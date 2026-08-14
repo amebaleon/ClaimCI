@@ -1,0 +1,8 @@
+{
+  "runs": [
+    {"seed": 1, "accuracy": 0.68},
+    {"seed": 2, "accuracy": 0.70},
+    {"seed": 3, "accuracy": 0.72}
+  ],
+  "summary": {"accuracy": 0.70}
+}

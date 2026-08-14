@@ -1,0 +1,6 @@
+{
+  "runs": [
+    {"seed": 404, "accuracy": 0.90}
+  ],
+  "summary": {"accuracy": 0.90}
+}

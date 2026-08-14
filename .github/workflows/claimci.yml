@@ -1,0 +1,143 @@
+name: ClaimCI
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# This target-context workflow is safe only because pull-request code is never
+# imported, installed, or executed. ClaimCI is installed from the trusted base
+# commit; the PR checkout is passive, path-confined scientific input.
+permissions:
+  contents: read
+  checks: write
+
+env:
+  CLAIMCI_MANIFEST: research.yaml
+
+jobs:
+  claimci:
+    name: ClaimCI audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted ClaimCI base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: claimci-trusted
+          persist-credentials: false
+
+      - name: Check out pull-request artifacts as passive data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pull-request
+          persist-credentials: false
+          # checkout v7 requires this acknowledgement outside GITHUB_WORKSPACE.
+          # Nothing from this tree is imported, installed, or executed.
+          allow-unsafe-pr-checkout: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install trusted ClaimCI
+        run: python -m pip install ./claimci-trusted
+
+      - name: Run trusted ClaimCI audit over PR artifacts
+        id: audit
+        shell: bash
+        run: |
+          # Both views are rendered by the trusted base package. The explicit
+          # artifact root rejects absolute paths, traversal, and symlink escape.
+          set +e
+          claimci audit "pull-request/$CLAIMCI_MANIFEST" \
+            --artifact-root pull-request \
+            --json > claimci-result.json
+          json_status=$?
+          claimci audit "pull-request/$CLAIMCI_MANIFEST" \
+            --artifact-root pull-request \
+            --markdown > claimci-summary.md
+          markdown_status=$?
+          set -e
+
+          if [ ! -s claimci-result.json ]; then
+            printf '%s\n' '{"verdict":"UNKNOWN"}' > claimci-result.json
+          fi
+          if [ ! -s claimci-summary.md ]; then
+            {
+              echo '## ClaimCI Audit'
+              echo
+              echo '**ClaimCI could not render a Markdown audit summary.**'
+            } > claimci-summary.md
+          fi
+          if [ "$json_status" -ne "$markdown_status" ]; then
+            # Exit 1 and 2 are valid verdict exits. Only renderer disagreement
+            # makes this an integration failure.
+            printf '%s\n' '{"verdict":"UNKNOWN"}' > claimci-result.json
+          fi
+
+          cat claimci-summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "json_status=$json_status" >> "$GITHUB_OUTPUT"
+          echo "markdown_status=$markdown_status" >> "$GITHUB_OUTPUT"
+
+      - name: Build GitHub Check payload
+        run: |
+          python -m claimci.github \
+            --report claimci-result.json \
+            --markdown claimci-summary.md \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --details-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --output claimci-check.json
+
+      - name: Publish ClaimCI Check
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Even an earlier checkout/setup/audit failure must leave an
+          # explicit, non-passing Check on the PR head when the runner and
+          # GitHub API remain available.
+          if [ ! -s claimci-check.json ]; then
+            jq -n \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg details_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{
+                name: "ClaimCI Audit",
+                head_sha: $head_sha,
+                status: "completed",
+                conclusion: "failure",
+                details_url: $details_url,
+                output: {
+                  title: "ClaimCI Audit - integration failure",
+                  summary: "## ClaimCI Audit\n\n**FAILURE - the workflow could not produce a trustworthy audit report.**"
+                }
+              }' > claimci-check.json
+          fi
+          # --input keeps artifact-controlled evidence out of shell arguments.
+          gh api \
+            --method POST \
+            --input claimci-check.json \
+            "repos/${GITHUB_REPOSITORY}/check-runs"
+
+      - name: Enforce ClaimCI verdict
+        if: always()
+        shell: bash
+        run: |
+          verdict="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("verdict", "UNKNOWN"))' claimci-result.json 2>/dev/null || echo UNKNOWN)"
+          case "$verdict" in
+            SUPPORTED)
+              echo 'ClaimCI verdict: SUPPORTED'
+              ;;
+            NOT_SUPPORTED)
+              echo 'ClaimCI verdict: NOT_SUPPORTED (the claim is rejected).'
+              exit 1
+              ;;
+            INSUFFICIENT_EVIDENCE)
+              echo 'ClaimCI verdict: INSUFFICIENT_EVIDENCE (the explicit Check Run is action_required).'
+              ;;
+            *)
+              echo "ClaimCI verdict: $verdict (integration failure)."
+              exit 1
+              ;;
+          esac

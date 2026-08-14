@@ -1,0 +1,15 @@
+claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+
+baseline:
+  config: examples/shared/base/config.yaml
+  results: examples/shared/base/results.json
+  train_dataset: examples/shared/base/train.jsonl
+  eval_dataset: examples/shared/base/eval.jsonl
+
+candidate:
+  config: examples/shared/candidate/config.yaml
+  results: examples/shared/candidate/results.json
+  train_dataset: examples/shared/candidate/train.jsonl
+  eval_dataset: examples/shared/candidate/eval.jsonl

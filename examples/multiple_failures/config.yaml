@@ -1,0 +1,12 @@
+training_steps: 300
+epochs: 12
+batch_size: 8
+dataset:
+  identifier: changed-train
+  version: v2
+evaluation:
+  dataset_identifier: other-eval
+  dataset_version: v2
+  split: validation
+model: tiny-candidate
+learning_rate: 0.01

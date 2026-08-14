@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claimci"
+version = "0.2.0"
+description = "Deterministic CI auditing for research claims"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ClaimCI contributors" }]
+dependencies = ["PyYAML==6.0.3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+claimci = "claimci.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+include = ["claimci*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
