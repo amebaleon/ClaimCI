@@ -419,7 +419,7 @@ def test_prompt_policy_override_stays_quoted_data_and_cannot_change_status(
 
     assert result.status is ReviewStatus.COMPLETE
     assert injection in seen[0]
-    assert "secrets" not in result.__dict__
+    assert not hasattr(result, "verdict")
 
 
 def test_context_limit_stops_before_provider_call(tmp_path: Path) -> None:
