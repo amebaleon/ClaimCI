@@ -393,6 +393,17 @@ def test_authority_field_injection_in_synthesis_is_rejected(tmp_path: Path) -> N
     assert len(provider.calls) == 2
 
 
+def test_oversized_synthesis_output_is_unavailable_without_retry(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        synthesis=lambda request: _synthesis_output(request) + "x" * 200
+    )
+
+    result = _run(tmp_path, provider, config=_config(max_output_chars=32))
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert len(provider.calls) == 2
+
+
 def test_prompt_policy_override_stays_quoted_data_and_cannot_change_status(
     tmp_path: Path,
 ) -> None:
