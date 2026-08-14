@@ -9,6 +9,7 @@ or contact a real network service.
 from __future__ import annotations
 
 import inspect
+import math
 import sys
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -214,3 +215,47 @@ def test_openai_adapter_missing_sdk_is_lazy_and_controlled(monkeypatch: pytest.M
 
     with pytest.raises(Exception, match=r"(?i)sdk|openai|install|provider"):
         provider.extract_claims(_request())
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf, 31.0])
+def test_openai_adapter_rejects_nonfinite_or_out_of_policy_timeout(
+    timeout: float,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        OpenAIReviewerProvider(
+            model="test-model",
+            timeout_seconds=timeout,
+            max_output_tokens=123,
+            client=_FakeClient(),
+        )
+
+
+def test_openai_adapter_usage_overflow_is_observability_only() -> None:
+    """Implausible provider counters cannot make a valid response unavailable."""
+
+    class HugeUsageResponses:
+        def create(self, **_: Any) -> Any:
+            return SimpleNamespace(
+                id="openai-request-huge-usage",
+                output_text='{"claims": []}',
+                usage=SimpleNamespace(
+                    input_tokens=10**100_000,
+                    output_tokens=1,
+                    total_tokens=10**100_000,
+                ),
+            )
+
+    provider = OpenAIReviewerProvider(
+        model="gpt-5.6-terra",
+        timeout_seconds=1,
+        max_output_tokens=123,
+        client=SimpleNamespace(responses=HugeUsageResponses()),
+    )
+
+    response = provider.extract_claims(_request())
+
+    assert response.output_text == '{"claims": []}'
+    assert response.usage.input_tokens is None
+    assert response.usage.output_tokens == 1
+    assert response.usage.total_tokens is None
+    assert response.usage.estimated_cost_usd is None

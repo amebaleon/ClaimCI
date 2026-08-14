@@ -142,6 +142,62 @@ local model requires ClaimCI itself to be present on the base branch; a
 published reusable action or GitHub App is still needed for centralized
 versioning across unrelated customer repositories.
 
+## Optional ClaimCI Research Review (Day 3)
+
+The same workflow can add an advisory, LLM-powered **ClaimCI Research Review**
+for ordinary research pull requests. It reads the pull-request title and
+description plus selected changed Markdown/TeX research notes, then uses
+bounded deterministic artifact discovery and the existing ClaimCI audit tools
+to ground the review. Supported review claim categories include metric
+improvements, compute equivalence, held-out evaluation, resource reductions,
+component causality, no-external-reward statements, implementation claims, and
+other scientific statements.
+
+Research review is explicitly **opt in**. The trusted base checkout must carry
+`.claimci/review.yaml`; a pull request cannot enable review or change its
+provider policy. A minimal configuration is:
+
+```yaml
+schema_version: 1
+enabled: true
+policy: advisory
+provider: openai
+model: gpt-5.6-terra
+limits:
+  max_calls: 2
+  max_context_chars: 60000
+  max_output_chars: 12000
+  max_files: 24
+  max_file_chars: 16000
+  max_output_tokens_per_call: 2000
+  timeout_seconds: 30
+```
+
+The workflow supplies `OPENAI_API_KEY` only to the trusted review step. ClaimCI
+reads it at runtime through the provider SDK; it is never printed, rendered,
+serialized, or committed. The default provider is OpenAI's `gpt-5.6-terra`;
+trusted runtime configuration may set `CLAIMCI_OPENAI_MODEL` to a compatible
+model. Automated tests use mocked providers and never make paid API calls.
+Each review uses at most two provider calls (claim extraction and evidence-
+grounded synthesis), a 60,000-character total context budget, and a 12,000-
+character output budget. Provider input/output/total tokens and estimated
+cost, when supplied, are recorded for observability only.
+
+Selected private repository content may therefore be sent to the configured
+external provider when an owner enables this configuration. This boundary is
+especially important for `pull_request_target` and fork pull requests: the
+head checkout is passive data, while configuration and code come from the
+trusted base branch. Disable or omit `.claimci/review.yaml` when external data
+egress is not acceptable.
+
+The review check is always `neutral` and is never a quality gate. Its Markdown
+labels distinguish deterministic evidence, LLM interpretation, missing
+evidence, and unsupported inference. Only the separate deterministic
+**ClaimCI Audit** Check can block a PR; enabling or disabling review does not
+change deterministic audit bytes, verdicts, or exit codes. A future strict
+organization policy may make unresolved review findings non-passing on this
+separate check, but Day 3 intentionally remains advisory.
+
 ## Current checks
 
 - Compares training steps, epochs, batch size, model, learning rate, training dataset identity/version, and the full evaluation mapping.

@@ -119,3 +119,226 @@ jobs:
             --method POST \
             --input claimci-check.json \
             "repos/${GITHUB_REPOSITORY}/check-runs"
+
+  research_review:
+    name: ClaimCI research review
+    runs-on: ubuntu-latest
+    # The provider can inspect repository contents but cannot create or update
+    # Checks. The job-level map narrows the inherited workflow permissions.
+    permissions:
+      contents: read
+    outputs:
+      review_check_b64: ${{ steps.review_payload.outputs.review_check_b64 }}
+    steps:
+      - name: Check out trusted ClaimCI base for review
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: claimci-trusted
+          persist-credentials: false
+
+      - name: Check out pull-request artifacts as passive review data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pull-request
+          persist-credentials: false
+          # checkout v7 requires this acknowledgement outside GITHUB_WORKSPACE.
+          # No file from this tree is imported, installed, or executed.
+          allow-unsafe-pr-checkout: true
+
+      - name: Set up Python for trusted review
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install trusted ClaimCI and conditional review SDK
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python -m pip install ./claimci-trusted
+          install_status=$?
+          set -e
+          review_enabled=false
+          if [ "$install_status" -eq 0 ]; then
+            review_enabled="$(python - <<'PY'
+          from pathlib import Path
+
+          from claimci.review.config import load_review_config
+
+          try:
+              enabled = load_review_config(Path("claimci-trusted")).enabled
+          except Exception:
+              enabled = False
+          print("true" if enabled else "false")
+          PY
+          )"
+          fi
+          if [ "$review_enabled" = "true" ]; then
+            # The optional SDK is installed only from the trusted base.  A
+            # missing SDK remains an advisory review failure.
+            python -m pip install "./claimci-trusted[llm]" || true
+          fi
+          # Keep a failed base install visible to the job while allowing the
+          # always-running fallback/output steps to hand off a neutral Check.
+          exit "$install_status"
+
+      - name: Run optional ClaimCI Research Review
+        id: review
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          # Provider credentials are scoped to this job/step only.  The review
+          # command reads the key through the SDK environment and never emits
+          # it in either report or the handoff payload.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set +e
+          claimci review pull-request \
+            --base-root claimci-trusted \
+            --config-root claimci-trusted \
+            --config .claimci/review.yaml \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --json-output claimci-review.json \
+            --markdown-output claimci-review.md
+          review_status=$?
+          set -e
+
+          # Disabled, unavailable, or malformed reviews remain advisory. Keep
+          # both views present so the payload builder can fail closed.
+          if [ ! -s claimci-review.json ]; then
+            printf '%s\n' '{"schema_version":1,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json
+          fi
+          if [ ! -s claimci-review.md ]; then
+            {
+              echo '## ClaimCI Research Review (Advisory)'
+              echo
+              echo '**Review unavailable; no advisory Markdown was produced.**'
+              echo
+              echo 'Only the separate deterministic ClaimCI Audit can block a pull request.'
+            } > claimci-review.md
+          fi
+          cat claimci-review.md >> "$GITHUB_STEP_SUMMARY"
+          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
+
+      - name: Build ClaimCI Research Review Check payload
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python -m claimci.review.github \
+            --review-json claimci-review.json \
+            --markdown claimci-review.md \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --details-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --output claimci-review-check.json
+          payload_status=$?
+          set -e
+
+          # If setup or the optional adapter failed, hand off a fixed neutral
+          # payload instead of a missing/partial file.
+          if [ "$payload_status" -ne 0 ] || [ ! -s claimci-review-check.json ]; then
+            jq -n \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg details_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{
+                name: "ClaimCI Research Review",
+                head_sha: $head_sha,
+                status: "completed",
+                conclusion: "neutral",
+                details_url: $details_url,
+                output: {
+                  title: "ClaimCI Research Review - advisory",
+                  summary: "## ClaimCI Research Review (Advisory)\n\nReview unavailable; the optional advisory integration could not render a review.\n\nOnly the separate deterministic ClaimCI Audit can block a pull request."
+                }
+              }' > claimci-review-check.json
+          fi
+
+      - name: Encode review Check payload for trusted publisher
+        id: review_payload
+        if: always()
+        shell: bash
+        run: |
+          payload_b64=""
+          if [ -s claimci-review-check.json ]; then
+            payload_b64="$(base64 -w 0 claimci-review-check.json 2>/dev/null || true)"
+            if [ -z "$payload_b64" ]; then
+              payload_b64="$(base64 claimci-review-check.json | tr -d '\n')"
+            fi
+          fi
+          # Job outputs have a finite size; an oversized/invalid handoff is
+          # rejected by the publisher and replaced with its fixed fallback.
+          if [ "${#payload_b64}" -gt 100000 ]; then
+            payload_b64=""
+          fi
+          echo "review_check_b64=$payload_b64" >> "$GITHUB_OUTPUT"
+
+  publish_research_review:
+    name: Publish ClaimCI research review
+    if: always()
+    needs: [claimci, research_review]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REVIEW_CHECK_B64: ${{ needs.research_review.outputs.review_check_b64 }}
+    steps:
+      - name: Publish ClaimCI Research Review Check
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          decode_status=1
+          if [ -n "${REVIEW_CHECK_B64:-}" ]; then
+            printf '%s' "$REVIEW_CHECK_B64" | base64 --decode > claimci-review-check.json
+            decode_status=$?
+          fi
+          set -e
+
+          # Validate the bounded handoff shape before sending it to GitHub.
+          # Any missing, malformed, or tampered payload receives the same
+          # fixed neutral advisory Check and cannot affect ClaimCI Audit.
+          expected_head_sha="${{ github.event.pull_request.head.sha }}"
+          expected_details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "$decode_status" -ne 0 ] || [ ! -s claimci-review-check.json ] || \
+             ! jq -e \
+               --arg head_sha "$expected_head_sha" \
+               --arg details_url "$expected_details_url" \
+               'type == "object" and
+                (keys | sort) == (["conclusion", "details_url", "head_sha", "name", "output", "status"] | sort) and
+                .name == "ClaimCI Research Review" and
+                .head_sha == $head_sha and
+                .status == "completed" and
+                .conclusion == "neutral" and
+                .details_url == $details_url and
+                (.output | type == "object") and
+                (.output | keys | sort) == (["summary", "title"] | sort) and
+                .output.title == "ClaimCI Research Review - advisory" and
+                (.output.summary | type == "string") and
+                (.output.summary | length) <= 65535' \
+             claimci-review-check.json >/dev/null 2>&1; then
+            jq -n \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg details_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{
+                name: "ClaimCI Research Review",
+                head_sha: $head_sha,
+                status: "completed",
+                conclusion: "neutral",
+                details_url: $details_url,
+                output: {
+                  title: "ClaimCI Research Review - advisory",
+                  summary: "## ClaimCI Research Review (Advisory)\n\nReview unavailable; the optional advisory integration could not render a review.\n\nOnly the separate deterministic ClaimCI Audit can block a pull request."
+                }
+              }' > claimci-review-check.json
+          fi
+
+          # The publisher has Checks permission but no provider credentials;
+          # this is the only job that sends the advisory payload to GitHub.
+          gh api \
+            --method POST \
+            --input claimci-review-check.json \
+            "repos/${GITHUB_REPOSITORY}/check-runs"

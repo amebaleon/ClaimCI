@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, is_dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +19,7 @@ import pytest
 from claimci.review.models import ProviderUsage, ReviewConfig, ReviewLimits, ReviewStatus
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
+from claimci.review.evidence import EvidenceBundle, EvidenceKind, EvidenceReference
 
 
 TITLE = "Candidate improves accuracy by five percentage points"
@@ -48,7 +50,7 @@ def _config(**limit_updates: Any) -> ReviewConfig:
 
 def _inputs(tmp_path: Path, *, title: str = TITLE) -> ReviewInputs:
     repository = tmp_path / "repo"
-    repository.mkdir()
+    repository.mkdir(parents=True)
     (repository / "README.md").write_text(
         "# Study\n\n" + title + "\n", encoding="utf-8"
     )
@@ -352,6 +354,79 @@ def test_unknown_evidence_citation_is_rejected(tmp_path: Path) -> None:
     assert len(provider.calls) == 2
 
 
+def test_evidence_citation_must_be_issued_for_the_interpreted_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real evidence ID cannot be laundered across unrelated claims."""
+
+    def two_claims(request: StructuredRequest) -> str:
+        payload = json.loads(_extraction_output(request))
+        second = dict(payload["claims"][0])
+        second.update(
+            {
+                "claim_type": "compute_equivalence",
+                "subject": "training budget",
+                "metric": None,
+                "direction": "not_applicable",
+                "confidence": 0.8,
+            }
+        )
+        payload["claims"].append(second)
+        return json.dumps(payload)
+
+    def evidence_for_first_claim(
+        _root: Path,
+        claims: Any,
+        _paths: Any,
+        **_kwargs: Any,
+    ) -> EvidenceBundle:
+        return EvidenceBundle(
+            references=(
+                EvidenceReference(
+                    evidence_id="evidence-first-claim-only",
+                    claim_ids=(claims[0].claim_id,),
+                    kind=EvidenceKind.RESULTS,
+                    path="results.json",
+                    start_line=1,
+                    end_line=1,
+                    sha256="a" * 64,
+                    size=2,
+                    excerpt="{}",
+                ),
+            ),
+            total_chars=2,
+        )
+
+    def mismatched_citation(request: StructuredRequest) -> str:
+        claims = request.payload["claims"]
+        return json.dumps(
+            {
+                "interpretations": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "interpretation": "Advisory interpretation.",
+                        "citations": ["evidence-first-claim-only"],
+                        "missing_evidence": [],
+                        "unsupported_inferences": [],
+                        "confidence": 0.5,
+                    }
+                    for claim in claims
+                ]
+            }
+        )
+
+    import claimci.review.orchestrator as orchestrator
+
+    monkeypatch.setattr(orchestrator, "discover_evidence", evidence_for_first_claim)
+    provider = FakeProvider(extraction=two_claims, synthesis=mismatched_citation)
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert len(provider.calls) == 2
+
+
 @pytest.mark.parametrize(
     "malformed",
     [
@@ -373,6 +448,19 @@ def test_malformed_synthesis_output_is_unavailable_without_a_third_call(
         "extract_claims",
         "synthesize_review",
     ]
+
+
+def test_synthesis_rejects_lone_unicode_surrogates_before_rendering(
+    tmp_path: Path,
+) -> None:
+    def surrogate_text(request: StructuredRequest) -> str:
+        payload = json.loads(_synthesis_output(request))
+        payload["interpretations"][0]["interpretation"] = "bad\ud800text"
+        return json.dumps(payload)
+
+    result = _run(tmp_path, FakeProvider(synthesis=surrogate_text))
+
+    assert result.status is ReviewStatus.UNAVAILABLE
 
 
 def test_authority_field_injection_in_synthesis_is_rejected(tmp_path: Path) -> None:
@@ -398,7 +486,10 @@ def test_oversized_synthesis_output_is_unavailable_without_retry(tmp_path: Path)
         synthesis=lambda request: _synthesis_output(request) + "x" * 200
     )
 
-    result = _run(tmp_path, provider, config=_config(max_output_chars=32))
+    # The cap must admit the valid extraction response so this regression
+    # reaches the deliberately oversized second response. It still bounds the
+    # aggregate generated output across both calls.
+    result = _run(tmp_path, provider, config=_config(max_output_chars=500))
 
     assert result.status is ReviewStatus.UNAVAILABLE
     assert len(provider.calls) == 2
@@ -428,6 +519,57 @@ def test_context_limit_stops_before_provider_call(tmp_path: Path) -> None:
 
     assert result.status is ReviewStatus.UNAVAILABLE
     assert provider.calls == []
+
+
+def test_file_limit_is_global_across_sources_evidence_and_manifests(
+    tmp_path: Path,
+) -> None:
+    """Phase-local limits must not multiply provider-visible repository files."""
+
+    repository = tmp_path / "bounded-repository"
+    repository.mkdir()
+    for index in range(24):
+        (repository / f"note-{index:02d}.md").write_text(
+            f"Research note {index}.\n",
+            encoding="utf-8",
+        )
+        (repository / f"component-{index:02d}.py").write_text(
+            f"COMPONENT_{index} = True\n",
+            encoding="utf-8",
+        )
+
+    def implementation_claim(request: StructuredRequest) -> str:
+        payload = json.loads(_extraction_output(request))
+        payload["claims"][0].update(
+            {
+                "claim_type": "implementation_claim",
+                "subject": "component implementation",
+                "metric": None,
+                "direction": "not_applicable",
+            }
+        )
+        return json.dumps(payload)
+
+    provider = FakeProvider(extraction=implementation_claim)
+    result = run_review(
+        ReviewInputs(repository_root=repository, pr_title=TITLE),
+        _config(max_files=24),
+        provider=provider,
+    )
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert len(provider.calls) == 2
+    extraction_paths = {
+        source["path"]
+        for source in provider.calls[0].payload["sources"]
+        if source["path"] is not None
+    }
+    synthesis = provider.calls[1].payload
+    evidence_paths = {item["path"] for item in synthesis["evidence"]}
+    manifest_paths = {
+        item["manifest_path"] for item in synthesis["deterministic_audits"]
+    }
+    assert len(extraction_paths | evidence_paths | manifest_paths) <= 24
 
 
 def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: Path) -> None:
@@ -469,6 +611,30 @@ def test_per_call_and_aggregate_usage_are_observability_only(tmp_path: Path) -> 
     assert result.usage.output_tokens == 50
     assert result.usage.total_tokens == 250
     assert result.usage.estimated_cost_usd == pytest.approx(2469.0)
+
+
+def test_extreme_finite_cost_cannot_escape_or_change_review_status(
+    tmp_path: Path,
+) -> None:
+    """Decimal aggregation failure degrades to unknown observability metadata."""
+
+    extreme_cost = Decimal("1e1000000")
+    usage = ProviderUsage(
+        input_tokens=1,
+        output_tokens=1,
+        total_tokens=2,
+        estimated_cost_usd=extreme_cost,
+    )
+
+    result = _run(tmp_path, FakeProvider(usage=usage))
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert len(result.provider_calls) == 2
+    assert all(
+        call.usage.estimated_cost_usd == extreme_cost
+        for call in result.provider_calls
+    )
+    assert result.usage.estimated_cost_usd is None
 
 
 def test_usage_and_estimated_cost_cannot_change_review_status_or_audit_snapshot(
