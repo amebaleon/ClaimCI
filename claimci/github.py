@@ -33,6 +33,7 @@ from .parsing import unique_json_object
 # value in one place so both the pure adapter and its CLI obey the same bound.
 MAX_SUMMARY_LENGTH = 65_535
 CHECK_NAME = "ClaimCI Audit"
+INTEGRATION_FAILURE_TITLE = "ClaimCI Audit - integration failure"
 _HEAD_SHA = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 _SEVERITIES = {"CRITICAL", "WARNING", "VERIFIED", "INFO"}
 _IMPACTS = {"NONE", "INVALIDATES", "INSUFFICIENT"}
@@ -317,7 +318,7 @@ def build_check_payload(
     if reasons:
         conclusion = "failure"
         summary = _bounded_summary(_failure_summary("; ".join(reasons)))
-        title = "ClaimCI Audit - integration failure"
+        title = INTEGRATION_FAILURE_TITLE
     else:
         # ``verdict`` is known to be one of the three canonical values after
         # _valid_report succeeds, but keep the fallback defensive for future
@@ -401,6 +402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.head_sha,
         details_url=args.details_url,
     )
+    integration_failed = payload["output"]["title"] == INTEGRATION_FAILURE_TITLE
     encoded = (
         json.dumps(
             payload,
@@ -419,7 +421,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, UnicodeError, ValueError) as exc:
             print(f"ClaimCI GitHub adapter error: {exc}", file=sys.stderr)
             return 2
-    return 0
+    # A valid scientific verdict never controls the runner job: the explicit
+    # Check Run is authoritative.  Invalid adapter inputs still leave a
+    # publishable failure payload, while this nonzero exit marks the workflow
+    # itself as an integration failure.
+    return 1 if integration_failed else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by the workflow
