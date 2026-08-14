@@ -17,9 +17,9 @@ from typing import Any
 import pytest
 
 from claimci.review.openai_provider import OpenAIReviewerProvider
+from claimci.review.models import ProviderUsage
 from claimci.review.provider import (
     ProviderResponse,
-    ProviderUsage,
     ReviewerProvider,
     StructuredRequest,
 )
@@ -214,4 +214,3 @@ def test_openai_adapter_missing_sdk_is_lazy_and_controlled(monkeypatch: pytest.M
 
     with pytest.raises(Exception, match=r"(?i)sdk|openai|install|provider"):
         provider.extract_claims(_request())
-

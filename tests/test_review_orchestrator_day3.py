@@ -15,10 +15,9 @@ from typing import Any, Callable
 
 import pytest
 
-from claimci.review.config import ReviewConfig, ReviewLimits
-from claimci.review.models import ReviewStatus
+from claimci.review.models import ProviderUsage, ReviewConfig, ReviewLimits, ReviewStatus
 from claimci.review.orchestrator import ReviewInputs, run_review
-from claimci.review.provider import ProviderResponse, ProviderUsage, StructuredRequest
+from claimci.review.provider import ProviderResponse, StructuredRequest
 
 
 TITLE = "Candidate improves accuracy by five percentage points"
