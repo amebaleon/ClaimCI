@@ -126,6 +126,13 @@ The checked-in [ClaimCI workflow](.github/workflows/claimci.yml) runs automatica
 
 `action_required` is intentionally non-passing and distinct from a rejected claim. Configure `ClaimCI Audit` as a required check to gate merges. To use another manifest path, change `CLAIMCI_MANIFEST` in the workflow.
 
+To make the authoritative quality gate required, open **Settings → Branches →
+Branch protection rules**, enable **Require status checks to pass before
+merging**, and select the exact status name **`ClaimCI Audit`**. Do not require
+the Actions job named `ClaimCI audit`: that job reports workflow/integration
+health and remains successful for a correctly published scientific
+`NOT_SUPPORTED` or `INSUFFICIENT_EVIDENCE` result.
+
 The workflow uses `pull_request_target` for a writable Check token, but it does
 not execute pull-request code. Both GitHub actions are pinned to immutable
 commits; ClaimCI is installed from the trusted base commit; and the PR checkout

@@ -88,9 +88,9 @@ def test_unreadable_report_is_a_published_failure_payload(
 
     code, payload = _run_adapter(report, markdown, output, capsys)
 
-    # A writable output is enough to publish an explicit integration failure;
-    # the adapter itself must not hide the Check Run behind exit status 2.
-    assert code == 0
+    # The failure payload remains publishable, while the nonzero adapter exit
+    # makes the surrounding runner job report a real integration failure.
+    assert code == 1
     assert payload is not None
     assert payload["conclusion"] == "failure"
     assert payload["status"] == "completed"
@@ -120,7 +120,7 @@ def test_unreadable_markdown_is_a_published_failure_payload(
 
     code, payload = _run_adapter(report, markdown, output, capsys)
 
-    assert code == 0
+    assert code == 1
     assert payload is not None
     assert payload["conclusion"] == "failure"
     assert "trustworthy" in payload["output"]["summary"].casefold()
@@ -165,6 +165,23 @@ def test_unwritable_or_nul_output_path_returns_exit_two(
     captured = capsys.readouterr()
     assert code == 2
     assert "adapter error" in captured.err.casefold()
+
+
+def test_unknown_verdict_writes_failure_payload_and_returns_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report, markdown = _write_inputs(tmp_path)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    payload["verdict"] = "UNKNOWN"
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    output = tmp_path / "unknown-payload.json"
+
+    code, check = _run_adapter(report, markdown, output, capsys)
+
+    assert code == 1
+    assert check is not None
+    assert check["conclusion"] == "failure"
+    assert "integration failure" in check["output"]["title"].casefold()
 
 
 @pytest.mark.parametrize("verdict", list(Verdict))

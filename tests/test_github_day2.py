@@ -236,11 +236,22 @@ def test_workflow_preserves_valid_nonzero_audit_verdicts() -> None:
     assert 'if [ "$markdown_status" -ne 0 ]; then' not in text
 
 
-def test_workflow_does_not_collapse_insufficient_evidence_into_job_failure() -> None:
-    text = _workflow_text()
-    insufficient_branch = text.split("INSUFFICIENT_EVIDENCE)", 1)[1].split(";;", 1)[0]
+def test_workflow_has_no_duplicate_scientific_verdict_enforcement_step() -> None:
+    parsed = _workflow_mapping()
+    steps = parsed["jobs"]["claimci"]["steps"]
+    names = [step.get("name") for step in steps]
 
-    # The explicit Check Run is action_required and therefore blocks when it
-    # is required.  The surrounding Actions job stays distinct from a
-    # NOT_SUPPORTED failure rather than adding a second generic red failure.
-    assert "exit 1" not in insufficient_branch
+    # The explicit ClaimCI Audit Check Run is authoritative.  Once the
+    # adapter and GitHub publication succeed, a valid scientific verdict must
+    # not independently turn the Actions job red.
+    assert "Enforce ClaimCI verdict" not in names
+
+
+def test_workflow_always_publishes_the_check_after_adapter_failure() -> None:
+    parsed = _workflow_mapping()
+    steps = parsed["jobs"]["claimci"]["steps"]
+    publish = next(step for step in steps if step.get("name") == "Publish ClaimCI Check")
+
+    # Invalid adapter input returns nonzero but still writes a failure payload;
+    # always() ensures that payload is published before the job remains failed.
+    assert publish.get("if") == "always()"
