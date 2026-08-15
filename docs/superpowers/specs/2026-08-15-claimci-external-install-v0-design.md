@@ -98,18 +98,23 @@ The reusable workflow has three security domains:
    `--artifact-root pull-request`, and publishes `ClaimCI Audit` against the
    explicit PR head SHA. Only deterministic verdicts control its conclusion.
 2. **Optional research review.** It has `contents: read` only, checks out the
-   consumer base SHA to `consumer-base` and head SHA to `pull-request`, installs
-   the immutable carrier, loads review configuration only from
-   `consumer-base`, and receives only `OPENAI_API_KEY`. Missing or disabled
-   config produces zero provider calls. One `claimci review` invocation emits
-   both JSON and Markdown and can make at most two provider calls.
+   caller's trusted `pull_request_target` event commit (`github.sha`) to
+   `consumer-base` and the explicit PR head SHA to `pull-request`, installs the
+   immutable carrier, loads review configuration only from `consumer-base`, and
+   receives only `OPENAI_API_KEY`. Missing or disabled config produces zero
+   provider calls. One `claimci review` invocation emits both JSON and Markdown
+   and can make at most two provider calls.
 3. **Advisory publication.** It has `checks: write`, receives no provider
    secret, performs no repository checkout, revalidates the bounded payload and
    PR head SHA, and publishes only a completed `neutral` Research Review Check.
 
-The called workflow uses the caller's `github` event context, so
-`github.event.pull_request.base.sha`, `head.sha`, repository, event path, and
-Checks API target all refer to the consumer repository.
+The called workflow uses the caller's `github` event context. For the v0
+`pull_request_target` caller, `${{ github.sha }}` identifies the current trusted
+consumer default-branch commit for the run; the pull-request payload's base SHA
+must not be used because it can be stale. The explicit
+`${{ github.event.pull_request.head.sha }}` remains the passive, untrusted PR
+artifact revision. The repository, event path, and Checks API target also refer
+to the consumer repository.
 
 ### 3. Minimal customer caller
 

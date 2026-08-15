@@ -310,6 +310,9 @@ def _active_on(workflow: dict[str, object]) -> dict[str, object]:
 def test_active_workflow_is_rendered_at_authorized_sha_and_has_exact_call_contract():
     text = _active_text()
     workflow = _active_mapping()
+    assert text == TEMPLATE.read_text(encoding="utf-8").replace(
+        "__CLAIMCI_INSTALLER_SHA__", INSTALLER_SHA
+    )
     assert "__CLAIMCI_INSTALLER_SHA__" not in text
     refs = re.findall(r"amebaleon/ClaimCI@([^\s\"']+)", text)
     assert refs and refs == [INSTALLER_SHA] * len(refs)
@@ -376,16 +379,47 @@ def test_advisory_review_setup_and_publication_cannot_fail_authoritative_audit()
     assert jobs["publish_research_review"].get("continue-on-error") is True
 
 
-def test_active_workflow_uses_explicit_base_head_checkouts_and_never_installs_consumer_code():
-    text = _active_text()
-    assert "github.event.pull_request.base.sha" in text
-    assert text.count("github.event.pull_request.head.sha") >= 2
-    assert text.count("persist-credentials: false") >= 3
-    assert "path: consumer-base" in text
-    assert "path: pull-request" in text
-    assert "allow-unsafe-pr-checkout: true" in text
+def test_external_workflow_uses_current_trusted_base_and_keeps_head_passive():
+    for path in (ACTIVE_WORKFLOW, TEMPLATE):
+        text = path.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(text)
+        steps = workflow["jobs"]["research_review"]["steps"]
+        audit_steps = workflow["jobs"]["claimci_audit"]["steps"]
+        trusted_base_steps = [
+            step for step in steps if step.get("name") == "Check out trusted consumer base"
+        ]
+        passive_head_steps = [
+            step
+            for step in steps
+            if step.get("name") == "Check out pull-request artifacts as passive review data"
+        ]
+        audit_head_steps = [
+            step
+            for step in audit_steps
+            if step.get("name") == "Check out pull-request artifacts as passive data"
+        ]
+        assert len(trusted_base_steps) == 1
+        assert len(passive_head_steps) == 1
+        assert len(audit_head_steps) == 1
+        trusted_base = trusted_base_steps[0]
+        passive_head = passive_head_steps[0]
+        audit_head = audit_head_steps[0]
 
-    lowered = text.casefold()
+        assert trusted_base["with"] == {
+            "ref": "${{ github.sha }}",
+            "path": "consumer-base",
+            "persist-credentials": False,
+        }
+        assert "github.event.pull_request.base.sha" not in text
+        assert passive_head["with"] == {
+            "ref": "${{ github.event.pull_request.head.sha }}",
+            "path": "pull-request",
+            "persist-credentials": False,
+            "allow-unsafe-pr-checkout": True,
+        }
+        assert audit_head["with"] == passive_head["with"]
+
+    lowered = _active_text().casefold()
     for forbidden in (
         "pip install ./pull-request",
         "pip install -e ./pull-request",
@@ -441,6 +475,12 @@ def test_materializer_creates_clean_consumer_fixture_and_known_audit(tmp_path: P
     assert f"amebaleon/ClaimCI/.github/workflows/claimci-external.yml@{DEMO_SHA}" in workflow_text
     assert "permissions: {}" in workflow_text
     assert "OPENAI_API_KEY:" in workflow_text
+    caller = yaml.safe_load(workflow_text)
+    assert _active_on(caller) == {
+        "pull_request_target": {
+            "types": ["opened", "synchronize", "reopened", "ready_for_review"]
+        }
+    }
     manifest = yaml.safe_load((output / "research.yaml").read_text(encoding="utf-8"))
     for arm in ("baseline", "candidate"):
         for path_value in manifest[arm].values():
