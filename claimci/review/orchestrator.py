@@ -79,6 +79,53 @@ class ResearchReview:
     error_message: str | None = None
 
 
+_EXTRACTION_CONTRACT: dict[str, str] = {
+    "claim_selection": (
+        "Extract only explicit, scientifically verifiable statements present "
+        "in an issued source. Do not emit duplicate claims."
+    ),
+    "source_location": (
+        "Use only an issued source_id and 1-based inclusive start_line/end_line "
+        "values that are inside that source."
+    ),
+    "source_text": (
+        "Copy exactly the complete source line or consecutive complete source "
+        "lines selected by start_line/end_line, including punctuation; do not "
+        "paraphrase, trim, join partial lines, or return a substring."
+    ),
+    "normalized_fields": (
+        "Use non-empty strings for subject and every present metric, magnitude "
+        "text/unit, qualifier, and evidence hint. Use null or [] instead of "
+        "empty strings."
+    ),
+    "authority": (
+        "Do not emit verdicts, findings, severity, impact, thresholds, or "
+        "deterministic evidence."
+    ),
+}
+
+
+_SYNTHESIS_CONTRACT: dict[str, str] = {
+    "claim_coverage": (
+        "Return exactly one interpretation for every issued claim_id, with no "
+        "unknown, omitted, or duplicate claim IDs."
+    ),
+    "citations": (
+        "Citations may contain only issued evidence_id values assigned to that claim "
+        "through the evidence claim_ids field. Do not cite rule IDs, paths, manifests, "
+        "or deterministic finding IDs."
+    ),
+    "missing_evidence": (
+        "When issued evidence does not support a statement, use an empty list for "
+        "citations and describe the gap in missing_evidence or unsupported_inferences."
+    ),
+    "authority": (
+        "Produce advisory interpretation only. Deterministic audit snapshots are "
+        "read-only authority and must not be rewritten, upgraded, or contradicted."
+    ),
+}
+
+
 _EXTRACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -471,6 +518,7 @@ def run_review(
                 "untrusted_content": True,
                 "deterministic_authority": "ClaimCI Audit only",
             },
+            "extraction_contract": dict(_EXTRACTION_CONTRACT),
             "sources": _plain(sources.sources),
             "repository_paths": _plain(sources.repository_paths),
         }
@@ -537,6 +585,7 @@ def run_review(
                 "mode": "advisory",
                 "deterministic_authority": "read_only",
             },
+            "synthesis_contract": dict(_SYNTHESIS_CONTRACT),
             "claims": _plain(claims),
             "evidence": _plain(evidence.references),
             "missing_evidence": _plain(evidence.missing),

@@ -233,6 +233,57 @@ def test_run_review_uses_exact_extract_discover_tools_synthesize_sequence(
     assert "claims" in provider.calls[1].payload
 
 
+def test_extraction_request_matches_the_trusted_claim_validator_contract(
+    tmp_path: Path,
+) -> None:
+    """Live structured output must be told constraints JSON Schema cannot express."""
+
+    def extraction(request: StructuredRequest) -> str:
+        contract = request.payload["extraction_contract"]
+        assert "complete source line" in contract["source_text"]
+        assert "do not paraphrase" in contract["source_text"]
+        assert "1-based inclusive" in contract["source_location"]
+        assert "Do not emit duplicate claims" in contract["claim_selection"]
+        assert "empty strings" in contract["normalized_fields"]
+
+        return _extraction_output(request)
+
+    provider = FakeProvider(extraction=extraction)
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+
+
+def test_synthesis_request_matches_the_trusted_interpretation_validator_contract(
+    tmp_path: Path,
+) -> None:
+    """Live synthesis must receive the semantic rules enforced after JSON parsing."""
+
+    def synthesis(request: StructuredRequest) -> str:
+        contract = request.payload["synthesis_contract"]
+        assert "exactly one interpretation" in contract["claim_coverage"]
+        assert "assigned to that claim" in contract["citations"]
+        assert "Do not cite rule IDs" in contract["citations"]
+        assert "empty list" in contract["missing_evidence"]
+        assert "advisory interpretation" in contract["authority"]
+        return _synthesis_output(request)
+
+    provider = FakeProvider(synthesis=synthesis)
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+
+
 def test_provider_call_cap_one_returns_partial_without_a_third_call(tmp_path: Path) -> None:
     provider = FakeProvider()
 
@@ -579,6 +630,32 @@ def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: 
 
     assert result.status is ReviewStatus.UNAVAILABLE
     assert len(provider.calls) == 1
+
+
+def test_rate_limit_before_response_is_advisory_and_never_retried(
+    tmp_path: Path,
+) -> None:
+    """A live-style 429 has no usage envelope and cannot trigger synthesis."""
+
+    class MockRateLimitError(RuntimeError):
+        pass
+
+    def rate_limited(_: StructuredRequest) -> str:
+        raise MockRateLimitError("quota detail must not be rendered")
+
+    provider = FakeProvider(extraction=rate_limited)
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert [request.task for request in provider.calls] == ["extract_claims"]
+    assert result.provider_calls == ()
+    assert result.usage == ProviderUsage()
+    assert result.error_code == "REVIEW_UNAVAILABLE"
+    assert result.error_message == (
+        "Research review is unavailable (MockRateLimitError)."
+    )
+    assert "quota detail" not in result.error_message
 
 
 def test_synthesis_timeout_is_unavailable_without_retry_or_third_call(tmp_path: Path) -> None:
