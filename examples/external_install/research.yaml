@@ -1,0 +1,15 @@
+claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+
+baseline:
+  config: baseline-config.yaml
+  results: baseline-results.json
+  train_dataset: baseline-train.jsonl
+  eval_dataset: baseline-eval.jsonl
+
+candidate:
+  config: candidate-config.yaml
+  results: candidate-results.json
+  train_dataset: candidate-train.jsonl
+  eval_dataset: candidate-eval.jsonl

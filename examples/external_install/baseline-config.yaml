@@ -1,0 +1,12 @@
+training_steps: 100
+epochs: 4
+batch_size: 8
+dataset:
+  identifier: claimci-demo-train
+  version: v1
+evaluation:
+  dataset_identifier: claimci-demo-eval
+  dataset_version: v1
+  split: test
+model: claimci-demo-model
+learning_rate: 0.001

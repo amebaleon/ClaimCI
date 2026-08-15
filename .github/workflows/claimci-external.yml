@@ -41,7 +41,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install trusted ClaimCI
-        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
+        uses: amebaleon/ClaimCI@1b85419c4beaf7052732339fd80fb9242e75ef06
         with:
           install-review-dependencies: false
 
@@ -115,7 +115,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install trusted ClaimCI carrier
-        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
+        uses: amebaleon/ClaimCI@1b85419c4beaf7052732339fd80fb9242e75ef06
         with:
           install-review-dependencies: false
 
@@ -150,7 +150,7 @@ jobs:
       - name: Install optional review dependencies
         if: steps.review_config.outputs.enabled == 'true'
         continue-on-error: true
-        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
+        uses: amebaleon/ClaimCI@1b85419c4beaf7052732339fd80fb9242e75ef06
         with:
           install-review-dependencies: true
 
