@@ -1,0 +1,260 @@
+name: ClaimCI external
+
+on:
+  workflow_call:
+    inputs:
+      manifest-path:
+        description: Relative path to the research manifest in the consumer PR.
+        required: false
+        type: string
+        default: research.yaml
+      review-config-path:
+        description: Relative path to trusted review config on the consumer base.
+        required: false
+        type: string
+        default: .claimci/review.yaml
+    secrets:
+      OPENAI_API_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  claimci_audit:
+    name: ClaimCI Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Check out pull-request artifacts as passive data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pull-request
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+
+      - name: Install trusted ClaimCI
+        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
+        with:
+          install-review-dependencies: false
+
+      - name: Run deterministic audit
+        id: audit
+        shell: bash
+        env:
+          CLAIMCI_MANIFEST: ${{ inputs.manifest-path }}
+        run: |
+          set +e
+          claimci audit "pull-request/$CLAIMCI_MANIFEST" --artifact-root pull-request --json > claimci-result.json
+          json_status=$?
+          claimci audit "pull-request/$CLAIMCI_MANIFEST" --artifact-root pull-request --markdown > claimci-summary.md
+          markdown_status=$?
+          set -e
+          if [ ! -s claimci-result.json ]; then printf '%s\n' '{"verdict":"UNKNOWN"}' > claimci-result.json; fi
+          if [ ! -s claimci-summary.md ]; then printf '%s\n' '## ClaimCI Audit' > claimci-summary.md; fi
+          if [ "$json_status" -ne "$markdown_status" ]; then printf '%s\n' '{"verdict":"UNKNOWN"}' > claimci-result.json; fi
+          cat claimci-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build audit Check payload
+        if: always()
+        run: |
+          details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python -m claimci.github \
+            --report claimci-result.json \
+            --markdown claimci-summary.md \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --details-url "$details_url" \
+            --output claimci-check.json || true
+          if [ ! -s claimci-check.json ]; then
+            jq -n \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg details_url "$details_url" \
+              '{name:"ClaimCI Audit",head_sha:$head_sha,status:"completed",conclusion:"failure",details_url:$details_url,output:{title:"ClaimCI Audit - integration failure",summary:"## ClaimCI Audit\n\n**FAILURE - the workflow could not produce a trustworthy audit report.**"}}' > claimci-check.json
+          fi
+
+      - name: Publish ClaimCI Audit Check
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST --input claimci-check.json "repos/${GITHUB_REPOSITORY}/check-runs"
+
+  research_review:
+    name: ClaimCI Research Review
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      review_check_b64: ${{ steps.encode.outputs.review_check_b64 }}
+    steps:
+      - name: Check out trusted consumer base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: consumer-base
+          persist-credentials: false
+
+      - name: Check out pull-request artifacts as passive review data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pull-request
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Set up Python for trusted review
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+
+      - name: Install trusted ClaimCI carrier
+        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
+        with:
+          install-review-dependencies: false
+
+      - name: Probe trusted review configuration
+        id: review_config
+        if: always()
+        shell: bash
+        env:
+          REVIEW_CONFIG_PATH: ${{ inputs.review-config-path }}
+        run: |
+          set +e
+          enabled="$(python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from claimci.review.config import load_review_config
+
+          try:
+              config = load_review_config(
+                  Path("consumer-base"),
+                  Path(os.environ["REVIEW_CONFIG_PATH"]),
+              )
+              print("true" if config.enabled else "false")
+          except Exception:
+              print("false")
+          PY
+          )"
+          case "$enabled" in true|false) ;; *) enabled=false ;; esac
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Install optional review dependencies
+        if: steps.review_config.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
+        with:
+          install-review-dependencies: true
+
+      - name: Run optional research review
+        id: review
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REVIEW_CONFIG_PATH: ${{ inputs.review-config-path }}
+        run: |
+          set +e
+          claimci review pull-request \
+            --base-root consumer-base \
+            --config-root consumer-base \
+            --config "$REVIEW_CONFIG_PATH" \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --json-output claimci-review.json \
+            --markdown-output claimci-review.md
+          review_status=$?
+          set -e
+          if [ ! -s claimci-review.json ]; then printf '%s\n' '{"schema_version":1,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json; fi
+          if [ ! -s claimci-review.md ]; then printf '%s\n' '## ClaimCI Research Review (Advisory)' > claimci-review.md; fi
+          cat claimci-review.md >> "$GITHUB_STEP_SUMMARY"
+          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
+
+      - name: Build advisory Review Check payload
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python -m claimci.review.github \
+            --review-json claimci-review.json \
+            --markdown claimci-review.md \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --details-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --output claimci-review-check.json
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] || [ ! -s claimci-review-check.json ]; then
+            jq -n \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg details_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{name:"ClaimCI Research Review",head_sha:$head_sha,status:"completed",conclusion:"neutral",details_url:$details_url,output:{title:"ClaimCI Research Review - advisory",summary:"## ClaimCI Research Review (Advisory)\n\nReview unavailable; the optional advisory integration could not render a review."}}' > claimci-review-check.json
+          fi
+
+      - name: Encode advisory payload
+        id: encode
+        if: always()
+        shell: bash
+        run: |
+          payload_b64=""
+          if [ -s claimci-review-check.json ]; then
+            payload_b64="$(base64 -w 0 claimci-review-check.json 2>/dev/null || true)"
+            if [ -z "$payload_b64" ]; then
+              payload_b64="$(base64 claimci-review-check.json | tr -d '\n')"
+            fi
+          fi
+          if [ "${#payload_b64}" -gt 100000 ]; then
+            payload_b64=""
+          fi
+          echo "review_check_b64=$payload_b64" >> "$GITHUB_OUTPUT"
+
+  publish_research_review:
+    name: Publish ClaimCI Research Review
+    if: always()
+    continue-on-error: true
+    needs: [claimci_audit, research_review]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REVIEW_CHECK_B64: ${{ needs.research_review.outputs.review_check_b64 }}
+    steps:
+      - name: Publish bounded neutral Review Check
+        shell: bash
+        run: |
+          set +e
+          payload_b64="${REVIEW_CHECK_B64:-}"
+          decode_status=1
+          payload_bytes=""
+          if [ "${#payload_b64}" -le 100000 ] && [ -n "$payload_b64" ]; then
+            printf '%s' "$payload_b64" | base64 --decode > claimci-review-check.json
+            decode_status=$?
+          fi
+          summary_bytes=""
+          if [ "$decode_status" -eq 0 ] && [ -s claimci-review-check.json ]; then
+            payload_bytes="$(wc -c < claimci-review-check.json | tr -d '[:space:]')"
+            summary_bytes="$(jq -j '.output.summary' claimci-review-check.json 2>/dev/null | wc -c | tr -d '[:space:]')"
+          fi
+          if [ "$decode_status" -ne 0 ] || [ ! -s claimci-review-check.json ] || \
+             [ -z "$payload_bytes" ] || [ "$payload_bytes" -gt 100000 ] || \
+             [ -z "$summary_bytes" ] || [ "$summary_bytes" -gt 60000 ] || \
+             ! jq -e \
+               --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+               --arg details_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+               'type == "object" and (keys | sort) == (["conclusion", "details_url", "head_sha", "name", "output", "status"] | sort) and .name == "ClaimCI Research Review" and .head_sha == $head_sha and .status == "completed" and .conclusion == "neutral" and .details_url == $details_url and (.output | type == "object") and (.output | keys | sort) == (["summary", "title"] | sort) and .output.title == "ClaimCI Research Review - advisory" and (.output.summary | type == "string")' \
+               claimci-review-check.json >/dev/null 2>&1; then
+            jq -n \
+              --arg head_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg details_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{name:"ClaimCI Research Review",head_sha:$head_sha,status:"completed",conclusion:"neutral",details_url:$details_url,output:{title:"ClaimCI Research Review - advisory",summary:"## ClaimCI Research Review (Advisory)\n\nReview unavailable; the optional advisory integration could not render a review."}}' > claimci-review-check.json
+          fi
+          set -e
+          gh api --method POST --input claimci-review-check.json "repos/${GITHUB_REPOSITORY}/check-runs"

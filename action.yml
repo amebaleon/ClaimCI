@@ -1,0 +1,31 @@
+name: ClaimCI immutable installer
+description: Install ClaimCI from the immutable action revision.
+
+inputs:
+  install-review-dependencies:
+    description: Install ClaimCI's optional review dependencies.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install ClaimCI from the downloaded action
+      shell: bash
+      env:
+        CLAIMCI_ACTION_PATH: ${{ github.action_path }}
+        CLAIMCI_INSTALL_REVIEW_DEPENDENCIES: ${{ inputs.install-review-dependencies }}
+      run: |
+        set -eu
+        case "$CLAIMCI_INSTALL_REVIEW_DEPENDENCIES" in
+          false)
+            python -m pip install --disable-pip-version-check "$CLAIMCI_ACTION_PATH"
+            ;;
+          true)
+            python -m pip install --disable-pip-version-check "$CLAIMCI_ACTION_PATH[llm]"
+            ;;
+          *)
+            echo "install-review-dependencies must be exactly true or false" >&2
+            exit 2
+            ;;
+        esac

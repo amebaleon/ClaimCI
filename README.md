@@ -244,6 +244,30 @@ claimci audit examples/day2_demo/research.yaml --json > day2-demo.json
 
 The command intentionally exits `1`; open `day2-demo.md` in a Markdown preview to show the PR-ready view. See [the demo guide](examples/day2_demo/README.md) for the exact story and limitations.
 
+## External private-repository pilot
+
+ClaimCI v0 can be consumed from a separate private repository owned by the same
+GitHub user through a full-SHA-pinned reusable workflow. The consumer contains
+only a tiny caller workflow and its declared research artifacts; it does not
+copy ClaimCI source or installer code. GitHub's private Actions sharing boundary
+does not support arbitrary external repositories, so configure the ClaimCI
+repository's Actions access for same-owner private repositories before testing.
+
+Generate the clean PR#1-style consumer fixture with a reviewed workflow commit:
+
+```powershell
+python scripts/materialize_external_demo.py `
+  --workflow-sha <reviewed-workflow-commit-sha> `
+  --output C:\path\to\ClaimCI-Demo
+```
+
+Add `--enable-review` only when the trusted base should carry the disabled
+advisory review configuration. The deterministic Audit needs no API key and is
+the only blocking Check; Review is neutral and optional. See the
+[external-install v0 guide](docs/external-install-v0.md) for the exact manual
+pilot steps, branch protection, fork/passive-data boundary, and troubleshooting.
+When review is enabled, pull_request_target fork-authored head content may be sent to the configured provider; keep review disabled when that egress is not approved.
+
 ## Current limitations
 
 ClaimCI does not establish statistical significance, causal validity, artifact
