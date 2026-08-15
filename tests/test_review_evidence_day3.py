@@ -18,6 +18,7 @@ import pytest
 from claimci.review.evidence import discover_evidence
 from claimci.review.models import (
     ClaimType,
+    ReviewError,
     ReviewLimits,
     ScientificClaim,
     SourceKind,
@@ -392,6 +393,41 @@ def test_evidence_is_sorted_bounded_and_content_addressed(tmp_path: Path) -> Non
         assert reference.size == len(raw)
         assert reference.start_line >= 1
         assert reference.end_line >= reference.start_line
+
+
+def test_trusted_priority_preempts_heuristics_without_weakening_confinement(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "a-decoy-results.json", '{"unrelated": true}\n')
+    _write(tmp_path, "z-declared-results.json", '{"accuracy": 0.9}\n')
+    claim = _claim("metric_improvement")
+    paths = ["a-decoy-results.json", "z-declared-results.json"]
+
+    bundle = discover_evidence(
+        tmp_path,
+        [claim],
+        paths,
+        limits=_limits(max_files=1),
+        priority_paths={claim.claim_id: ["z-declared-results.json"]},
+    )
+
+    assert [reference.path for reference in bundle.references] == [
+        "z-declared-results.json"
+    ]
+    with pytest.raises(ReviewError, match="unsafe or not indexed"):
+        discover_evidence(
+            tmp_path,
+            [claim],
+            paths,
+            priority_paths={claim.claim_id: ["../outside.json"]},
+        )
+    with pytest.raises(ReviewError, match="unknown claim"):
+        discover_evidence(
+            tmp_path,
+            [claim],
+            paths,
+            priority_paths={"claim-invented": ["z-declared-results.json"]},
+        )
 
 
 def test_evidence_only_reads_indexed_regular_files_and_preserves_relative_paths(

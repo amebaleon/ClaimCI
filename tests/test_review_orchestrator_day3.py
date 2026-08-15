@@ -9,17 +9,20 @@ observability cannot become a scientific decision.
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+import yaml
 
 from claimci.review.models import ProviderUsage, ReviewConfig, ReviewLimits, ReviewStatus
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.evidence import EvidenceBundle, EvidenceKind, EvidenceReference
+from claimci.review.report import render_review_markdown
 
 
 TITLE = "Candidate improves accuracy by five percentage points"
@@ -189,6 +192,7 @@ def _wrap_pipeline(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
         "validate_claim_candidates": "validate",
         "discover_evidence": "evidence",
         "discover_manifests": "manifests",
+        "plan_manifest_audits": "plans",
         "run_manifest_audits": "audits",
     }
     for name, label in names.items():
@@ -213,11 +217,12 @@ def test_run_review_uses_exact_extract_discover_tools_synthesize_sequence(
     assert result.status is ReviewStatus.COMPLETE
     assert events == [
         "sources",
+        "manifests",
+        "plans",
         "extract_claims",
         "validate",
-        "evidence",
-        "manifests",
         "audits",
+        "evidence",
         "synthesize_review",
     ]
     assert len(provider.calls) == 2
@@ -621,6 +626,130 @@ def test_file_limit_is_global_across_sources_evidence_and_manifests(
         item["manifest_path"] for item in synthesis["deterministic_audits"]
     }
     assert len(extraction_paths | evidence_paths | manifest_paths) <= 24
+
+
+@pytest.mark.parametrize("normalized_metric", ["accuracy", None])
+def test_pr1_manifest_evidence_preempts_unrelated_heuristic_matches(
+    tmp_path: Path,
+    normalized_metric: str | None,
+) -> None:
+    """The PR's declared experiment must not be starved by broad retrieval."""
+
+    repository = tmp_path / "pull-request"
+    demo = repository / "examples" / "day2_demo"
+    demo.mkdir(parents=True)
+    fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+    artifact_names = (
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "baseline-train.jsonl",
+        "baseline-eval.jsonl",
+        "candidate-config.yaml",
+        "candidate-results.json",
+        "candidate-train.jsonl",
+        "candidate-eval.jsonl",
+    )
+    for name in artifact_names:
+        shutil.copyfile(fixture / name, demo / name)
+
+    manifest_payload = yaml.safe_load((fixture / "research.yaml").read_text(encoding="utf-8"))
+    for experiment_name in ("baseline", "candidate"):
+        for field, relative in manifest_payload[experiment_name].items():
+            manifest_payload[experiment_name][field] = f"examples/day2_demo/{relative}"
+    (repository / "research.yaml").write_text(
+        yaml.safe_dump(manifest_payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    # Mirror the live repository shape: many lexically earlier files match the
+    # broad metric route, and more than four nested manifests precede the root
+    # manifest under the old lexical-only discovery order.
+    for index in range(30):
+        decoy = repository / "examples" / f"decoy-{index:02d}"
+        decoy.mkdir(parents=True)
+        (decoy / "results.json").write_text(
+            json.dumps({"unrelated": index}), encoding="utf-8"
+        )
+        if index < 6:
+            (decoy / "research.yaml").write_text(
+                "claim: [not a usable manifest]", encoding="utf-8"
+            )
+    source_decoy = repository / "claimci" / "config_check.py"
+    source_decoy.parent.mkdir()
+    source_decoy.write_text("UNRELATED = True\n", encoding="utf-8")
+
+    title = "Candidate improves accuracy from 0.60 to 0.90"
+
+    def extraction(request: StructuredRequest) -> str:
+        payload = json.loads(_extraction_output(request, title=title))
+        payload["claims"][0]["metric"] = normalized_metric
+        return json.dumps(payload)
+
+    def grounded_synthesis(request: StructuredRequest) -> str:
+        claim = _mapping(request.payload["claims"][0])
+        claim_id = claim["claim_id"]
+        citations = [
+            item["evidence_id"]
+            for item in request.payload["evidence"]
+            if claim_id in item["claim_ids"]
+        ]
+        return json.dumps(
+            {
+                "interpretations": [
+                    {
+                        "claim_id": claim_id,
+                        "interpretation": (
+                            "The submitted score improves, but deterministic "
+                            "ClaimCI findings invalidate the stronger claim."
+                        ),
+                        "citations": citations,
+                        "missing_evidence": [],
+                        "unsupported_inferences": [],
+                        "confidence": 0.95,
+                    }
+                ]
+            }
+        )
+
+    provider = FakeProvider(extraction=extraction, synthesis=grounded_synthesis)
+    result = run_review(
+        ReviewInputs(repository_root=repository, pr_title=title),
+        _config(max_files=24),
+        provider=provider,
+    )
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert len(provider.calls) == 2
+    root_audit = next(
+        audit for audit in result.deterministic_audits if audit.manifest_path == "research.yaml"
+    )
+    assert root_audit.verdict == "NOT_SUPPORTED"
+    assert {
+        "CONFIG.COMPUTE_MISMATCH",
+        "RESULT.CLAIM_SUPPORTED",
+        "DATASET.EXACT_LEAKAGE",
+    }.issubset({finding.rule_id for finding in root_audit.findings})
+
+    declared_paths = (
+        "research.yaml",
+        *(f"examples/day2_demo/{name}" for name in artifact_names),
+    )
+    evidence_paths = tuple(reference.path for reference in result.evidence.references)
+    assert evidence_paths[: len(declared_paths)] == declared_paths
+    assert set(declared_paths).issubset(evidence_paths)
+    extraction_paths = {
+        source["path"]
+        for source in provider.calls[0].payload["sources"]
+        if source["path"]
+    }
+    assert len(extraction_paths | set(evidence_paths)) <= 24
+
+    issued_ids = {reference.evidence_id for reference in result.evidence.references}
+    assert set(result.interpretations[0].citations).issubset(issued_ids)
+    markdown = render_review_markdown(result)
+    assert "No deterministic ClaimCI audit evidence was discovered." not in markdown
+    assert "CONFIG.COMPUTE&#95;MISMATCH" in markdown
+    assert "DATASET.EXACT&#95;LEAKAGE" in markdown
 
 
 def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: Path) -> None:
