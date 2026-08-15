@@ -284,4 +284,9 @@ def test_review_handoff_is_bounded_and_revalidated_for_the_pr_head() -> None:
     assert cap and int(cap.group(1)) <= 120_000
     assert '.head_sha == $head_sha' in publisher_commands
     assert '.conclusion == "neutral"' in publisher_commands
-    assert '65535' in publisher_commands
+    assert "jq -j '.output.summary'" in publisher_commands
+    assert "wc -c" in publisher_commands
+    byte_cap = re.search(r'\$summary_bytes"?\s*-gt\s+(\d+)', publisher_commands)
+    assert byte_cap and int(byte_cap.group(1)) <= 60_000
+    assert ".output.summary | length" not in publisher_commands
+    assert "Review unavailable; the optional advisory integration" in publisher_commands

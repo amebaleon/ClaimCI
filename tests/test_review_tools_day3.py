@@ -32,14 +32,14 @@ def test_manifest_discovery_is_bounded_sorted_and_repository_confined(
 
     paths = ["nested/research.yaml", "research.yaml", "../outside-research.yaml", "README.md"]
     discovered = discover_manifests(root, paths, max_manifests=1)
-    assert discovered == ("nested/research.yaml",)
+    assert discovered == ("research.yaml",)
     assert all(not Path(path).is_absolute() for path in discovered)
     assert all(".." not in Path(path).parts for path in discovered)
 
     # Shuffling the path index must not change selection or order.
     assert discover_manifests(root, list(reversed(paths)), max_manifests=4) == (
-        "nested/research.yaml",
         "research.yaml",
+        "nested/research.yaml",
     )
 
 
