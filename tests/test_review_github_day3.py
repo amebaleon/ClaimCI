@@ -8,7 +8,9 @@ an API key.
 
 from __future__ import annotations
 
+import base64
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,7 +25,7 @@ from tests.test_markdown_day2 import _result
 
 GOOD_SHA = "a" * 40
 GOOD_SHA_64 = "B" * 64
-MAX_CHECK_SUMMARY = 65_535
+MAX_CHECK_SUMMARY_BYTES = 60_000
 
 
 def _review(status: ReviewStatus = ReviewStatus.COMPLETE) -> ResearchReview:
@@ -153,18 +155,76 @@ def test_adapter_accepts_only_hex_commit_sha_shapes(head_sha: str) -> None:
 
 
 def test_summary_is_bounded_deterministically_and_remains_strict_json() -> None:
-    """GitHub's output limit is enforced before publication."""
+    """The post-render Check summary is bounded by UTF-8 bytes, not characters."""
 
-    oversized = "prefix-" + ("x" * (MAX_CHECK_SUMMARY + 10_000))
+    escaped_unit = "\ud55c&lt;record&gt;"
+    oversized = (
+        "## ClaimCI Research Review (Advisory)\n\n"
+        + escaped_unit * 4_000
+    )
+    assert len(oversized) < 65_535
+    assert len(oversized.encode("utf-8")) > 65_535
     first = _build(_review(), oversized)
     second = _build(_review(), oversized)
 
     assert first == second
     summary = first["output"]["summary"]
-    assert len(summary) <= MAX_CHECK_SUMMARY
-    assert summary.startswith("prefix-")
+    encoded = summary.encode("utf-8")
+    assert len(encoded) <= MAX_CHECK_SUMMARY_BYTES
+    assert encoded.decode("utf-8") == summary
+    assert summary.startswith("## ClaimCI Research Review (Advisory)")
     assert "truncat" in summary.casefold()
     json.dumps(first, ensure_ascii=False, allow_nan=False)
+
+
+def test_malformed_oversized_input_uses_small_neutral_fallback() -> None:
+    """Publisher-bound malformed data cannot retain an oversized summary."""
+
+    oversized = "\ud55c" * 30_000
+    payload = _build(None, oversized)
+    summary = payload["output"]["summary"]
+
+    assert payload["conclusion"] == "neutral"
+    assert "unavailable" in summary.casefold()
+    assert len(summary.encode("utf-8")) <= MAX_CHECK_SUMMARY_BYTES
+    assert oversized not in summary
+
+
+def test_cli_preserves_utf8_and_fits_the_cross_job_handoff(tmp_path: Path) -> None:
+    """Escaped JSON must not re-expand a bounded Unicode summary past handoff."""
+
+    from claimci.review.github import main
+
+    review_json = tmp_path / "review.json"
+    markdown = tmp_path / "review.md"
+    output = tmp_path / "check.json"
+    review_json.write_text(
+        json.dumps({"review": {"status": "PARTIAL"}}), encoding="utf-8"
+    )
+    markdown.write_text(
+        "## ClaimCI Research Review (Advisory)\n\n" + "\U0001f9ea" * 20_000,
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "--review-json",
+            str(review_json),
+            "--markdown",
+            str(markdown),
+            "--head-sha",
+            GOOD_SHA,
+            "--output",
+            str(output),
+        ]
+    ) == 0
+
+    encoded_payload = output.read_bytes()
+    assert len(base64.b64encode(encoded_payload)) < 100_000
+    payload = json.loads(encoded_payload.decode("utf-8"))
+    summary = payload["output"]["summary"]
+    assert len(summary.encode("utf-8")) <= MAX_CHECK_SUMMARY_BYTES
+    assert "truncat" in summary.casefold()
 
 
 def test_adapter_preserves_renderer_escaping_byte_for_byte() -> None:

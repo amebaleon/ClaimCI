@@ -28,7 +28,9 @@ from .orchestrator import ResearchReview
 
 
 CHECK_NAME = "ClaimCI Research Review"
-MAX_CHECK_SUMMARY = 65_535
+# GitHub enforces this field in UTF-8 bytes.  Stay below the documented
+# 65,535-byte ceiling so serialization and platform edge cases retain margin.
+MAX_CHECK_SUMMARY_BYTES = 60_000
 _HEAD_SHA = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
 
@@ -41,16 +43,21 @@ def _strict_json_safe(value: object) -> bool:
 
 
 def _bounded_summary(summary: str) -> str:
-    """Bound a renderer-owned summary to GitHub's Check Run limit."""
+    """Bound final renderer output without splitting a UTF-8 code point."""
 
-    if len(summary) <= MAX_CHECK_SUMMARY:
+    encoded = summary.encode("utf-8")
+    if len(encoded) <= MAX_CHECK_SUMMARY_BYTES:
         return summary
     notice = (
         "\n\n> **ClaimCI:** advisory review summary truncated to satisfy the "
         "GitHub Check Run output limit."
     )
-    keep = max(0, MAX_CHECK_SUMMARY - len(notice))
-    return summary[:keep] + notice
+    notice_bytes = notice.encode("utf-8")
+    keep = max(0, MAX_CHECK_SUMMARY_BYTES - len(notice_bytes))
+    # The input is already rendered and escaped. Decode only the retained byte
+    # prefix, dropping at most the incomplete final code point at the cut.
+    prefix = encoded[:keep].decode("utf-8", errors="ignore")
+    return prefix + notice
 
 
 def _integration_summary(reason: str) -> str:
@@ -84,7 +91,11 @@ def _valid_markdown(markdown: object) -> bool:
 
     if not isinstance(markdown, str) or not markdown.strip():
         return False
-    if len(markdown) >= MAX_CHECK_SUMMARY:
+    try:
+        encoded_size = len(markdown.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    if encoded_size >= MAX_CHECK_SUMMARY_BYTES:
         return True
     return markdown.startswith("## ClaimCI Research Review (Advisory)")
 
@@ -227,7 +238,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     encoded = json.dumps(
         payload,
-        ensure_ascii=True,
+        # Preserve UTF-8 instead of expanding every non-ASCII code point into
+        # JSON escapes; the payload then remains inside the bounded job handoff.
+        ensure_ascii=False,
         indent=2,
         sort_keys=True,
         allow_nan=False,

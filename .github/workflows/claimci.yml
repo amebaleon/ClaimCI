@@ -303,7 +303,15 @@ jobs:
           # fixed neutral advisory Check and cannot affect ClaimCI Audit.
           expected_head_sha="${{ github.event.pull_request.head.sha }}"
           expected_details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          summary_bytes=""
+          if [ "$decode_status" -eq 0 ] && [ -s claimci-review-check.json ]; then
+            if jq -j '.output.summary' claimci-review-check.json \
+                 > claimci-review-summary.txt 2>/dev/null; then
+              summary_bytes="$(wc -c < claimci-review-summary.txt | tr -d '[:space:]')"
+            fi
+          fi
           if [ "$decode_status" -ne 0 ] || [ ! -s claimci-review-check.json ] || \
+             [ -z "$summary_bytes" ] || [ "$summary_bytes" -gt 60000 ] || \
              ! jq -e \
                --arg head_sha "$expected_head_sha" \
                --arg details_url "$expected_details_url" \
@@ -317,8 +325,7 @@ jobs:
                 (.output | type == "object") and
                 (.output | keys | sort) == (["summary", "title"] | sort) and
                 .output.title == "ClaimCI Research Review - advisory" and
-                (.output.summary | type == "string") and
-                (.output.summary | length) <= 65535' \
+                (.output.summary | type == "string")' \
              claimci-review-check.json >/dev/null 2>&1; then
             jq -n \
               --arg head_sha "${{ github.event.pull_request.head.sha }}" \
