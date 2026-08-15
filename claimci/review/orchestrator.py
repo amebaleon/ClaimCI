@@ -15,12 +15,14 @@ from claimci.parsing import unique_json_object
 
 from .evidence import EvidenceBundle, discover_evidence
 from .models import (
+    ClaimType,
     ProviderCallRecord,
     ProviderUsage,
     ReviewConfig,
     ReviewError,
     ReviewStatus,
     ScientificClaim,
+    SourceBundle,
 )
 from .openai_provider import OpenAIReviewerProvider
 from .provider import (
@@ -32,7 +34,10 @@ from .provider import (
 from .sources import collect_review_sources, validate_claim_candidates
 from .tools import (
     DeterministicAuditSnapshot,
+    ManifestAuditBundle,
+    ManifestAuditPlan,
     discover_manifests,
+    plan_manifest_audits,
     run_manifest_audits,
 )
 
@@ -476,6 +481,72 @@ def _record_call(
     )
 
 
+def _sources_after_manifest_reservation(
+    sources: SourceBundle,
+    audit_plans: Sequence[ManifestAuditPlan],
+    *,
+    max_files: int,
+) -> SourceBundle:
+    """Keep metadata and only repository sources left after audit priority."""
+
+    selected = {
+        path
+        for plan in audit_plans
+        for path in plan.paths
+    }
+    kept = []
+    for source in sources.sources:
+        if source.path is None:
+            kept.append(source)
+            continue
+        if source.path in selected:
+            kept.append(source)
+            continue
+        if len(selected) >= max_files:
+            continue
+        kept.append(source)
+        selected.add(source.path)
+    return SourceBundle(
+        sources=tuple(kept),
+        repository_paths=sources.repository_paths,
+        changed_paths=sources.changed_paths,
+        total_chars=sum(len(source.text) for source in kept),
+    )
+
+
+def _manifest_priority_paths(
+    claims: Sequence[ScientificClaim],
+    audit_bundles: Sequence[ManifestAuditBundle],
+    *,
+    repository_paths: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    """Associate trusted manifest inputs with claims they can actually inform."""
+
+    indexed = set(repository_paths)
+    routed: dict[str, tuple[str, ...]] = {}
+    generally_auditable = {
+        ClaimType.METRIC_IMPROVEMENT,
+        ClaimType.COMPUTE_EQUIVALENCE,
+        ClaimType.HELD_OUT_EVALUATION,
+        ClaimType.COMPONENT_CAUSALITY,
+    }
+    for claim in claims:
+        paths: list[str] = []
+        for bundle in audit_bundles:
+            metric_matches = (
+                claim.metric is not None
+                and claim.metric.casefold() == bundle.snapshot.metric.casefold()
+            )
+            if not metric_matches and claim.claim_type not in generally_auditable:
+                continue
+            for path in bundle.paths:
+                if path in indexed and path not in paths:
+                    paths.append(path)
+        if paths:
+            routed[claim.claim_id] = tuple(paths)
+    return routed
+
+
 def run_review(
     inputs: ReviewInputs,
     config: ReviewConfig,
@@ -512,6 +583,21 @@ def run_review(
             pr_description=inputs.pr_description,
             limits=config.limits,
         )
+        manifest_candidates = discover_manifests(
+            inputs.repository_root,
+            sources.repository_paths,
+            max_manifests=min(4, config.limits.max_files),
+        )
+        audit_plans = plan_manifest_audits(
+            inputs.repository_root,
+            manifest_candidates,
+            limits=config.limits,
+        )
+        sources = _sources_after_manifest_reservation(
+            sources,
+            audit_plans,
+            max_files=config.limits.max_files,
+        )
         extraction_payload = {
             "policy": {
                 "mode": "advisory",
@@ -547,28 +633,41 @@ def run_review(
         claims = validate_claim_candidates(
             _parse_json(extraction_response.output_text), sources
         )
+        deterministic_audits = run_manifest_audits(
+            inputs.repository_root,
+            manifest_candidates,
+            limits=config.limits,
+        )
+        plans_by_manifest = {
+            plan.manifest_path: plan for plan in audit_plans
+        }
+        audit_bundles = tuple(
+            ManifestAuditBundle(snapshot=snapshot, paths=plan.paths)
+            for snapshot in deterministic_audits
+            if (plan := plans_by_manifest.get(snapshot.manifest_path)) is not None
+        )
         selected_paths = {
             source.path for source in sources.sources if source.path is not None
         }
+        selected_paths.update(
+            path
+            for bundle in audit_bundles
+            for path in bundle.paths
+            if path in sources.repository_paths
+        )
+        priority_paths = _manifest_priority_paths(
+            claims,
+            audit_bundles,
+            repository_paths=sources.repository_paths,
+        )
         evidence = discover_evidence(
             inputs.repository_root,
             claims,
             sources.repository_paths,
             limits=config.limits,
+            priority_paths=priority_paths,
             selected_paths=tuple(sorted(selected_paths)),
             changed_paths=sources.changed_paths,
-        )
-        selected_paths.update(reference.path for reference in evidence.references)
-        manifest_candidates = discover_manifests(
-            inputs.repository_root,
-            sources.repository_paths,
-            max_manifests=min(4, config.limits.max_files),
-        )
-        deterministic_audits = run_manifest_audits(
-            inputs.repository_root,
-            manifest_candidates,
-            limits=config.limits,
-            selected_paths=tuple(sorted(selected_paths)),
         )
         if config.limits.max_calls < 2:
             return _result(

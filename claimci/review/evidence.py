@@ -318,6 +318,7 @@ def discover_evidence(
     *,
     limits: ReviewLimits = ReviewLimits(),
     suggested_paths: Mapping[str, Sequence[str]] | None = None,
+    priority_paths: Mapping[str, Sequence[str]] | None = None,
     selected_paths: Sequence[str] = (),
     changed_paths: Sequence[str] | None = None,
 ) -> EvidenceBundle:
@@ -326,6 +327,8 @@ def discover_evidence(
     ``selected_paths`` contains repository files already sent during claim
     extraction.  They may be reused without consuming another slot; every new
     evidence path consumes one of the same ``limits.max_files`` slots.
+    ``priority_paths`` is trusted deterministic routing data, never a provider
+    hint; those paths are issued before broader heuristic matches.
     """
 
     root = _root(repository_root)
@@ -367,7 +370,30 @@ def discover_evidence(
                 raise ReviewError("changed evidence path is unsafe or not indexed")
             changed.add(normalized)
     by_path: dict[str, set[str]] = defaultdict(set)
+    priority_order: list[str] = []
     missing: list[MissingEvidence] = []
+
+    claim_ids = {claim.claim_id for claim in claims}
+    if priority_paths is not None:
+        if not isinstance(priority_paths, Mapping):
+            raise ReviewError("priority evidence paths must be a mapping")
+        if any(claim_id not in claim_ids for claim_id in priority_paths):
+            raise ReviewError("priority evidence paths cite an unknown claim")
+        for claim in claims:
+            raw_paths = priority_paths.get(claim.claim_id, ())
+            if not isinstance(raw_paths, Sequence) or isinstance(
+                raw_paths, (str, bytes)
+            ):
+                raise ReviewError("priority evidence paths must be sequences")
+            for raw in raw_paths:
+                normalized = _safe_relative(raw)
+                if normalized is None or normalized not in normalized_index:
+                    raise ReviewError(
+                        "priority evidence path is unsafe or not indexed"
+                    )
+                by_path[normalized].add(claim.claim_id)
+                if normalized not in priority_order:
+                    priority_order.append(normalized)
 
     for claim in claims:
         for path in sorted_index:
@@ -420,7 +446,12 @@ def discover_evidence(
     references: list[EvidenceReference] = []
     file_limit_counts: dict[str, int] = defaultdict(int)
     remaining = limits.max_context_chars
-    for relative in sorted(by_path):
+    priority_set = set(priority_order)
+    ordered_paths = (
+        *priority_order,
+        *(path for path in sorted(by_path) if path not in priority_set),
+    )
+    for relative in ordered_paths:
         if remaining <= 0:
             break
         if relative not in selected and len(selected) >= limits.max_files:

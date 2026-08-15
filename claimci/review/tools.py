@@ -52,6 +52,22 @@ class DeterministicAuditSnapshot:
     findings: tuple[DeterministicFindingSnapshot, ...]
 
 
+@dataclass(frozen=True)
+class ManifestAuditBundle:
+    """One actual deterministic audit plus the submitted files it consumed."""
+
+    snapshot: DeterministicAuditSnapshot
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ManifestAuditPlan:
+    """A path-confined, bounded manifest bundle reserved for later auditing."""
+
+    manifest_path: str
+    paths: tuple[str, ...]
+
+
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
@@ -130,13 +146,13 @@ def discover_manifests(
     *,
     max_manifests: int = 4,
 ) -> tuple[str, ...]:
-    """Return sorted, indexed, confined ClaimCI manifest paths."""
+    """Return bounded, confined manifests with repository-root studies first."""
 
     root = _root(repository_root)
     if isinstance(max_manifests, bool) or not isinstance(max_manifests, int) or max_manifests < 1:
         raise ReviewError("max_manifests must be a positive integer")
-    selected: list[str] = []
-    for raw in sorted(set(repository_paths)):
+    candidates: set[str] = set()
+    for raw in repository_paths:
         relative = _relative(raw)
         if relative is None or PurePosixPath(relative).name.casefold() not in {
             "research.yaml",
@@ -149,20 +165,101 @@ def discover_manifests(
         except (OSError, ValueError, RuntimeError):
             continue
         if resolved.is_file():
-            selected.append(relative)
-            if len(selected) >= max_manifests:
-                break
-    return tuple(selected)
+            candidates.add(relative)
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda path: (
+                len(PurePosixPath(path).parts),
+                path.casefold(),
+                path,
+            ),
+        )[:max_manifests]
+    )
 
 
-def run_manifest_audits(
+def _has_symlink_component(root: Path, relative: str) -> bool:
+    """Reject a lexical link before ``resolve`` erases its provenance."""
+
+    cursor = root
+    try:
+        for part in PurePosixPath(relative).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                return True
+    except (OSError, ValueError, RuntimeError):
+        return True
+    return False
+
+
+def _declared_artifact_paths(
+    root: Path, manifest_relative: str
+) -> tuple[str, ...] | None:
+    """Read declared lexical paths without following provider-selected links."""
+
+    try:
+        manifest_path = root / Path(manifest_relative)
+        payload = load_unique_yaml(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            return None
+        parent = PurePosixPath(manifest_relative).parent
+        declared: list[str] = []
+        for experiment_name in ("baseline", "candidate"):
+            experiment = payload.get(experiment_name)
+            if not isinstance(experiment, Mapping):
+                return None
+            for field in _ARTIFACT_FIELDS:
+                raw = experiment.get(field)
+                # Backslash spellings are platform-ambiguous and are not
+                # accepted by the advisory repository path model.
+                if not isinstance(raw, str) or "\\" in raw:
+                    return None
+                artifact = _relative(raw)
+                if artifact is None:
+                    return None
+                joined = _relative((parent / PurePosixPath(artifact)).as_posix())
+                if joined is None:
+                    return None
+                declared.append(joined)
+        return tuple(declared)
+    except (
+        OSError,
+        UnicodeError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        yaml.YAMLError,
+    ):
+        return None
+
+
+def _bounded_text(root: Path, path: Path, limits: ReviewLimits) -> bool:
+    """Allow missing evidence, but bound every existing file before audit."""
+
+    try:
+        lexical = path.relative_to(root).as_posix()
+        if _has_symlink_component(root, lexical):
+            return False
+        if not path.exists():
+            return True
+        if path.is_symlink() or not path.is_file():
+            return False
+        if path.stat().st_size > limits.max_file_chars * 4:
+            return False
+        with path.open("r", encoding="utf-8", newline=None) as handle:
+            return len(handle.read(limits.max_file_chars + 1)) <= limits.max_file_chars
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return False
+
+
+def plan_manifest_audits(
     repository_root: Path,
     manifest_paths: Sequence[str],
     *,
     limits: ReviewLimits = ReviewLimits(),
     selected_paths: Sequence[str] = (),
-) -> tuple[DeterministicAuditSnapshot, ...]:
-    """Run deterministic audits only after one global bounded-file preflight."""
+) -> tuple[ManifestAuditPlan, ...]:
+    """Reserve safe manifest bundles before broad repository retrieval."""
 
     root = _root(repository_root)
     if not isinstance(limits, ReviewLimits):
@@ -180,87 +277,20 @@ def run_manifest_audits(
     if len(selected) > limits.max_files:
         raise ReviewError("selected paths exceed the global review file limit")
 
-    def has_symlink_component(relative: str) -> bool:
-        """Reject a lexical link before ``resolve`` erases its provenance."""
-
-        cursor = root
-        try:
-            for part in PurePosixPath(relative).parts:
-                cursor = cursor / part
-                if cursor.is_symlink():
-                    return True
-        except (OSError, ValueError, RuntimeError):
-            return True
-        return False
-
-    def declared_artifact_paths(manifest_relative: str) -> tuple[str, ...] | None:
-        """Read only declared lexical paths so links can be rejected pre-audit."""
-
-        try:
-            manifest_path = root / Path(manifest_relative)
-            payload = load_unique_yaml(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, Mapping):
-                return None
-            parent = PurePosixPath(manifest_relative).parent
-            declared: list[str] = []
-            for experiment_name in ("baseline", "candidate"):
-                experiment = payload.get(experiment_name)
-                if not isinstance(experiment, Mapping):
-                    return None
-                for field in _ARTIFACT_FIELDS:
-                    raw = experiment.get(field)
-                    # Backslash spellings are platform-ambiguous and are not
-                    # accepted by the advisory repository path model.
-                    if not isinstance(raw, str) or "\\" in raw:
-                        return None
-                    artifact = _relative(raw)
-                    if artifact is None:
-                        return None
-                    joined = _relative((parent / PurePosixPath(artifact)).as_posix())
-                    if joined is None:
-                        return None
-                    declared.append(joined)
-            return tuple(declared)
-        except (
-            OSError,
-            UnicodeError,
-            TypeError,
-            ValueError,
-            RuntimeError,
-            yaml.YAMLError,
-        ):
-            return None
-
-    def bounded_text(path: Path) -> bool:
-        """Allow missing evidence, but bound every existing file before audit."""
-
-        try:
-            lexical = path.relative_to(root).as_posix()
-            if has_symlink_component(lexical):
-                return False
-            if not path.exists():
-                return True
-            if path.is_symlink() or not path.is_file():
-                return False
-            if path.stat().st_size > limits.max_file_chars * 4:
-                return False
-            with path.open("r", encoding="utf-8", newline=None) as handle:
-                return len(handle.read(limits.max_file_chars + 1)) <= limits.max_file_chars
-        except (OSError, UnicodeError, ValueError, RuntimeError):
-            return False
-
-    snapshots: list[DeterministicAuditSnapshot] = []
+    plans: list[ManifestAuditPlan] = []
     for raw in manifest_paths:
         relative = _relative(raw)
         if relative is None:
             continue
         try:
             lexical_manifest = root / Path(relative)
-            if has_symlink_component(relative) or not bounded_text(lexical_manifest):
+            if _has_symlink_component(root, relative) or not _bounded_text(
+                root, lexical_manifest, limits
+            ):
                 continue
-            lexical_artifacts = declared_artifact_paths(relative)
+            lexical_artifacts = _declared_artifact_paths(root, relative)
             if lexical_artifacts is None or any(
-                has_symlink_component(path) for path in lexical_artifacts
+                _has_symlink_component(root, path) for path in lexical_artifacts
             ):
                 continue
             manifest = lexical_manifest.resolve()
@@ -268,19 +298,77 @@ def run_manifest_audits(
             load_research_spec(manifest, artifact_root=root)
             # Count the declared lexical files.  Links were rejected before
             # resolution, so these names preserve the submitted provenance.
-            audit_paths = {relative, *lexical_artifacts}
+            ordered_audit_paths = tuple(
+                dict.fromkeys((relative, *lexical_artifacts))
+            )
+            audit_paths = set(ordered_audit_paths)
             if len(selected | audit_paths) > limits.max_files:
                 continue
             if any(
-                not bounded_text(root / Path(artifact_path))
+                not _bounded_text(root, root / Path(artifact_path), limits)
                 for artifact_path in lexical_artifacts
             ):
                 continue
             selected.update(audit_paths)
-            result = audit_research(manifest, artifact_root=root)
-            snapshots.append(snapshot_audit_result(result, repository_root=root))
+            plans.append(
+                ManifestAuditPlan(
+                    manifest_path=relative,
+                    paths=ordered_audit_paths,
+                )
+            )
         except (ClaimCIError, ReviewError, OSError, ValueError, RuntimeError):
             # A malformed manifest is missing usable deterministic evidence;
             # it never becomes a model-invented finding.
             continue
-    return tuple(snapshots)
+    return tuple(plans)
+
+
+def collect_manifest_audits(
+    repository_root: Path,
+    manifest_paths: Sequence[str],
+    *,
+    limits: ReviewLimits = ReviewLimits(),
+    selected_paths: Sequence[str] = (),
+) -> tuple[ManifestAuditBundle, ...]:
+    """Run planned audits and retain their exact lexical input paths."""
+
+    root = _root(repository_root)
+    plans = plan_manifest_audits(
+        root,
+        manifest_paths,
+        limits=limits,
+        selected_paths=selected_paths,
+    )
+    bundles: list[ManifestAuditBundle] = []
+    for plan in plans:
+        try:
+            result = audit_research(root / Path(plan.manifest_path), artifact_root=root)
+            bundles.append(
+                ManifestAuditBundle(
+                    snapshot=snapshot_audit_result(result, repository_root=root),
+                    paths=plan.paths,
+                )
+            )
+        except (ClaimCIError, ReviewError, OSError, ValueError, RuntimeError):
+            continue
+    return tuple(bundles)
+
+
+def run_manifest_audits(
+    repository_root: Path,
+    manifest_paths: Sequence[str],
+    *,
+    limits: ReviewLimits = ReviewLimits(),
+    selected_paths: Sequence[str] = (),
+) -> tuple[DeterministicAuditSnapshot, ...]:
+    """Compatibility view returning only immutable deterministic snapshots."""
+
+    return tuple(
+        bundle.snapshot
+        for bundle in collect_manifest_audits(
+            repository_root,
+            manifest_paths,
+            limits=limits,
+            selected_paths=selected_paths,
+        )
+    )
