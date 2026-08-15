@@ -1,0 +1,431 @@
+"""Passive, bounded source collection and trusted claim validation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from .models import (
+    ClaimDirection,
+    ClaimMagnitude,
+    ClaimType,
+    MagnitudeKind,
+    ReviewError,
+    ReviewLimits,
+    ScientificClaim,
+    SourceBundle,
+    SourceKind,
+    SourceLocation,
+    SourceRecord,
+)
+
+
+MAX_REPOSITORY_PATHS = 2_048
+MAX_REPOSITORY_ENTRIES = 8_192
+MAX_REPOSITORY_DEPTH = 64
+MAX_CHANGE_COMPARISON_FILES = 512
+MAX_CHANGE_COMPARISON_BYTES = 16 * 1024 * 1024
+MAX_CHANGE_COMPARISON_FILE_BYTES = 1024 * 1024
+MAX_CLAIMS = 64
+MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
+
+
+def _root(path: Path, label: str) -> Path:
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        raise ReviewError(f"{label} is invalid: {exc}") from exc
+    if not resolved.is_dir():
+        raise ReviewError(f"{label} is not a directory: {resolved}")
+    return resolved
+
+
+def _iter_regular_paths(root: Path) -> tuple[str, ...]:
+    paths: list[str] = []
+    visited_entries = 0
+    seen_directories: set[Path] = {root}
+
+    def visit(directory: Path, depth: int) -> bool:
+        nonlocal visited_entries
+        if depth > MAX_REPOSITORY_DEPTH:
+            raise ReviewError("repository nesting exceeds the review index limit")
+        entries: list[os.DirEntry[str]] = []
+        try:
+            with os.scandir(directory) as iterator:
+                for entry in iterator:
+                    visited_entries += 1
+                    if visited_entries > MAX_REPOSITORY_ENTRIES:
+                        raise ReviewError(
+                            "repository entries exceed the review index limit"
+                        )
+                    entries.append(entry)
+        except ReviewError:
+            raise
+        except OSError as exc:
+            raise ReviewError(f"could not enumerate repository: {exc}") from exc
+
+        for entry in sorted(
+            entries,
+            key=lambda item: (item.name.casefold(), item.name),
+        ):
+            candidate = Path(entry.path)
+            try:
+                if entry.name.casefold() in {".git", "__pycache__"}:
+                    continue
+                if entry.is_symlink() or candidate.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    resolved_directory = candidate.resolve()
+                    resolved_directory.relative_to(root)
+                    if resolved_directory in seen_directories:
+                        continue
+                    seen_directories.add(resolved_directory)
+                    if visit(candidate, depth + 1):
+                        return True
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                resolved = candidate.resolve()
+                relative = resolved.relative_to(root).as_posix()
+                if "\\" in relative:
+                    # A literal POSIX backslash cannot be represented by the
+                    # portable review-path model without changing identity.
+                    continue
+            except ReviewError:
+                raise
+            except (OSError, ValueError, RuntimeError):
+                continue
+            paths.append(relative)
+            if len(paths) >= MAX_REPOSITORY_PATHS:
+                return True
+        return False
+
+    visit(root, 0)
+    return tuple(sorted(set(paths)))
+
+
+def _confined_regular_file(root: Path, relative: str) -> Path | None:
+    """Resolve one lexical path without following symlinked components."""
+
+    candidate = root / Path(relative)
+    cursor = root
+    try:
+        for part in Path(relative).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                return None
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+        return resolved if resolved.is_file() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _eligible_document(path: str) -> bool:
+    relative = Path(path)
+    name = relative.name.casefold()
+    suffix = relative.suffix.casefold()
+    return suffix in {".md", ".markdown"} or name == "paper.tex"
+
+
+def _change_candidate(path: str) -> bool:
+    """Return paths whose base/head status can affect review file selection."""
+
+    relative = Path(path)
+    lowered = relative.as_posix().casefold()
+    name = relative.name.casefold()
+    return (
+        _eligible_document(path)
+        or relative.suffix.casefold() in {".py", ".js", ".ts", ".rs", ".go"}
+        or lowered.startswith(("src/", "lib/", "claimci/", "tests/"))
+        or name.startswith("test_")
+    )
+
+
+def _stream_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while block := handle.read(64 * 1024):
+                digest.update(block)
+    except OSError as exc:
+        raise ReviewError(f"could not hash review source {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _changed(
+    path: str,
+    head: Path,
+    base: Path | None,
+    *,
+    comparison_budget: dict[str, int],
+) -> bool:
+    head_path = _confined_regular_file(head, path)
+    if head_path is None:
+        raise ReviewError(f"review source is not a confined regular file: {path}")
+    try:
+        head_size = head_path.stat().st_size
+    except OSError as exc:
+        raise ReviewError(f"could not inspect review source {head_path}: {exc}") from exc
+    if head_size < 0 or head_size > MAX_SOURCE_FILE_BYTES:
+        raise ReviewError(f"review source exceeds the change-inspection limit: {path}")
+    if base is None:
+        return True
+    base_path = _confined_regular_file(base, path)
+    if base_path is None:
+        return True
+    try:
+        base_size = base_path.stat().st_size
+    except OSError as exc:
+        raise ReviewError(f"could not inspect base review source {base_path}: {exc}") from exc
+    if base_size != head_size:
+        return True
+    if base_size > MAX_SOURCE_FILE_BYTES:
+        raise ReviewError(f"base review source exceeds the change-inspection limit: {path}")
+    required_bytes = head_size + base_size
+    if (
+        head_size > MAX_CHANGE_COMPARISON_FILE_BYTES
+        or comparison_budget["files"] <= 0
+        or required_bytes > comparison_budget["bytes"]
+    ):
+        raise ReviewError(
+            "repository change-comparison budget was exhausted before review"
+        )
+    comparison_budget["files"] -= 1
+    comparison_budget["bytes"] -= required_bytes
+    return _stream_digest(head_path) != _stream_digest(base_path)
+
+
+def _bounded_text(path: Path, max_chars: int) -> str:
+    try:
+        # Universal-newline normalization keeps source locations and exact
+        # quotes stable across Windows and POSIX checkouts.
+        with path.open("r", encoding="utf-8") as handle:
+            return handle.read(max_chars)
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        raise ReviewError(f"could not read review source {path}: {exc}") from exc
+
+
+def _source_id(kind: SourceKind, path: str | None, text: str) -> str:
+    material = json.dumps(
+        {"kind": kind.value, "path": path, "text": text},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "source-" + hashlib.sha256(material).hexdigest()[:16]
+
+
+def _record(kind: SourceKind, path: str | None, text: str) -> SourceRecord:
+    return SourceRecord(
+        source_id=_source_id(kind, path, text),
+        kind=kind,
+        path=path,
+        text=text,
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
+
+
+def collect_review_sources(
+    head_root: Path,
+    *,
+    base_root: Path | None = None,
+    pr_title: str = "",
+    pr_description: str = "",
+    limits: ReviewLimits = ReviewLimits(),
+) -> SourceBundle:
+    """Collect bounded PR metadata and changed research documents."""
+
+    if not isinstance(limits, ReviewLimits):
+        raise ReviewError("limits must be ReviewLimits")
+    head = _root(head_root, "head repository root")
+    base = None if base_root is None else _root(base_root, "base repository root")
+    repository_paths = _iter_regular_paths(head)
+    comparison_budget = {
+        "files": MAX_CHANGE_COMPARISON_FILES,
+        "bytes": MAX_CHANGE_COMPARISON_BYTES,
+    }
+    changed_paths = tuple(
+        relative
+        for relative in repository_paths
+        if _change_candidate(relative)
+        if _changed(
+            relative,
+            head,
+            base,
+            comparison_budget=comparison_budget,
+        )
+    )
+    changed_set = set(changed_paths)
+    records: list[SourceRecord] = []
+    remaining = limits.max_context_chars
+
+    for kind, value in (
+        (SourceKind.PULL_REQUEST_TITLE, pr_title),
+        (SourceKind.PULL_REQUEST_DESCRIPTION, pr_description),
+    ):
+        if not isinstance(value, str):
+            raise ReviewError(f"{kind.value} must be a string")
+        if value and remaining > 0:
+            text = value.replace("\r\n", "\n").replace("\r", "\n")[:remaining]
+            records.append(_record(kind, None, text))
+            remaining -= len(text)
+
+    selected = 0
+    for relative in repository_paths:
+        if selected >= limits.max_files or remaining <= 0:
+            break
+        if not _eligible_document(relative) or relative not in changed_set:
+            continue
+        resolved = (head / Path(relative)).resolve()
+        try:
+            resolved.relative_to(head)
+        except ValueError as exc:
+            raise ReviewError(f"review source resolves outside repository: {relative}") from exc
+        text = _bounded_text(resolved, min(limits.max_file_chars, remaining))
+        records.append(_record(SourceKind.REPOSITORY_FILE, relative, text))
+        remaining -= len(text)
+        selected += 1
+
+    return SourceBundle(
+        sources=tuple(records),
+        repository_paths=repository_paths,
+        changed_paths=changed_paths,
+        total_chars=sum(len(record.text) for record in records),
+    )
+
+
+def _strict_fields(value: object, expected: set[str], label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ReviewError(f"{label} must be an object")
+    fields = set(value)
+    if fields != expected:
+        missing = expected - fields
+        extra = fields - expected
+        raise ReviewError(f"{label} fields are invalid; missing={sorted(missing)}, extra={sorted(map(str, extra))}")
+    return value
+
+
+def _string_list(value: object, label: str, *, max_items: int = 32) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > max_items:
+        raise ReviewError(f"{label} must be a bounded list")
+    if not all(isinstance(item, str) and item.strip() and len(item) <= 4_096 for item in value):
+        raise ReviewError(f"{label} must contain bounded non-empty strings")
+    return tuple(value)
+
+
+def _magnitude(value: object) -> ClaimMagnitude | None:
+    if value is None:
+        return None
+    mapping = _strict_fields(value, {"raw", "value", "unit", "kind"}, "claimed_magnitude")
+    return ClaimMagnitude(
+        raw=mapping["raw"],
+        value=mapping["value"],
+        unit=mapping["unit"],
+        kind=MagnitudeKind(mapping["kind"]),
+    )
+
+
+def _quote(record: SourceRecord, start_line: int, end_line: int) -> str:
+    lines = record.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if start_line < 1 or end_line < start_line or end_line > len(lines):
+        raise ReviewError("claim source line span is outside the selected source")
+    return "\n".join(lines[start_line - 1 : end_line])
+
+
+def validate_claim_candidates(
+    payload: object,
+    sources: SourceBundle,
+) -> tuple[ScientificClaim, ...]:
+    """Validate extraction output and assign trusted deterministic claim IDs."""
+
+    if not isinstance(sources, SourceBundle):
+        raise ReviewError("sources must be a SourceBundle")
+    root = _strict_fields(payload, {"claims"}, "claim extraction response")
+    candidates = root["claims"]
+    if not isinstance(candidates, list) or len(candidates) > MAX_CLAIMS:
+        raise ReviewError("claims must be a bounded list")
+    records = {source.source_id: source for source in sources.sources}
+    expected = {
+        "source_text",
+        "claim_type",
+        "subject",
+        "metric",
+        "direction",
+        "claimed_magnitude",
+        "qualifiers",
+        "source",
+        "confidence",
+        "evidence_hints",
+    }
+    accepted: list[ScientificClaim] = []
+    for index, candidate_value in enumerate(candidates):
+        candidate = _strict_fields(candidate_value, expected, f"claim {index}")
+        source_value = _strict_fields(
+            candidate["source"],
+            {"source_id", "start_line", "end_line"},
+            f"claim {index} source",
+        )
+        source_id = source_value["source_id"]
+        if not isinstance(source_id, str) or source_id not in records:
+            raise ReviewError(f"claim {index} cites an unknown source")
+        start_line = source_value["start_line"]
+        end_line = source_value["end_line"]
+        if isinstance(start_line, bool) or not isinstance(start_line, int):
+            raise ReviewError("claim source start_line must be an integer")
+        if isinstance(end_line, bool) or not isinstance(end_line, int):
+            raise ReviewError("claim source end_line must be an integer")
+        record = records[source_id]
+        source_text = candidate["source_text"]
+        if not isinstance(source_text, str) or source_text != _quote(record, start_line, end_line):
+            raise ReviewError(f"claim {index} source quote does not match the trusted source")
+        confidence = candidate["confidence"]
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(float(confidence))
+        ):
+            raise ReviewError("claim confidence must be finite")
+        metric = candidate["metric"]
+        if metric is not None and not isinstance(metric, str):
+            raise ReviewError("claim metric must be a string or null")
+
+        canonical = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        claim_id = "claim-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        if any(existing.claim_id == claim_id for existing in accepted):
+            raise ReviewError(f"claim {index} duplicates an earlier claim")
+        try:
+            claim = ScientificClaim(
+                claim_id=claim_id,
+                source_text=source_text,
+                claim_type=ClaimType(candidate["claim_type"]),
+                subject=candidate["subject"],
+                source=SourceLocation(
+                    source_id=source_id,
+                    kind=record.kind,
+                    path=record.path,
+                    start_line=start_line,
+                    end_line=end_line,
+                ),
+                metric=metric,
+                direction=ClaimDirection(candidate["direction"]),
+                claimed_magnitude=_magnitude(candidate["claimed_magnitude"]),
+                qualifiers=_string_list(candidate["qualifiers"], "claim qualifiers"),
+                confidence=float(confidence),
+                evidence_hints=_string_list(candidate["evidence_hints"], "evidence hints"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReviewError(f"claim {index} is invalid: {exc}") from exc
+        accepted.append(claim)
+    return tuple(accepted)

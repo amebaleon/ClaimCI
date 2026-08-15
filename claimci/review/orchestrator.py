@@ -1,0 +1,638 @@
+"""Fixed two-call research-review orchestration."""
+
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
+from decimal import Decimal, DecimalException
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from claimci.parsing import unique_json_object
+
+from .evidence import EvidenceBundle, discover_evidence
+from .models import (
+    ProviderCallRecord,
+    ProviderUsage,
+    ReviewConfig,
+    ReviewError,
+    ReviewStatus,
+    ScientificClaim,
+)
+from .openai_provider import OpenAIReviewerProvider
+from .provider import (
+    ProviderResponse,
+    REVIEW_SYSTEM_POLICY,
+    ReviewerProvider,
+    StructuredRequest,
+)
+from .sources import collect_review_sources, validate_claim_candidates
+from .tools import (
+    DeterministicAuditSnapshot,
+    discover_manifests,
+    run_manifest_audits,
+)
+
+
+MAX_PROVIDER_JSON_DEPTH = 64
+
+
+@dataclass(frozen=True)
+class ReviewInputs:
+    repository_root: Path
+    base_root: Path | None = None
+    pr_title: str = ""
+    pr_description: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repository_root, Path):
+            object.__setattr__(self, "repository_root", Path(self.repository_root))
+        if self.base_root is not None and not isinstance(self.base_root, Path):
+            object.__setattr__(self, "base_root", Path(self.base_root))
+        if not isinstance(self.pr_title, str) or not isinstance(self.pr_description, str):
+            raise ReviewError("pull-request title and description must be strings")
+
+
+@dataclass(frozen=True)
+class ClaimInterpretation:
+    claim_id: str
+    interpretation: str
+    citations: tuple[str, ...]
+    missing_evidence: tuple[str, ...]
+    unsupported_inferences: tuple[str, ...]
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ResearchReview:
+    status: ReviewStatus
+    claims: tuple[ScientificClaim, ...] = ()
+    interpretations: tuple[ClaimInterpretation, ...] = ()
+    evidence: EvidenceBundle = EvidenceBundle()
+    deterministic_audits: tuple[DeterministicAuditSnapshot, ...] = ()
+    provider_calls: tuple[ProviderCallRecord, ...] = ()
+    usage: ProviderUsage = ProviderUsage()
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+_EXTRACTION_CONTRACT: dict[str, str] = {
+    "claim_selection": (
+        "Extract only explicit, scientifically verifiable statements present "
+        "in an issued source. Do not emit duplicate claims."
+    ),
+    "source_location": (
+        "Use only an issued source_id and 1-based inclusive start_line/end_line "
+        "values that are inside that source."
+    ),
+    "source_text": (
+        "Copy exactly the complete source line or consecutive complete source "
+        "lines selected by start_line/end_line, including punctuation; do not "
+        "paraphrase, trim, join partial lines, or return a substring."
+    ),
+    "normalized_fields": (
+        "Use non-empty strings for subject and every present metric, magnitude "
+        "text/unit, qualifier, and evidence hint. Use null or [] instead of "
+        "empty strings."
+    ),
+    "authority": (
+        "Do not emit verdicts, findings, severity, impact, thresholds, or "
+        "deterministic evidence."
+    ),
+}
+
+
+_SYNTHESIS_CONTRACT: dict[str, str] = {
+    "claim_coverage": (
+        "Return exactly one interpretation for every issued claim_id, with no "
+        "unknown, omitted, or duplicate claim IDs."
+    ),
+    "citations": (
+        "Citations may contain only issued evidence_id values assigned to that claim "
+        "through the evidence claim_ids field. Do not cite rule IDs, paths, manifests, "
+        "or deterministic finding IDs."
+    ),
+    "missing_evidence": (
+        "When issued evidence does not support a statement, use an empty list for "
+        "citations and describe the gap in missing_evidence or unsupported_inferences."
+    ),
+    "authority": (
+        "Produce advisory interpretation only. Deterministic audit snapshots are "
+        "read-only authority and must not be rewritten, upgraded, or contradicted."
+    ),
+}
+
+
+_EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["claims"],
+    "properties": {
+        "claims": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "source_text",
+                    "claim_type",
+                    "subject",
+                    "metric",
+                    "direction",
+                    "claimed_magnitude",
+                    "qualifiers",
+                    "source",
+                    "confidence",
+                    "evidence_hints",
+                ],
+                "properties": {
+                    "source_text": {"type": "string"},
+                    "claim_type": {
+                        "type": "string",
+                        "enum": [
+                            "metric_improvement",
+                            "compute_equivalence",
+                            "held_out_evaluation",
+                            "resource_reduction",
+                            "component_causality",
+                            "no_external_reward",
+                            "implementation_claim",
+                            "other_scientific",
+                        ],
+                    },
+                    "subject": {"type": "string"},
+                    "metric": {"type": ["string", "null"]},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["higher", "lower", "not_applicable"],
+                    },
+                    "claimed_magnitude": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["raw", "value", "unit", "kind"],
+                                "properties": {
+                                    "raw": {"type": "string"},
+                                    "value": {"type": ["number", "null"]},
+                                    "unit": {"type": ["string", "null"]},
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": ["absolute", "relative", "unspecified"],
+                                    },
+                                },
+                            },
+                        ]
+                    },
+                    "qualifiers": {"type": "array", "items": {"type": "string"}},
+                    "source": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["source_id", "start_line", "end_line"],
+                        "properties": {
+                            "source_id": {"type": "string"},
+                            "start_line": {"type": "integer", "minimum": 1},
+                            "end_line": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "evidence_hints": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        }
+    },
+}
+
+_SYNTHESIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["interpretations"],
+    "properties": {
+        "interpretations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "claim_id",
+                    "interpretation",
+                    "citations",
+                    "missing_evidence",
+                    "unsupported_inferences",
+                    "confidence",
+                ],
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "interpretation": {"type": "string"},
+                    "citations": {"type": "array", "items": {"type": "string"}},
+                    "missing_evidence": {"type": "array", "items": {"type": "string"}},
+                    "unsupported_inferences": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+        }
+    },
+}
+
+
+def _plain(value: Any) -> Any:
+    if is_dataclass(value):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _serialized_chars(value: object) -> int:
+    return len(
+        json.dumps(
+            _plain(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+
+
+def _request_chars(task: str, payload: object, schema: object) -> int:
+    """Count the complete logical provider context, not only repository data."""
+
+    return _serialized_chars(
+        {
+            "system_policy": REVIEW_SYSTEM_POLICY,
+            "task": task,
+            "input": payload,
+            "strict_response_schema": schema,
+        }
+    )
+
+
+def _reject_constant(token: str) -> None:
+    raise ReviewError(f"provider output contains non-finite number {token}")
+
+
+def _validate_depth(value: object, depth: int = 0) -> None:
+    if depth > MAX_PROVIDER_JSON_DEPTH:
+        raise ReviewError("provider output exceeds maximum nesting depth")
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ReviewError("provider output object keys must be strings")
+            _validate_depth(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_depth(item, depth + 1)
+
+
+def _parse_json(text: str) -> object:
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=unique_json_object,
+            parse_constant=_reject_constant,
+        )
+        _validate_depth(value)
+        return value
+    except ReviewError:
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
+        raise ReviewError("provider returned malformed structured output") from exc
+
+
+def _string_tuple(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 64:
+        raise ReviewError(f"{label} must be a bounded list")
+    if not all(isinstance(item, str) and item.strip() and len(item) <= 4_096 for item in value):
+        raise ReviewError(f"{label} contains an invalid string")
+    if any(
+        any(0xD800 <= ord(character) <= 0xDFFF for character in item)
+        for item in value
+    ):
+        raise ReviewError(f"{label} contains an invalid Unicode surrogate")
+    return tuple(value)
+
+
+def _parse_interpretations(
+    value: object,
+    claims: tuple[ScientificClaim, ...],
+    evidence: EvidenceBundle,
+) -> tuple[ClaimInterpretation, ...]:
+    if not isinstance(value, Mapping) or set(value) != {"interpretations"}:
+        raise ReviewError("synthesis response must contain only interpretations")
+    rows = value["interpretations"]
+    if not isinstance(rows, list) or len(rows) > len(claims):
+        raise ReviewError("synthesis interpretations must be a bounded list")
+    claim_ids = {claim.claim_id for claim in claims}
+    evidence_claims = {
+        item.evidence_id: frozenset(item.claim_ids)
+        for item in evidence.references
+    }
+    expected = {
+        "claim_id",
+        "interpretation",
+        "citations",
+        "missing_evidence",
+        "unsupported_inferences",
+        "confidence",
+    }
+    seen: set[str] = set()
+    parsed: list[ClaimInterpretation] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != expected:
+            raise ReviewError("synthesis interpretation fields are invalid")
+        claim_id = row["claim_id"]
+        if not isinstance(claim_id, str) or claim_id not in claim_ids or claim_id in seen:
+            raise ReviewError("synthesis cites an unknown or duplicate claim")
+        interpretation = row["interpretation"]
+        if not isinstance(interpretation, str) or not interpretation.strip() or len(interpretation) > 8_000:
+            raise ReviewError("synthesis interpretation text is invalid")
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in interpretation):
+            raise ReviewError("synthesis interpretation contains an invalid Unicode surrogate")
+        citations = _string_tuple(row["citations"], "synthesis citations")
+        if any(
+            citation not in evidence_claims
+            or claim_id not in evidence_claims[citation]
+            for citation in citations
+        ):
+            raise ReviewError(
+                "synthesis cites unknown or claim-mismatched repository evidence"
+            )
+        confidence = row["confidence"]
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(float(confidence))
+            or not 0 <= float(confidence) <= 1
+        ):
+            raise ReviewError("synthesis confidence is invalid")
+        parsed.append(
+            ClaimInterpretation(
+                claim_id=claim_id,
+                interpretation=interpretation,
+                citations=citations,
+                missing_evidence=_string_tuple(row["missing_evidence"], "missing evidence"),
+                unsupported_inferences=_string_tuple(
+                    row["unsupported_inferences"], "unsupported inferences"
+                ),
+                confidence=float(confidence),
+            )
+        )
+        seen.add(claim_id)
+    if seen != claim_ids:
+        raise ReviewError("synthesis must interpret every accepted claim exactly once")
+    return tuple(parsed)
+
+
+def _aggregate_usage(calls: Sequence[ProviderCallRecord]) -> ProviderUsage:
+    def total(field: str) -> int | None:
+        values = [getattr(call.usage, field) for call in calls]
+        if not values or any(value is None for value in values):
+            return None
+        return sum(values)
+
+    totals_are_consistent = all(
+        call.usage.input_tokens is not None
+        and call.usage.output_tokens is not None
+        and call.usage.total_tokens
+        == call.usage.input_tokens + call.usage.output_tokens
+        for call in calls
+    )
+
+    costs = [call.usage.estimated_cost_usd for call in calls]
+    aggregate_cost: Decimal | None = None
+    if costs and all(cost is not None for cost in costs):
+        try:
+            aggregate_cost = sum(
+                (cost for cost in costs if cost is not None),
+                Decimal(0),
+            )
+        except DecimalException:
+            # Cost is observability only. Decimal context overflow must never
+            # change review status or escape the controlled failure boundary.
+            aggregate_cost = None
+    return ProviderUsage(
+        input_tokens=total("input_tokens"),
+        output_tokens=total("output_tokens"),
+        total_tokens=total("total_tokens") if totals_are_consistent else None,
+        estimated_cost_usd=aggregate_cost,
+    )
+
+
+def _result(
+    status: ReviewStatus,
+    *,
+    claims: tuple[ScientificClaim, ...] = (),
+    interpretations: tuple[ClaimInterpretation, ...] = (),
+    evidence: EvidenceBundle = EvidenceBundle(),
+    deterministic_audits: tuple[DeterministicAuditSnapshot, ...] = (),
+    calls: Sequence[ProviderCallRecord] = (),
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> ResearchReview:
+    call_tuple = tuple(calls)
+    return ResearchReview(
+        status=status,
+        claims=claims,
+        interpretations=interpretations,
+        evidence=evidence,
+        deterministic_audits=deterministic_audits,
+        provider_calls=call_tuple,
+        usage=_aggregate_usage(call_tuple),
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
+def _record_call(
+    task: str,
+    response: ProviderResponse,
+    input_chars: int,
+) -> ProviderCallRecord:
+    if not isinstance(response, ProviderResponse):
+        raise ReviewError("provider returned an invalid response envelope")
+    return ProviderCallRecord(
+        task=task,
+        provider=response.provider,
+        model=response.model,
+        request_id=response.request_id,
+        usage=response.usage,
+        input_chars=input_chars,
+        output_chars=len(response.output_text),
+    )
+
+
+def run_review(
+    inputs: ReviewInputs,
+    config: ReviewConfig,
+    *,
+    provider: ReviewerProvider | None = None,
+) -> ResearchReview:
+    """Run the fixed two-call advisory review state machine."""
+
+    if not isinstance(config, ReviewConfig):
+        raise ReviewError("config must be ReviewConfig")
+    if not config.enabled:
+        return _result(ReviewStatus.DISABLED)
+    if not isinstance(inputs, ReviewInputs):
+        raise ReviewError("inputs must be ReviewInputs")
+    if provider is None:
+        if config.provider != "openai":
+            return _result(
+                ReviewStatus.UNAVAILABLE,
+                error_code="PROVIDER_UNSUPPORTED",
+                error_message="Configured review provider is not available.",
+            )
+        provider = OpenAIReviewerProvider(
+            model=config.model,
+            timeout_seconds=config.limits.timeout_seconds,
+            max_output_tokens=config.limits.max_output_tokens_per_call,
+        )
+
+    calls: list[ProviderCallRecord] = []
+    try:
+        sources = collect_review_sources(
+            inputs.repository_root,
+            base_root=inputs.base_root,
+            pr_title=inputs.pr_title,
+            pr_description=inputs.pr_description,
+            limits=config.limits,
+        )
+        extraction_payload = {
+            "policy": {
+                "mode": "advisory",
+                "untrusted_content": True,
+                "deterministic_authority": "ClaimCI Audit only",
+            },
+            "extraction_contract": dict(_EXTRACTION_CONTRACT),
+            "sources": _plain(sources.sources),
+            "repository_paths": _plain(sources.repository_paths),
+        }
+        extraction_chars = _request_chars(
+            "extract_claims", extraction_payload, _EXTRACTION_SCHEMA
+        )
+        if extraction_chars > config.limits.max_context_chars:
+            return _result(
+                ReviewStatus.UNAVAILABLE,
+                error_code="CONTEXT_LIMIT",
+                error_message="Extraction context exceeds the configured limit.",
+            )
+        extraction_request = StructuredRequest(
+            task="extract_claims",
+            payload=extraction_payload,
+            schema=_EXTRACTION_SCHEMA,
+            max_output_tokens=config.limits.max_output_tokens_per_call,
+        )
+        extraction_response = provider.extract_claims(extraction_request)
+        extraction_call = _record_call(
+            "extract_claims", extraction_response, extraction_chars
+        )
+        calls.append(extraction_call)
+        if extraction_call.output_chars > config.limits.max_output_chars:
+            raise ReviewError("provider extraction output exceeds configured limit")
+        claims = validate_claim_candidates(
+            _parse_json(extraction_response.output_text), sources
+        )
+        selected_paths = {
+            source.path for source in sources.sources if source.path is not None
+        }
+        evidence = discover_evidence(
+            inputs.repository_root,
+            claims,
+            sources.repository_paths,
+            limits=config.limits,
+            selected_paths=tuple(sorted(selected_paths)),
+            changed_paths=sources.changed_paths,
+        )
+        selected_paths.update(reference.path for reference in evidence.references)
+        manifest_candidates = discover_manifests(
+            inputs.repository_root,
+            sources.repository_paths,
+            max_manifests=min(4, config.limits.max_files),
+        )
+        deterministic_audits = run_manifest_audits(
+            inputs.repository_root,
+            manifest_candidates,
+            limits=config.limits,
+            selected_paths=tuple(sorted(selected_paths)),
+        )
+        if config.limits.max_calls < 2:
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="CALL_LIMIT",
+                error_message="Synthesis was skipped by the configured call limit.",
+            )
+        synthesis_payload = {
+            "policy": {
+                "mode": "advisory",
+                "deterministic_authority": "read_only",
+            },
+            "synthesis_contract": dict(_SYNTHESIS_CONTRACT),
+            "claims": _plain(claims),
+            "evidence": _plain(evidence.references),
+            "missing_evidence": _plain(evidence.missing),
+            "deterministic_audits": _plain(deterministic_audits),
+        }
+        synthesis_chars = _request_chars(
+            "synthesize_review", synthesis_payload, _SYNTHESIS_SCHEMA
+        )
+        if extraction_chars + synthesis_chars > config.limits.max_context_chars:
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="CONTEXT_LIMIT",
+                error_message="Synthesis context exceeds the configured limit.",
+            )
+        synthesis_request = StructuredRequest(
+            task="synthesize_review",
+            payload=synthesis_payload,
+            schema=_SYNTHESIS_SCHEMA,
+            max_output_tokens=config.limits.max_output_tokens_per_call,
+        )
+        synthesis_response = provider.synthesize_review(synthesis_request)
+        synthesis_call = _record_call(
+            "synthesize_review", synthesis_response, synthesis_chars
+        )
+        calls.append(synthesis_call)
+        if sum(call.output_chars for call in calls) > config.limits.max_output_chars:
+            raise ReviewError("provider output exceeds configured total limit")
+        interpretations = _parse_interpretations(
+            _parse_json(synthesis_response.output_text), claims, evidence
+        )
+        return _result(
+            ReviewStatus.COMPLETE,
+            claims=claims,
+            interpretations=interpretations,
+            evidence=evidence,
+            deterministic_audits=deterministic_audits,
+            calls=calls,
+        )
+    except Exception as exc:
+        # Provider/model text is never included in the safe status message.
+        return _result(
+            ReviewStatus.UNAVAILABLE,
+            calls=calls,
+            error_code="REVIEW_UNAVAILABLE",
+            error_message=f"Research review is unavailable ({type(exc).__name__}).",
+        )
