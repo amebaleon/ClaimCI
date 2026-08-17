@@ -1,6 +1,10 @@
 """Shared immutable contracts for ClaimCI zero-configuration analysis."""
 
 from .confidence import Confidence
+from .claims import (
+    audit_claim_spec_from_research_spec,
+    audit_relevant_claim_projection,
+)
 from .contracts import (
     Adapter,
     AdapterMatch,
@@ -11,7 +15,9 @@ from .contracts import (
     ArtifactCandidate,
     ArtifactBinding,
     ArtifactKind,
+    AuditClaimSpec,
     ClaimReference,
+    ClaimedMetricValue,
     ComputeEvidence,
     ConfigValue,
     DatasetReference,
@@ -50,7 +56,9 @@ __all__ = [
     "ArtifactCandidate",
     "ArtifactBinding",
     "ArtifactKind",
+    "AuditClaimSpec",
     "ClaimReference",
+    "ClaimedMetricValue",
     "ComputeEvidence",
     "Confidence",
     "ConfigValue",
@@ -78,4 +86,6 @@ __all__ = [
     "Sha256Digest",
     "UnifiedAnalysisResult",
     "to_jsonable",
+    "audit_claim_spec_from_research_spec",
+    "audit_relevant_claim_projection",
 ]
