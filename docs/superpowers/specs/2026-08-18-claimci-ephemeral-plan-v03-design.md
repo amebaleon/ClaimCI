@@ -90,7 +90,10 @@ deterministic engine gains that capability. The planner never inserts zero,
 `0.05`, an epsilon, or a difference calculated from descriptive values.
 
 `ClaimedMetricValue` records a separately validated baseline or candidate value,
-its exact raw text, optional unit, and field provenance. It is descriptive
+its optional exact raw token, optional unit, and field provenance. The raw token
+is nullable because Auto Discovery's current `ClaimedValue` contract preserves
+the numeric value, unit, and provenance while the full exact quotation remains
+in `ClaimReference.text`. It is descriptive
 claim evidence only. It never feeds `minimum_improvement`, native result
 observations, plan identity, or verdict logic merely because it numerically
 matches discovered artifacts. Unstructured values remain preserved in the
@@ -128,6 +131,47 @@ with `MANIFEST_HINT` field provenance. This representation supports common
 analysis consumers, but the legacy audit continues to execute its user-authored
 manifest through the existing native path.
 
+### Auto Discovery conversion
+
+The implemented Auto Discovery contracts enter planning through one explicit
+boundary:
+
+```python
+planning_request_from_discovery(
+    discovery: DiscoveryResult,
+    *,
+    claim_id: str,
+    normalized_evidence: tuple[NormalizedEvidence, ...],
+) -> PlanningRequest
+```
+
+The converter requires exact `DiscoveryResult` and `DiscoveredClaim` values. It
+selects exactly one issued claim ID, reuses its validated `ClaimReference`, and
+constructs `AuditClaimSpec` from the claim's metric, direction, claimed values,
+and field provenance. It accepts only `ClaimType.METRIC_IMPROVEMENT` with a
+present metric and `HIGHER` or `LOWER` direction. Other discovered claim types
+remain `PARTIAL` or unavailable to the current deterministic engine rather than
+being coerced into metric-improvement semantics.
+
+`DiscoveredClaim.baseline_value` and `candidate_value` become descriptive
+`ClaimedMetricValue` records with explicit roles. They do not become result
+observations or thresholds. `DiscoveredClaim.minimum_improvement` becomes a
+threshold only after the bridge independently confirms bounded requirement
+language in `ClaimReference.text` and verifies numeric/unit consistency. A
+from-to value pair alone never supplies that threshold.
+
+Repository identity, head SHA, PR number, artifacts, mapping candidates,
+approved mapping, and any upstream bounded mapping question are carried forward
+without trust elevation. Normalized evidence must refer to artifacts issued by
+the same `DiscoveryResult` and relevant to the selected claim. Artifact issues
+may inform controlled missing-evidence reporting but are never treated as
+observations. The converter does not use `DiscoveryResult.preferred_mapping` as
+an authorization shortcut; the planner applies the full mapping policy itself.
+
+The conversion preserves provider provenance. A provider-discovered claim still
+requires this validation boundary, and a provider-originated mapping still
+requires `RepoMapping.approve()` before deterministic use.
+
 ## Planning input and outcome
 
 `PlanningRequest` contains repository identity, optional PR number, head SHA,
@@ -164,8 +208,13 @@ native representation.
 
 An applicable `RepoMapping` is a separate, explicit user-approval transition
 and has higher trust than an inferred proposal. A current-head manifest hint is
-an optional high-confidence advanced input. Conflicting strong inputs are never
-silently resolved.
+an optional high-confidence advanced input. In the hosted path,
+`MappingTrust.MANIFEST_HINT` and confidence such as `0.99` do not elevate the
+candidate to `USER_APPROVED`, create a reusable repository mapping, or bypass
+runtime validation. A sole, structurally valid, current-head manifest hint may
+guide the ephemeral plan, but conflicts with approved mappings or other strong
+candidates are never silently resolved. The legacy native manifest path remains
+independent and continues to honor the user-authored manifest directly.
 
 An inferred mapping is automatically usable only when all seven conditions hold:
 
@@ -214,12 +263,12 @@ authored or approved by the customer.
 ## Runtime snapshot and final revalidation
 
 Immediately before materialization, the executor consumes a trusted
-`RuntimeExecutionContext` containing the checkout root, current head SHA, and
-invocation-private scratch root. It requires the same repository identity and
-head SHA and revalidates mapping trust, bindings, path, artifact kind, adapter
-ID, and selectors. Final validation produces an internal immutable captured
-snapshot; callers cannot supply a preconstructed captured snapshot that skips
-these checks.
+`RuntimeExecutionContext` containing trusted repository identity, checkout
+root, current head SHA, and invocation-private scratch root. The repository
+identity and head SHA must exactly match the plan. The executor then revalidates
+mapping trust, bindings, path, artifact kind, adapter ID, and selectors. Final
+validation produces an internal immutable captured snapshot; callers cannot
+supply a preconstructed captured snapshot that skips these checks.
 
 Every selected customer artifact is captured exactly once into immutable
 `PassiveArtifact.content` during this final validation:
@@ -419,6 +468,39 @@ provider or artifact content is not copied into controlled public error text.
 
 ## Test strategy
 
+### Acceptance scenarios
+
+The branch must pass these end-to-end acceptance scenarios through public
+interfaces:
+
+- **A. Zero-manifest full audit:** JSON/CSV-style adapter fakes provide valid
+  normalized results and config evidence plus selected passive JSONL datasets;
+  the hosted entry point creates an ephemeral plan, runs the existing Audit,
+  runs one advisory synthesis, and returns one unified result.
+- **B. Native-manifest compatibility:** an existing user-authored
+  `research.yaml` follows the unchanged native path and produces the same
+  deterministic verdict and rendered bytes as before where applicable.
+- **C. Ambiguous candidate mapping:** two viable candidate-result mappings
+  produce one bounded `MappingQuestion` and no guessed deterministic verdict.
+- **D. Missing dataset:** an entirely absent required dataset produces typed
+  missing evidence and pre-Audit `PARTIAL`; no placeholder dataset, manifest,
+  or verdict is manufactured.
+- **E. Advisory disagreement:** an LLM interpretation that disagrees with the
+  Audit cannot change `authoritative_verdict`.
+- **F. Explicit threshold:** a source claim with validated bounded threshold
+  semantics produces the corresponding explicit absolute threshold in
+  `AuditClaimSpec` and the generated native manifest.
+- **G. Vague improvement:** a claim such as "accuracy improved" receives no
+  `0.05`, zero, epsilon, or derived threshold and remains `PARTIAL` for the
+  current engine.
+- **H. Stable retries:** identical canonical inputs produce the same plan ID,
+  plan serialization, state, deterministic verdict/findings, and advisory test
+  result, excluding only explicitly documented host-path diagnostics.
+- **I. Hostile provider mapping:** unsafe paths/selectors, authority fields,
+  trust escalation, or provider-originated mappings—including confidence
+  `1.0`—are rejected from deterministic planning unless the exact validated
+  candidate crosses `RepoMapping.approve()`.
+
 Focused tests cover:
 
 1. `AuditClaimSpec`, claimed-value isolation, immutability, JSON serialization,
@@ -469,8 +551,8 @@ all A-I scenarios against this design before publication.
 - Adapter branches supply typed mappings and normalized evidence from passive
   bytes; they must not execute repository content.
 - The hosted runner supplies a trusted current-head `RuntimeExecutionContext`
-  with its checkout root and invocation-private scratch root, then calls
-  `run_unified_analysis()`.
+  with repository identity, checkout root, and invocation-private scratch root,
+  then calls `run_unified_analysis()`.
 - A stored mapping becomes trusted only through `RepoMapping.approve()`.
 - Consumers must account for the added audit-claim and selected-mapping fields
   on `EphemeralAuditPlan` and typed missing evidence on
