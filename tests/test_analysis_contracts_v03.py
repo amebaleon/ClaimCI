@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -21,6 +22,7 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactBinding,
     ArtifactKind,
+    AuditClaimSpec,
     ClaimReference,
     ComputeEvidence,
     Confidence,
@@ -50,7 +52,7 @@ from claimci.analysis import (
     UnifiedAnalysisResult,
     to_jsonable,
 )
-from claimci.models import AuditResult, Finding, Impact, Severity, Verdict
+from claimci.models import AuditResult, Direction, Finding, Impact, Severity, Verdict
 
 
 RAW_RESULTS = b'{"runs":[{"seed":1,"accuracy":0.9}]}\n'
@@ -777,6 +779,48 @@ def test_repo_mapping_approval_rejects_subclassed_trust_inputs() -> None:
         )
 
 
+def test_repo_mapping_can_only_narrow_and_runtime_bind_approved_slots() -> None:
+    repository = RepositoryIdentity("amebaleon", "ClaimCI-Demo")
+    source_bindings = (
+        _binding(
+            "base/config.yaml",
+            ArtifactKind.CONFIG,
+            ExperimentRole.BASELINE,
+        ),
+        _binding(
+            "candidate/config.yaml",
+            ArtifactKind.CONFIG,
+            ExperimentRole.CANDIDATE,
+        ),
+    )
+    approved = RepoMapping.approve(
+        repository,
+        _mapping_candidate(bindings=source_bindings),
+        approved_by="owner:amebaleon",
+    )
+    runtime_binding = dataclasses.replace(
+        source_bindings[0],
+        adapter_id="claimci-yaml-config-v1",
+        mappings=(_mapping(),),
+    )
+
+    scoped = approved.scope_to_runtime_bindings((runtime_binding,))
+
+    assert scoped is not approved
+    assert scoped.repository == approved.repository
+    assert scoped.bindings == (runtime_binding,)
+    assert scoped.approved_by == approved.approved_by
+    assert scoped.source_mapping_id == approved.source_mapping_id
+    assert scoped.source_trust is approved.source_trust
+    assert scoped.approval_provenance == approved.approval_provenance
+    assert scoped.trust is MappingTrust.USER_APPROVED
+
+    with pytest.raises((TypeError, ValueError), match="approved|binding|slot"):
+        approved.scope_to_runtime_bindings(
+            (dataclasses.replace(runtime_binding, path=RepositoryPath("other.yaml")),)
+        )
+
+
 def test_provider_mapping_can_only_become_approved_through_explicit_transition() -> None:
     proposed = _mapping_candidate(
         provenance=FieldProvenance(
@@ -843,6 +887,57 @@ def test_ephemeral_audit_plan_carries_required_identity_and_evidence() -> None:
     assert plan.ephemeral is True
     assert not hasattr(plan, "committed_path")
     assert not hasattr(plan, "write")
+
+
+def test_executable_ephemeral_plan_carries_matching_audit_claim_and_mapping() -> None:
+    provenance = _provenance()
+    audit_claim = AuditClaimSpec(
+        claim_id="claim-1",
+        metric="accuracy",
+        direction=Direction.HIGHER,
+        minimum_absolute_improvement=0.05,
+        metric_provenance=provenance,
+        direction_provenance=provenance,
+        threshold_provenance=provenance,
+    )
+    mapping = _mapping_candidate()
+    plan = EphemeralAuditPlan(
+        plan_id="plan-executable",
+        repository=RepositoryIdentity("amebaleon", "ClaimCI-Demo"),
+        pr_number=1,
+        head_sha=GitCommitSha("a" * 40),
+        claim=ClaimReference(
+            "claim-1",
+            "Accuracy improves by at least 0.05.",
+            None,
+            Confidence(0.9),
+            provenance,
+        ),
+        baseline_evidence=(
+            _normalized_evidence(
+                role=ExperimentRole.BASELINE,
+                evidence_id="evidence-baseline",
+            ),
+        ),
+        candidate_evidence=(_normalized_evidence(),),
+        mapping_provenance=(mapping.provenance,),
+        missing_evidence=(),
+        confidence=Confidence(0.9),
+        audit_claim=audit_claim,
+        selected_mapping=mapping,
+    )
+
+    assert plan.audit_claim is audit_claim
+    assert plan.selected_mapping is mapping
+
+    with pytest.raises((TypeError, ValueError), match="claim|claim_id"):
+        dataclasses.replace(
+            plan,
+            audit_claim=dataclasses.replace(audit_claim, claim_id="claim-2"),
+        )
+
+    with pytest.raises(TypeError, match="mapping"):
+        dataclasses.replace(plan, selected_mapping={"mapping_id": "forged"})
 
 
 def test_ephemeral_plan_rejects_role_conflicts_and_invalid_pr_number() -> None:
@@ -1034,9 +1129,16 @@ def test_unified_result_complete_requires_deterministic_authority() -> None:
             research_interpretation=_advisory(),
         )
 
+    with pytest.raises((TypeError, ValueError), match="COMPLETE|complete|review|research"):
+        UnifiedAnalysisResult(
+            state=AnalysisState.COMPLETE,
+            deterministic=DeterministicAuditOutcome.from_audit_result(_audit_result()),
+        )
+
     result = UnifiedAnalysisResult(
         state=AnalysisState.COMPLETE,
         deterministic=DeterministicAuditOutcome.from_audit_result(_audit_result()),
+        research_interpretation=_advisory(),
     )
     assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
 
@@ -1085,6 +1187,26 @@ def test_unified_result_partial_requires_explicit_available_state() -> None:
         unavailable_reason="deterministic adapter mapping is incomplete",
     )
     assert result.authoritative_verdict is None
+
+
+def test_partial_pipeline_can_retain_deterministic_authority_and_typed_missing_evidence() -> None:
+    missing = MissingEvidence(
+        kind=ArtifactKind.DOCUMENT,
+        role=ExperimentRole.UNSPECIFIED,
+        description="Research Review synthesis is unavailable.",
+        claim_id="claim-1",
+    )
+    outcome = DeterministicAuditOutcome.from_audit_result(_audit_result())
+
+    result = UnifiedAnalysisResult(
+        state=AnalysisState.PARTIAL,
+        deterministic=outcome,
+        missing_evidence=(missing,),
+    )
+
+    assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
+    assert result.missing_evidence == (missing,)
+    assert to_jsonable(result)["missing_evidence"][0]["kind"] == "document"  # type: ignore[index]
 
 
 def test_json_serialization_is_detached_finite_and_preserves_ephemeral_marker() -> None:

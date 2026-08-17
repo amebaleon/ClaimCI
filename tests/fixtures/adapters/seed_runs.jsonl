@@ -1,0 +1,3 @@
+{"run_id":"candidate-1","seed":11,"metrics":{"accuracy":0.88}}
+{"run_id":"candidate-2","seed":12,"metrics":{"accuracy":0.90}}
+{"run_id":"candidate-3","seed":13,"metrics":{"accuracy":0.92}}

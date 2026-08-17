@@ -18,7 +18,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Protocol
 
-from claimci.models import AuditResult, Verdict
+from claimci.models import AuditResult, Direction, Verdict
 from claimci.report import render_json
 
 from .confidence import Confidence
@@ -577,6 +577,21 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
     return bindings
 
 
+def _field_mapping_projection(
+    mappings: tuple[FieldMapping, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                item.target_field,
+                item.selector.kind.value,
+                item.selector.expression,
+            )
+            for item in mappings
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MappingCandidate:
     mapping_id: str
@@ -728,6 +743,61 @@ class RepoMapping:
         object.__setattr__(instance, "trust", MappingTrust.USER_APPROVED)
         return instance
 
+    def scope_to_runtime_bindings(
+        self,
+        bindings: tuple[ArtifactBinding, ...],
+    ) -> RepoMapping:
+        """Narrow approved slots and attach only validated runtime adapter data."""
+
+        validated = _validate_bindings(bindings, "runtime-approved bindings")
+        approved_by_key = {
+            (item.path, item.kind, item.role): item for item in self.bindings
+        }
+        for binding in validated:
+            key = (binding.path, binding.kind, binding.role)
+            approved = approved_by_key.get(key)
+            if approved is None:
+                raise AnalysisContractError(
+                    "runtime binding is not an approved repository mapping slot"
+                )
+            if binding.adapter_id is None:
+                raise AnalysisContractError(
+                    "runtime-approved binding requires a validated adapter"
+                )
+            if approved.adapter_id is not None and (
+                binding.adapter_id != approved.adapter_id
+            ):
+                raise AnalysisContractError(
+                    "runtime adapter conflicts with the approved binding"
+                )
+            if approved.mappings and _field_mapping_projection(
+                binding.mappings
+            ) != _field_mapping_projection(approved.mappings):
+                raise AnalysisContractError(
+                    "runtime selectors conflict with the approved binding"
+                )
+            if binding.provenance != approved.provenance:
+                raise AnalysisContractError(
+                    "runtime binding provenance must preserve the approved slot"
+                )
+
+        if validated == self.bindings:
+            return self
+
+        instance = object.__new__(RepoMapping)
+        object.__setattr__(instance, "repository", self.repository)
+        object.__setattr__(instance, "bindings", validated)
+        object.__setattr__(instance, "approved_by", self.approved_by)
+        object.__setattr__(instance, "source_mapping_id", self.source_mapping_id)
+        object.__setattr__(instance, "source_trust", self.source_trust)
+        object.__setattr__(
+            instance,
+            "approval_provenance",
+            self.approval_provenance,
+        )
+        object.__setattr__(instance, "trust", MappingTrust.USER_APPROVED)
+        return instance
+
 
 @dataclass(frozen=True, slots=True)
 class ClaimReference:
@@ -748,6 +818,102 @@ class ClaimReference:
             raise TypeError("claim confidence must be Confidence")
         if not isinstance(self.provenance, FieldProvenance):
             raise TypeError("claim provenance must be FieldProvenance")
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedMetricValue:
+    """A descriptive value quoted by a claim, never deterministic evidence."""
+
+    role: ExperimentRole
+    value: float
+    unit: str | None
+    provenance: FieldProvenance
+    raw: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.role not in {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}:
+            raise AnalysisContractError(
+                "claimed metric value role must be baseline or candidate"
+            )
+        object.__setattr__(
+            self,
+            "value",
+            _finite_number(self.value, "claimed metric value"),
+        )
+        if self.unit is not None:
+            unit = _bounded_text(self.unit, "claimed metric value unit", maximum=64)
+            if unit != unit.strip() or _has_control(unit):
+                raise AnalysisContractError(
+                    "claimed metric value unit must be canonical text"
+                )
+        if not isinstance(self.provenance, FieldProvenance):
+            raise TypeError("claimed metric value provenance must be FieldProvenance")
+        if self.raw is not None:
+            raw = _bounded_text(self.raw, "claimed metric raw token", maximum=512)
+            if raw != raw.strip() or _has_control(raw):
+                raise AnalysisContractError(
+                    "claimed metric raw token must be canonical text"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditClaimSpec:
+    """A validated claim policy to test, without any verdict authority."""
+
+    claim_id: str
+    metric: str
+    direction: Direction
+    minimum_absolute_improvement: float | None
+    metric_provenance: FieldProvenance
+    direction_provenance: FieldProvenance
+    threshold_provenance: FieldProvenance | None
+    claimed_values: tuple[ClaimedMetricValue, ...] = ()
+
+    def __post_init__(self) -> None:
+        _bounded_id(self.claim_id, "audit claim_id", maximum=128)
+        metric = _bounded_text(self.metric, "audit metric", maximum=256)
+        if metric != metric.strip() or _has_control(metric):
+            raise AnalysisContractError("audit metric must be canonical text")
+        if not isinstance(self.direction, Direction):
+            raise TypeError("audit direction must be Direction")
+        if (self.minimum_absolute_improvement is None) != (
+            self.threshold_provenance is None
+        ):
+            raise AnalysisContractError(
+                "audit threshold and threshold provenance must appear together"
+            )
+        if self.minimum_absolute_improvement is not None:
+            threshold = _finite_number(
+                self.minimum_absolute_improvement,
+                "minimum absolute improvement",
+            )
+            if threshold < 0:
+                raise AnalysisContractError(
+                    "minimum absolute improvement must be non-negative"
+                )
+            object.__setattr__(self, "minimum_absolute_improvement", threshold)
+        for label, provenance in (
+            ("metric", self.metric_provenance),
+            ("direction", self.direction_provenance),
+        ):
+            if not isinstance(provenance, FieldProvenance):
+                raise TypeError(f"audit {label} provenance must be FieldProvenance")
+        if self.threshold_provenance is not None and not isinstance(
+            self.threshold_provenance,
+            FieldProvenance,
+        ):
+            raise TypeError(
+                "audit threshold provenance must be FieldProvenance or null"
+            )
+        if not isinstance(self.claimed_values, tuple) or not all(
+            isinstance(item, ClaimedMetricValue) for item in self.claimed_values
+        ):
+            raise TypeError(
+                "audit claimed_values must be a tuple of ClaimedMetricValue values"
+            )
+        roles = tuple(item.role for item in self.claimed_values)
+        if len(set(roles)) != len(roles):
+            raise AnalysisContractError("audit claimed value roles must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -789,6 +955,8 @@ class EphemeralAuditPlan:
     mapping_provenance: tuple[FieldProvenance, ...]
     missing_evidence: tuple[MissingEvidence, ...]
     confidence: Confidence
+    audit_claim: AuditClaimSpec | None = None
+    selected_mapping: MappingCandidate | RepoMapping | None = None
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -835,6 +1003,26 @@ class EphemeralAuditPlan:
             raise TypeError("plan missing_evidence must be a tuple of MissingEvidence")
         if not isinstance(self.confidence, Confidence):
             raise TypeError("plan confidence must be Confidence")
+        if self.audit_claim is not None and type(self.audit_claim) is not AuditClaimSpec:
+            raise TypeError("plan audit_claim must be AuditClaimSpec or null")
+        if self.selected_mapping is not None and type(self.selected_mapping) not in {
+            MappingCandidate,
+            RepoMapping,
+        }:
+            raise TypeError(
+                "plan selected_mapping must be MappingCandidate, RepoMapping, or null"
+            )
+        if (self.audit_claim is None) != (self.selected_mapping is None):
+            raise AnalysisContractError(
+                "executable plan audit claim and selected mapping must appear together"
+            )
+        if (
+            self.audit_claim is not None
+            and self.audit_claim.claim_id != self.claim.claim_id
+        ):
+            raise AnalysisContractError(
+                "plan audit claim ID must match its claim reference"
+            )
 
 
 def _deep_freeze(value: object) -> object:
@@ -961,6 +1149,7 @@ class UnifiedAnalysisResult:
     research_interpretation: AdvisoryResearchInterpretation | None = None
     mapping_question: MappingQuestion | None = None
     unavailable_reason: str | None = None
+    missing_evidence: tuple[MissingEvidence, ...] = ()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("UnifiedAnalysisResult is final to preserve authority")
@@ -991,11 +1180,21 @@ class UnifiedAnalysisResult:
                 "unavailable reason",
                 maximum=4_096,
             )
+        if not isinstance(self.missing_evidence, tuple) or not all(
+            isinstance(item, MissingEvidence) for item in self.missing_evidence
+        ):
+            raise TypeError(
+                "unified missing_evidence must be a tuple of MissingEvidence values"
+            )
 
         if self.state is AnalysisState.COMPLETE:
             if self.deterministic is None:
                 raise AnalysisContractError(
                     "complete analysis requires a deterministic outcome"
+                )
+            if self.research_interpretation is None:
+                raise AnalysisContractError(
+                    "complete analysis requires a research interpretation"
                 )
             if self.mapping_question is not None or self.unavailable_reason is not None:
                 raise AnalysisContractError(
@@ -1038,7 +1237,7 @@ class UnifiedAnalysisResult:
                 self.mapping_question,
                 self.unavailable_reason,
             )
-        ):
+        ) and not self.missing_evidence:
             raise AnalysisContractError(
                 "partial analysis requires an available result, question, or reason"
             )
@@ -1100,7 +1299,9 @@ __all__ = [
     "ArtifactCandidate",
     "ArtifactBinding",
     "ArtifactKind",
+    "AuditClaimSpec",
     "ClaimReference",
+    "ClaimedMetricValue",
     "ComputeEvidence",
     "ConfigValue",
     "DatasetReference",
