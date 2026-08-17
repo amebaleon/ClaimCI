@@ -1,5 +1,9 @@
 """Shared immutable contracts for ClaimCI zero-configuration analysis."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from .confidence import Confidence
 from .claims import (
     audit_claim_spec_from_research_spec,
@@ -61,6 +65,29 @@ from .materialize import (
     execute_ephemeral_audit,
 )
 
+if TYPE_CHECKING:
+    from claimci.review.models import ReviewConfig
+    from claimci.review.provider import ReviewerProvider
+
+
+def run_unified_analysis(
+    request: PlanningRequest,
+    runtime: RuntimeExecutionContext,
+    review_config: "ReviewConfig",
+    *,
+    provider: "ReviewerProvider | None" = None,
+) -> UnifiedAnalysisResult:
+    """Load the hosted orchestration lazily to keep Review imports acyclic."""
+
+    from .integration import run_unified_analysis as implementation
+
+    return implementation(
+        request,
+        runtime,
+        review_config,
+        provider=provider,
+    )
+
 __all__ = [
     "Adapter",
     "AdapterMatch",
@@ -114,4 +141,5 @@ __all__ = [
     "execute_ephemeral_audit",
     "plan_ephemeral_audit",
     "planning_request_from_discovery",
+    "run_unified_analysis",
 ]

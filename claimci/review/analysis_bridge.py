@@ -357,9 +357,11 @@ def run_analysis_review(
     deterministic = None
     if context.deterministic is not None:
         serialized = to_jsonable(context.deterministic)
-        assert isinstance(serialized, dict)
+        if not isinstance(serialized, dict):
+            raise ReviewError("deterministic snapshot serialization is invalid")
         deterministic_payload = serialized.get("payload")
-        assert isinstance(deterministic_payload, dict)
+        if not isinstance(deterministic_payload, dict):
+            raise ReviewError("deterministic snapshot payload is invalid")
         deterministic_payload.pop("manifest", None)
         deterministic = serialized
     payload = {
