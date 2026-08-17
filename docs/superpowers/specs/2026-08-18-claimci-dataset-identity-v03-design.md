@@ -134,4 +134,3 @@ them losslessly into the native Audit representation.
   a separate transition.
 - Existing CLI, deterministic findings/verdict precedence, and Review authority
   remain byte/behavior compatible outside the new hosted dataset path.
-

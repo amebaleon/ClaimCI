@@ -745,10 +745,19 @@ def _planning_missing_evidence(
                         claim_id=request.claim.claim_id,
                     )
                 )
-        if not any(
-            item.artifact.kind is ArtifactKind.DATASET
+        dataset_evidence = tuple(
+            item
             for item in role_evidence
-        ):
+            if item.artifact.kind is ArtifactKind.DATASET
+        )
+        if request.upstream_mapping_question is not None:
+            has_dataset_slots = bool(dataset_evidence)
+        else:
+            has_dataset_slots = _potential_dataset_splits(request, role) == {
+                DatasetSplit.TRAIN,
+                DatasetSplit.EVAL,
+            }
+        if not has_dataset_slots:
             missing.append(
                 MissingEvidence(
                     kind=ArtifactKind.DATASET,
@@ -761,6 +770,28 @@ def _planning_missing_evidence(
                 )
             )
     return tuple(missing)
+
+
+def _potential_dataset_splits(
+    request: PlanningRequest,
+    role: ExperimentRole,
+) -> set[DatasetSplit]:
+    issued = {
+        (item.artifact.path, item.artifact.kind)
+        for item in request.normalized_evidence
+    }
+    mappings: tuple[MappingCandidate | RepoMapping, ...] = request.mapping_candidates
+    if request.approved_mapping is not None:
+        mappings = (*mappings, request.approved_mapping)
+    return {
+        binding.dataset_split
+        for mapping in mappings
+        for binding in mapping.bindings
+        if binding.kind is ArtifactKind.DATASET
+        and binding.role is role
+        and binding.dataset_split in {DatasetSplit.TRAIN, DatasetSplit.EVAL}
+        and (binding.path, binding.kind) in issued
+    }
 
 
 def _evidence_supports_role(

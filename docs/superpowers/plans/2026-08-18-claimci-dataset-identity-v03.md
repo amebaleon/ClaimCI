@@ -86,4 +86,3 @@ git diff --check
    mapping approval, lifecycle cleanup, and public interfaces.
 7. Push `feat/dataset-identity-v03` and open a draft PR against
    `feat/ephemeral-plan-v03`. Do not merge.
-

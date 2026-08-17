@@ -621,6 +621,7 @@ def _identity_only_dataset_evidence(
         observations = tuple(
             dataclasses.replace(
                 observation,
+                experiment_role=ExperimentRole.UNSPECIFIED,
                 dataset_references=tuple(
                     dataclasses.replace(reference, split=None)
                     for reference in observation.dataset_references
@@ -763,6 +764,84 @@ def test_missing_dataset_is_partial_without_a_mapping_question() -> None:
         (ArtifactKind.DATASET, ExperimentRole.BASELINE),
         (ArtifactKind.DATASET, ExperimentRole.CANDIDATE),
     }
+
+
+def test_missing_one_roles_identity_only_datasets_is_typed_partial_not_question() -> None:
+    evidence_with_splits = _complete_evidence()
+    identity_only = _identity_only_dataset_evidence(evidence_with_splits)
+    complete_mapping = _mapping("mapping-complete", evidence_with_splits)
+    evidence = tuple(
+        item
+        for item in identity_only
+        if not (
+            item.artifact.kind is ArtifactKind.DATASET
+            and "candidate" in str(item.artifact.path)
+        )
+    )
+    mapping = dataclasses.replace(
+        complete_mapping,
+        mapping_id="mapping-missing-candidate-datasets",
+        bindings=tuple(
+            item
+            for item in complete_mapping.bindings
+            if not (
+                item.kind is ArtifactKind.DATASET
+                and item.role is ExperimentRole.CANDIDATE
+            )
+        ),
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=evidence, mappings=(mapping,))
+    )
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.mapping_question is None
+    assert {
+        (item.kind, item.role)
+        for item in outcome.missing_evidence
+    } == {(ArtifactKind.DATASET, ExperimentRole.CANDIDATE)}
+
+
+@pytest.mark.parametrize("missing_split", [DatasetSplit.TRAIN, DatasetSplit.EVAL])
+def test_missing_one_candidate_dataset_split_is_typed_partial(
+    missing_split: DatasetSplit,
+) -> None:
+    evidence_with_splits = _complete_evidence()
+    identity_only = _identity_only_dataset_evidence(evidence_with_splits)
+    complete_mapping = _mapping("mapping-complete", evidence_with_splits)
+    missing_binding = next(
+        item
+        for item in complete_mapping.bindings
+        if item.kind is ArtifactKind.DATASET
+        and item.role is ExperimentRole.CANDIDATE
+        and item.dataset_split is missing_split
+    )
+    evidence = tuple(
+        item
+        for item in identity_only
+        if item.artifact.path != missing_binding.path
+    )
+    mapping = dataclasses.replace(
+        complete_mapping,
+        mapping_id=f"mapping-missing-candidate-{missing_split.value}",
+        bindings=tuple(
+            item
+            for item in complete_mapping.bindings
+            if item is not missing_binding
+        ),
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=evidence, mappings=(mapping,))
+    )
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.mapping_question is None
+    assert {
+        (item.kind, item.role)
+        for item in outcome.missing_evidence
+    } == {(ArtifactKind.DATASET, ExperimentRole.CANDIDATE)}
 
 
 def test_sole_eligible_inferred_mapping_produces_ready_head_bound_plan() -> None:
