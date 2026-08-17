@@ -115,6 +115,24 @@ def test_explicit_approval_preserves_split_and_rejects_runtime_split_drift() -> 
         )
 
 
+def test_one_path_may_explicitly_fill_both_dataset_splits_for_audit_detection() -> None:
+    train = _dataset_binding()
+    evaluation = dataclasses.replace(train, dataset_split=DatasetSplit.EVAL)
+
+    mapping = MappingCandidate(
+        mapping_id="mapping-shared-dataset-fixture",
+        bindings=(train, evaluation),
+        confidence=Confidence(0.95),
+        trust=MappingTrust.INFERRED,
+        provenance=PROVENANCE,
+    )
+
+    assert tuple(item.dataset_split for item in mapping.bindings) == (
+        DatasetSplit.TRAIN,
+        DatasetSplit.EVAL,
+    )
+
+
 def test_artifact_candidate_still_binds_exact_dataset_bytes() -> None:
     content = b'{"id":"one"}\n'
     candidate = ArtifactCandidate(

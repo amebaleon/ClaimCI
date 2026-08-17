@@ -23,6 +23,7 @@ from .contracts import (
     AuditClaimSpec,
     ClaimReference,
     ClaimedMetricValue,
+    DatasetSplit,
     EphemeralAuditPlan,
     ExperimentRole,
     FieldMapping,
@@ -744,15 +745,10 @@ def _planning_missing_evidence(
                         claim_id=request.claim.claim_id,
                     )
                 )
-        dataset_splits = {
-            reference.split.casefold()
+        if not any(
+            item.artifact.kind is ArtifactKind.DATASET
             for item in role_evidence
-            if item.artifact.kind is ArtifactKind.DATASET
-            for observation in item.observations
-            for reference in observation.dataset_references
-            if reference.split is not None
-        }
-        if not {"train", "eval"}.issubset(dataset_splits):
+        ):
             missing.append(
                 MissingEvidence(
                     kind=ArtifactKind.DATASET,
@@ -785,6 +781,7 @@ def _binding_signature(binding: ArtifactBinding) -> tuple[object, ...]:
         binding.kind.value,
         binding.role.value,
         binding.adapter_id,
+        binding.dataset_split.value if binding.dataset_split is not None else None,
         tuple(
             sorted(
                 (
@@ -855,20 +852,14 @@ def _mapping_covers_native_inputs(
             for kind in (ArtifactKind.RESULTS, ArtifactKind.CONFIG)
         ):
             return False
-        splits: set[str] = set()
-        for binding in role_bindings:
-            if binding.kind is not ArtifactKind.DATASET:
-                continue
-            evidence = evidence_by_key.get((binding.path, binding.kind))
-            if evidence is None:
-                continue
-            splits.update(
-                reference.split.casefold()
-                for observation in evidence.observations
-                for reference in observation.dataset_references
-                if reference.split is not None
-            )
-        if not {"train", "eval"}.issubset(splits):
+        dataset_bindings = tuple(
+            item for item in role_bindings if item.kind is ArtifactKind.DATASET
+        )
+        split_counts = {
+            split: sum(item.dataset_split is split for item in dataset_bindings)
+            for split in (DatasetSplit.TRAIN, DatasetSplit.EVAL)
+        }
+        if split_counts != {DatasetSplit.TRAIN: 1, DatasetSplit.EVAL: 1}:
             return False
     return True
 
@@ -1029,6 +1020,11 @@ def _plan_id_from_components(
                 "kind": binding.kind.value,
                 "role": binding.role.value,
                 "adapter_id": binding.adapter_id,
+                "dataset_split": (
+                    binding.dataset_split.value
+                    if binding.dataset_split is not None
+                    else None
+                ),
                 "selectors": [
                     {
                         "target": item.target_field,
@@ -1061,6 +1057,7 @@ def _plan_id_from_components(
                 str(item["path"]),
                 str(item["kind"]),
                 str(item["role"]),
+                str(item["dataset_split"]),
             ),
         ),
     }

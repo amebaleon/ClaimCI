@@ -578,7 +578,10 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
         isinstance(item, ArtifactBinding) for item in bindings
     ):
         raise TypeError(f"{label} must be a non-empty tuple of ArtifactBinding values")
-    keys = tuple((item.path, item.kind, item.role) for item in bindings)
+    keys = tuple(
+        (item.path, item.kind, item.role, item.dataset_split)
+        for item in bindings
+    )
     if len(set(keys)) != len(keys):
         raise AnalysisContractError(f"{label} must not contain duplicate bindings")
     roles_by_path: dict[RepositoryPath, set[ExperimentRole]] = {}

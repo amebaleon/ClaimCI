@@ -17,6 +17,7 @@ from claimci.analysis import (
     ArtifactKind,
     Confidence,
     ConfigValue,
+    DatasetSplit,
     DatasetReference,
     EvidenceSelector,
     ExperimentRole,
@@ -161,6 +162,18 @@ def _evidence(
 
 
 def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBinding:
+    references = tuple(
+        reference
+        for observation in evidence.observations
+        for reference in observation.dataset_references
+    )
+    dataset_split = (
+        DatasetSplit(references[0].split)
+        if evidence.artifact.kind is ArtifactKind.DATASET
+        and len(references) == 1
+        and references[0].split is not None
+        else None
+    )
     return ArtifactBinding(
         path=evidence.artifact.path,
         kind=evidence.artifact.kind,
@@ -168,6 +181,7 @@ def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBind
         adapter_id=evidence.adapter_match.adapter_id,
         mappings=evidence.adapter_match.mappings,
         provenance=evidence.adapter_match.match_evidence[0],
+        dataset_split=dataset_split,
     )
 
 
@@ -596,6 +610,125 @@ def _request(
     )
 
 
+def _identity_only_dataset_evidence(
+    evidence: tuple[NormalizedEvidence, ...],
+) -> tuple[NormalizedEvidence, ...]:
+    values: list[NormalizedEvidence] = []
+    for item in evidence:
+        if item.artifact.kind is not ArtifactKind.DATASET:
+            values.append(item)
+            continue
+        observations = tuple(
+            dataclasses.replace(
+                observation,
+                dataset_references=tuple(
+                    dataclasses.replace(reference, split=None)
+                    for reference in observation.dataset_references
+                ),
+            )
+            for observation in item.observations
+        )
+        values.append(dataclasses.replace(item, observations=observations))
+    return tuple(values)
+
+
+def test_split_bearing_mapping_makes_identity_only_dataset_evidence_ready() -> None:
+    evidence_with_splits = _complete_evidence()
+    mapping = _mapping("mapping-split-identity", evidence_with_splits)
+    identity_only = _identity_only_dataset_evidence(evidence_with_splits)
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=identity_only, mappings=(mapping,))
+    )
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert {
+        binding.dataset_split
+        for binding in outcome.plan.selected_mapping.bindings
+        if binding.kind is ArtifactKind.DATASET
+    } == {DatasetSplit.TRAIN, DatasetSplit.EVAL}
+
+
+def test_resolvable_upstream_dataset_question_precedes_splitless_partial() -> None:
+    evidence_with_splits = _complete_evidence()
+    identity_only = _identity_only_dataset_evidence(evidence_with_splits)
+    train = next(
+        item
+        for item in _mapping("mapping-question-source", evidence_with_splits).bindings
+        if item.kind is ArtifactKind.DATASET
+        and item.role is ExperimentRole.CANDIDATE
+        and item.dataset_split is DatasetSplit.TRAIN
+    )
+    alternative = dataclasses.replace(
+        train,
+        path=RepositoryPath("data/candidate-eval.jsonl"),
+    )
+    question = MappingQuestion(
+        question_id="question-candidate-train",
+        prompt="Which file contains the candidate train dataset?",
+        choices=(
+            MappingChoice("choice-candidate-train-1", str(train.path), (train,)),
+            MappingChoice(
+                "choice-candidate-train-2",
+                str(alternative.path),
+                (alternative,),
+            ),
+        ),
+        relevant_claim_id=CLAIM_ID,
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            evidence=identity_only,
+            mappings=(),
+            upstream_question=question,
+        )
+    )
+
+    assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.mapping_question is not None
+    assert outcome.mapping_question.prompt == question.prompt
+
+
+def test_dataset_split_changes_ephemeral_plan_identity() -> None:
+    evidence_with_splits = _complete_evidence()
+    identity_only = _identity_only_dataset_evidence(evidence_with_splits)
+    original = _mapping("mapping-split-sensitive", evidence_with_splits)
+    baseline_datasets = [
+        binding
+        for binding in original.bindings
+        if binding.kind is ArtifactKind.DATASET
+        and binding.role is ExperimentRole.BASELINE
+    ]
+    swapped_bindings = tuple(
+        dataclasses.replace(
+            binding,
+            dataset_split=(
+                DatasetSplit.EVAL
+                if binding.dataset_split is DatasetSplit.TRAIN
+                else DatasetSplit.TRAIN
+            ),
+        )
+        if binding in baseline_datasets
+        else binding
+        for binding in original.bindings
+    )
+    swapped = dataclasses.replace(original, bindings=swapped_bindings)
+
+    first = plan_ephemeral_audit(
+        _request(evidence=identity_only, mappings=(original,))
+    )
+    second = plan_ephemeral_audit(
+        _request(evidence=identity_only, mappings=(swapped,))
+    )
+
+    assert first.state is PlanningState.READY
+    assert second.state is PlanningState.READY
+    assert first.plan is not None and second.plan is not None
+    assert first.plan.plan_id != second.plan.plan_id
+
+
 def test_threshold_free_claim_is_partial_before_mapping_resolution() -> None:
     first = _mapping("mapping-first", _complete_evidence())
     second = dataclasses.replace(first, mapping_id="mapping-second")
@@ -953,6 +1086,11 @@ def _expected_plan_id(request: PlanningRequest, mapping: MappingCandidate) -> st
                 "kind": binding.kind.value,
                 "role": binding.role.value,
                 "adapter_id": binding.adapter_id,
+                "dataset_split": (
+                    binding.dataset_split.value
+                    if binding.dataset_split is not None
+                    else None
+                ),
                 "selectors": [
                     {
                         "target": item.target_field,
@@ -990,6 +1128,7 @@ def _expected_plan_id(request: PlanningRequest, mapping: MappingCandidate) -> st
                 str(item["path"]),
                 str(item["kind"]),
                 str(item["role"]),
+                str(item["dataset_split"]),
             ),
         ),
     }

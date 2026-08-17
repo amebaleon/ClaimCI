@@ -12,6 +12,7 @@ from claimci.analysis import (
     ArtifactKind,
     ClaimReference,
     Confidence,
+    DatasetSplit,
     ExperimentRole,
     FieldProvenance,
     GitCommitSha,
@@ -784,6 +785,16 @@ def test_valid_head_manifest_is_high_confidence_hint_without_trust_elevation(
         "study/candidate/train.jsonl",
         "study/candidate/eval.jsonl",
     }
+    assert {
+        (binding.role, binding.dataset_split)
+        for binding in mapping.bindings
+        if binding.kind is ArtifactKind.DATASET
+    } == {
+        (ExperimentRole.BASELINE, DatasetSplit.TRAIN),
+        (ExperimentRole.BASELINE, DatasetSplit.EVAL),
+        (ExperimentRole.CANDIDATE, DatasetSplit.TRAIN),
+        (ExperimentRole.CANDIDATE, DatasetSplit.EVAL),
+    }
     assert not isinstance(mapping, RepoMapping)
     assert discovery.issues == ()
 
@@ -909,6 +920,107 @@ def test_obvious_result_and_config_names_produce_mapping_without_question(
             "configs/candidate_config.yaml",
         ),
     }
+def test_obvious_dataset_names_preserve_all_four_role_and_split_slots(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        (
+            "results/baseline_results.json",
+            "results/candidate_results.json",
+            "configs/baseline_config.yaml",
+            "configs/candidate_config.yaml",
+            "data/baseline_train.jsonl",
+            "data/baseline_eval.jsonl",
+            "data/candidate_train.jsonl",
+            "data/candidate_eval.jsonl",
+        ),
+    )
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        discovered.manifest_mappings,
+        repository=REPOSITORY,
+        limits=DiscoveryLimits(),
+    )
+
+    assert resolution.question is None
+    inferred = next(
+        item for item in resolution.candidates if item.trust is MappingTrust.INFERRED
+    )
+    assert {
+        (str(binding.path), binding.role, binding.dataset_split)
+        for binding in inferred.bindings
+        if binding.kind is ArtifactKind.DATASET
+    } == {
+        (
+            "data/baseline_train.jsonl",
+            ExperimentRole.BASELINE,
+            DatasetSplit.TRAIN,
+        ),
+        (
+            "data/baseline_eval.jsonl",
+            ExperimentRole.BASELINE,
+            DatasetSplit.EVAL,
+        ),
+        (
+            "data/candidate_train.jsonl",
+            ExperimentRole.CANDIDATE,
+            DatasetSplit.TRAIN,
+        ),
+        (
+            "data/candidate_eval.jsonl",
+            ExperimentRole.CANDIDATE,
+            DatasetSplit.EVAL,
+        ),
+    }
+    assert all(
+        binding.provenance.source_path == binding.path
+        and "dataset_split=" in binding.provenance.detail
+        for binding in inferred.bindings
+        if binding.kind is ArtifactKind.DATASET
+    )
+
+
+def test_ambiguous_dataset_slot_question_preserves_requested_split(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        (
+            "results/baseline_results.json",
+            "results/candidate_results.json",
+            "configs/baseline_config.yaml",
+            "configs/candidate_config.yaml",
+            "data/baseline_train.jsonl",
+            "data/baseline_eval.jsonl",
+            "data/candidate_train_a.jsonl",
+            "data/candidate_train_b.jsonl",
+            "data/candidate_eval.jsonl",
+        ),
+    )
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        discovered.manifest_mappings,
+        repository=REPOSITORY,
+        limits=DiscoveryLimits(),
+    )
+
+    assert resolution.question is not None
+    assert resolution.question.prompt == "Which file contains the candidate train dataset?"
+    assert tuple(choice.label for choice in resolution.question.choices) == (
+        "data/candidate_train_a.jsonl",
+        "data/candidate_train_b.jsonl",
+    )
+    assert all(
+        choice.bindings[0].kind is ArtifactKind.DATASET
+        and choice.bindings[0].role is ExperimentRole.CANDIDATE
+        and choice.bindings[0].dataset_split is DatasetSplit.TRAIN
+        for choice in resolution.question.choices
+    )
 
 
 def test_ambiguous_candidate_results_create_one_minimal_mapping_question(
@@ -1081,6 +1193,50 @@ def test_provider_mapping_is_validated_proposal_without_trust_elevation(
     assert binding.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
     assert binding.mappings[0].selector.expression == "/metrics/accuracy"
     assert binding.mappings[0].provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+
+
+def test_provider_dataset_split_is_typed_but_remains_an_untrusted_proposal(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        ("data/candidate_train.jsonl",),
+    )
+    payload = {
+        "mappings": [
+            {
+                "confidence": 1.0,
+                "bindings": [
+                    {
+                        "path": "data/candidate_train.jsonl",
+                        "kind": "dataset",
+                        "role": "candidate",
+                        "dataset_split": "train",
+                        "adapter_id": "claimci-jsonl-dataset-v1",
+                        "mappings": [],
+                    }
+                ],
+            }
+        ]
+    }
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        (),
+        repository=REPOSITORY,
+        provider_payload=payload,
+        limits=DiscoveryLimits(),
+    )
+
+    provider = next(
+        candidate
+        for candidate in resolution.candidates
+        if candidate.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+    )
+    assert provider.bindings[0].dataset_split is DatasetSplit.TRAIN
+    assert provider.trust is MappingTrust.INFERRED
+    assert provider.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
 
 
 @pytest.mark.parametrize(

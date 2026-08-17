@@ -18,6 +18,7 @@ from claimci.analysis.contracts import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    DatasetSplit,
     ExperimentRole,
     FieldProvenance,
     MappingCandidate,
@@ -61,10 +62,10 @@ _EVIDENCE_KINDS = {
     EvidenceKind.DOCUMENT: ArtifactKind.DOCUMENT,
 }
 _ARTIFACT_FIELDS = {
-    "config": ArtifactKind.CONFIG,
-    "results": ArtifactKind.RESULTS,
-    "train_dataset": ArtifactKind.DATASET,
-    "eval_dataset": ArtifactKind.DATASET,
+    "config": (ArtifactKind.CONFIG, None),
+    "results": (ArtifactKind.RESULTS, None),
+    "train_dataset": (ArtifactKind.DATASET, DatasetSplit.TRAIN),
+    "eval_dataset": (ArtifactKind.DATASET, DatasetSplit.EVAL),
 }
 _TOKENS = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _ROLE_TOKENS = frozenset(
@@ -229,7 +230,7 @@ def _manifest_hint(
             experiment = payload.get(role_name)
             if not isinstance(experiment, Mapping):
                 raise DiscoveryError("manifest experiment mapping is invalid")
-            for field, kind in _ARTIFACT_FIELDS.items():
+            for field, (kind, dataset_split) in _ARTIFACT_FIELDS.items():
                 path = _resolve_manifest_path(manifest_path, experiment.get(field))
                 if path not in issued:
                     raise DiscoveryError("manifest artifact is not indexed")
@@ -244,13 +245,23 @@ def _manifest_hint(
                         adapter_id=None,
                         mappings=(),
                         provenance=provenance,
+                        dataset_split=dataset_split,
                     )
                 )
         material = json.dumps(
             {
                 "manifest": str(manifest_path),
                 "bindings": [
-                    (str(binding.path), binding.kind.value, binding.role.value)
+                    (
+                        str(binding.path),
+                        binding.kind.value,
+                        binding.role.value,
+                        (
+                            binding.dataset_split.value
+                            if binding.dataset_split is not None
+                            else None
+                        ),
+                    )
                     for binding in bindings
                 ],
             },
