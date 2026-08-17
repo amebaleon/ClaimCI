@@ -101,6 +101,23 @@ def test_nested_json_probe_and_extract_preserve_field_provenance() -> None:
     assert "/metrics/accuracy" in observation.provenance.detail
 
 
+def test_json_preserves_one_explicit_metric_name_field_when_available() -> None:
+    artifact = _passive(
+        b'{"metric_name":"f1_score","value":0.81}',
+        path="artifacts/named.json",
+    )
+    adapter = JsonAdapter()
+    match = adapter.probe(artifact)
+    assert match is not None
+    assert _targets(match) == {
+        "metric_name": "/metric_name",
+        "metric_value": "/value",
+    }
+    observation = adapter.extract(artifact, match).observations[0]
+    assert observation.metric_name == "f1_score"
+    assert observation.metric_value == pytest.approx(0.81)
+
+
 def test_ambiguous_json_requires_external_metric_mapping_without_guessing() -> None:
     artifact = _fixture("ambiguous_metrics.json")
     adapter = JsonAdapter()

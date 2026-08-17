@@ -8,6 +8,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 from claimci.analysis import (
     AdapterMatch,
+    AnalysisContractError,
     ArtifactKind,
     Confidence,
     ComputeEvidence,
@@ -132,7 +133,13 @@ def _parse_manifest(content: bytes) -> Mapping[str, object]:
     minimum = _manifest_value(root, "claim.minimum_improvement")
     if not isinstance(metric, str) or not metric.strip():
         raise AdapterParseError("manifest claim.metric must be non-empty text")
-    _finite_number(minimum, label="manifest claim.minimum_improvement")
+    minimum_value = _finite_number(
+        minimum, label="manifest claim.minimum_improvement"
+    )
+    if minimum_value < 0:
+        raise AdapterParseError(
+            "manifest claim.minimum_improvement must be non-negative"
+        )
     for selector in _MANIFEST_FIELDS[2:]:
         if not isinstance(_manifest_value(root, selector), str):
             raise AdapterParseError(f"manifest {selector} must be a path string")
@@ -418,20 +425,25 @@ class NativeResultsAdapter:
                 )
             )
         if summary:
-            config_values = tuple(
-                ConfigValue(
-                    f"summary.{_dotted_from_pointer(pointer)}",
-                    value,
-                    _adapter_provenance(
-                        artifact,
-                        adapter_id=self.adapter_id,
-                        selector=f"/summary{pointer}",
-                        inferred=False,
-                    ),
+            try:
+                config_values = tuple(
+                    ConfigValue(
+                        f"summary.{_dotted_from_pointer(pointer)}",
+                        value,
+                        _adapter_provenance(
+                            artifact,
+                            adapter_id=self.adapter_id,
+                            selector=f"/summary{pointer}",
+                            inferred=False,
+                        ),
+                    )
+                    for pointer, value in _pointer_leaves(summary)
+                    if not isinstance(value, (Mapping, list))
                 )
-                for pointer, value in _pointer_leaves(summary)
-                if not isinstance(value, (Mapping, list))
-            )
+            except AnalysisContractError as exc:
+                raise AdapterParseError(
+                    f"native results summary cannot be normalized safely: {exc}"
+                ) from exc
             if config_values:
                 observations.append(
                     NormalizedObservation(
@@ -468,7 +480,7 @@ class NativeConfigAdapter:
             return None
         _verify_integrity(artifact)
         root = _parse_yaml(artifact.content)
-        if not _COMPUTE_INPUTS.intersection(root):
+        if not _COMPUTE_INPUTS.issubset(root):
             return None
         leaves, unsupported = _scalar_leaves(root)
         mappings = tuple(
@@ -503,7 +515,7 @@ class NativeConfigAdapter:
     ) -> NormalizedEvidence:
         _verify_integrity(artifact)
         root = _parse_yaml(artifact.content)
-        if not _COMPUTE_INPUTS.intersection(root):
+        if not _COMPUTE_INPUTS.issubset(root):
             raise AdapterParseError("artifact does not contain native ClaimCI config")
         leaves, _unsupported = _scalar_leaves(root)
         allowed = frozenset(_config_target(selector) for selector, _value in leaves)

@@ -121,9 +121,17 @@ def _validate_graph(value: object) -> None:
     nodes = 0
     active: set[int] = set()
     completed: set[int] = set()
+    root_depth = 1 if isinstance(value, (Mapping, list, tuple)) else 0
+    stack: list[tuple[bool, object, int]] = [(False, value, root_depth)]
 
-    def walk(current: object, *, depth: int) -> None:
-        nonlocal nodes
+    while stack:
+        exiting, current, depth = stack.pop()
+        if exiting:
+            identity = id(current)
+            active.remove(identity)
+            completed.add(identity)
+            continue
+
         nodes += 1
         if nodes > MAX_NODES:
             raise AdapterLimitError(
@@ -133,7 +141,7 @@ def _validate_graph(value: object) -> None:
         if isinstance(current, float) and not math.isfinite(current):
             raise AdapterParseError("artifact numbers must be finite")
         if not isinstance(current, (Mapping, list, tuple)):
-            return
+            continue
         if depth > MAX_DEPTH:
             raise AdapterLimitError(
                 f"artifact exceeds the maximum supported depth {MAX_DEPTH}"
@@ -145,21 +153,18 @@ def _validate_graph(value: object) -> None:
         if identity in completed:
             raise AdapterParseError("repeated container aliases are not supported")
         active.add(identity)
-        try:
-            if isinstance(current, Mapping):
-                for key in sorted(current, key=lambda item: str(item)):
-                    if not isinstance(key, str):
-                        raise AdapterParseError("artifact mappings require string keys")
-                    walk(key, depth=depth + 1)
-                    walk(current[key], depth=depth + 1)
-            else:
-                for item in current:
-                    walk(item, depth=depth + 1)
-        finally:
-            active.remove(identity)
-        completed.add(identity)
-
-    walk(value, depth=1 if isinstance(value, (Mapping, list, tuple)) else 0)
+        stack.append((True, current, depth))
+        if isinstance(current, Mapping):
+            keys = sorted(current, key=lambda item: str(item))
+            if any(not isinstance(key, str) for key in keys):
+                raise AdapterParseError("artifact mappings require string keys")
+            children = tuple(
+                child for key in keys for child in (key, current[key])
+            )
+        else:
+            children = tuple(current)
+        for child in reversed(children):
+            stack.append((False, child, depth + 1))
 
 
 def _decode_pointer_token(token: str) -> str:
@@ -347,6 +352,16 @@ def _validate_match(
         raise AdapterSelectorError("adapter match path does not match artifact path")
 
     validated: dict[str, FieldMapping] = {}
+    expected_sha256 = str(artifact.candidate.sha256)
+    for provenance in match.match_evidence:
+        if provenance.source_path != artifact.candidate.path:
+            raise AdapterSelectorError(
+                "adapter match provenance path does not match artifact path"
+            )
+        if expected_sha256 not in provenance.detail:
+            raise AdapterSelectorError(
+                "adapter match provenance does not bind the current sha256"
+            )
     for mapping in match.mappings:
         if mapping.target_field not in allowed_targets:
             raise AdapterSelectorError(
@@ -355,12 +370,13 @@ def _validate_match(
         if mapping.selector.kind is not selector_kind:
             raise AdapterSelectorError("mapping selector kind is not supported")
         for provenance in (mapping.provenance, mapping.selector.provenance):
-            if (
-                provenance.source_path is not None
-                and provenance.source_path != artifact.candidate.path
-            ):
+            if provenance.source_path != artifact.candidate.path:
                 raise AdapterSelectorError(
                     "mapping selector provenance path does not match artifact path"
+                )
+            if expected_sha256 not in provenance.detail:
+                raise AdapterSelectorError(
+                    "mapping selector provenance does not bind the current sha256"
                 )
         validated[mapping.target_field] = mapping
     return validated

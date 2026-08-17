@@ -9,6 +9,7 @@ import re
 
 from claimci.analysis import (
     AdapterMatch,
+    AnalysisContractError,
     ArtifactKind,
     Confidence,
     ExperimentRole,
@@ -23,6 +24,7 @@ from .core import (
     MAX_COLUMNS,
     MAX_LOGICAL_RECORD_BYTES,
     MAX_RECORDS,
+    AdapterError,
     AdapterLimitError,
     AdapterParseError,
     AdapterSelectorError,
@@ -267,19 +269,26 @@ class CsvAdapter:
                 selector=f"row[{row_index}].{metric_mapping.selector.expression}",
                 inferred="inferred=true" in metric_mapping.provenance.detail,
             )
-            observations.append(
-                NormalizedObservation(
-                    provenance=provenance,
-                    metric_name=metric_mapping.selector.expression,
-                    metric_value=_finite_csv_number(
-                        metric_text,
-                        label="CSV metric value",
-                    ),
-                    run_id=run_text,
-                    seed=seed,
-                    experiment_role=ExperimentRole.UNSPECIFIED,
+            try:
+                observations.append(
+                    NormalizedObservation(
+                        provenance=provenance,
+                        metric_name=metric_mapping.selector.expression,
+                        metric_value=_finite_csv_number(
+                            metric_text,
+                            label="CSV metric value",
+                        ),
+                        run_id=run_text,
+                        seed=seed,
+                        experiment_role=ExperimentRole.UNSPECIFIED,
+                    )
                 )
-            )
+            except AdapterError:
+                raise
+            except AnalysisContractError as exc:
+                raise AdapterSelectorError(
+                    f"selected CSV identifier is invalid: {exc}"
+                ) from exc
         return NormalizedEvidence(
             evidence_id=_evidence_id(self.adapter_id, artifact),
             artifact=artifact.candidate,

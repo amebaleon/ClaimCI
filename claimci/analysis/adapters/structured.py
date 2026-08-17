@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 from claimci.analysis import (
     AdapterMatch,
+    AnalysisContractError,
     ArtifactKind,
     Confidence,
     ConfigValue,
@@ -40,6 +41,7 @@ from .core import (
 
 _RUN_NAMES = frozenset({"run", "run_id", "trial"})
 _SEED_NAMES = frozenset({"seed", "random_seed"})
+_METRIC_NAME_NAMES = frozenset({"metric", "metric_name"})
 _GENERIC_JSON_KINDS = frozenset(
     {
         ArtifactKind.RESULTS,
@@ -87,12 +89,38 @@ def _dotted_from_pointer(pointer: str) -> str:
     return ".".join(token.replace("~1", "/").replace("~0", "~") for token in tokens)
 
 
+def _json_config_entries(
+    leaves: tuple[tuple[str, object], ...],
+) -> tuple[tuple[str, str, object], ...]:
+    entries: list[tuple[str, str, object]] = []
+    seen_keys: set[str] = set()
+    for pointer, value in leaves:
+        dotted = _dotted_from_pointer(pointer)
+        if (
+            not dotted
+            or dotted != dotted.strip()
+            or len(dotted) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in dotted)
+        ):
+            raise AdapterParseError(
+                "JSON config key cannot be represented by the normalized config model"
+            )
+        if dotted in seen_keys:
+            raise AdapterParseError(
+                "JSON config selector collision cannot be represented safely"
+            )
+        seen_keys.add(dotted)
+        entries.append((pointer, dotted, value))
+    return tuple(entries)
+
+
 def _is_finite_number(value: object) -> bool:
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, (int, float))
-        and math.isfinite(float(value))
-    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
 
 
 def _unique_named_pointer(
@@ -114,6 +142,7 @@ def _result_mappings(
 ) -> tuple[FieldMapping, ...]:
     run_pointer = _unique_named_pointer(leaves, _RUN_NAMES)
     seed_pointer = _unique_named_pointer(leaves, _SEED_NAMES)
+    metric_name_pointer = _unique_named_pointer(leaves, _METRIC_NAME_NAMES)
     excluded = {item for item in (run_pointer, seed_pointer) if item is not None}
     metrics = tuple(
         pointer
@@ -130,6 +159,17 @@ def _result_mappings(
                 target_field="metric_value",
                 selector_kind=SelectorKind.JSON_POINTER,
                 selector=metrics[0],
+                inferred=True,
+            )
+        )
+    if metric_name_pointer is not None:
+        mappings.append(
+            _mapping(
+                artifact,
+                adapter_id=adapter_id,
+                target_field="metric_name",
+                selector_kind=SelectorKind.JSON_POINTER,
+                selector=metric_name_pointer,
                 inferred=True,
             )
         )
@@ -228,14 +268,19 @@ def _observation(
         _resolve_json_pointer(value, metric_mapping.selector.expression),
         label="metric value",
     )
-    return NormalizedObservation(
-        provenance=provenance,
-        metric_name=_metric_name(value, mappings),
-        metric_value=metric_value,
-        run_id=_run_id(value, mappings),
-        seed=_seed(value, mappings),
-        experiment_role=ExperimentRole.UNSPECIFIED,
-    )
+    try:
+        return NormalizedObservation(
+            provenance=provenance,
+            metric_name=_metric_name(value, mappings),
+            metric_value=metric_value,
+            run_id=_run_id(value, mappings),
+            seed=_seed(value, mappings),
+            experiment_role=ExperimentRole.UNSPECIFIED,
+        )
+    except AnalysisContractError as exc:
+        raise AdapterSelectorError(
+            f"selected structured identifier is invalid: {exc}"
+        ) from exc
 
 
 def _jsonl_records(content: bytes) -> tuple[Mapping[str, object], ...]:
@@ -313,17 +358,23 @@ class JsonAdapter:
         value = _parse_json(artifact.content)
         leaves = _pointer_leaves(value)
         if artifact.candidate.kind is ArtifactKind.CONFIG:
-            mappings = tuple(
-                _mapping(
-                    artifact,
-                    adapter_id=self.adapter_id,
-                    target_field=_config_target(_dotted_from_pointer(pointer)),
-                    selector_kind=SelectorKind.JSON_POINTER,
-                    selector=pointer,
-                    inferred=True,
+            entries = _json_config_entries(leaves)
+            try:
+                mappings = tuple(
+                    _mapping(
+                        artifact,
+                        adapter_id=self.adapter_id,
+                        target_field=_config_target(dotted),
+                        selector_kind=SelectorKind.JSON_POINTER,
+                        selector=pointer,
+                        inferred=True,
+                    )
+                    for pointer, dotted, _item in entries
                 )
-                for pointer, _item in leaves
-            )
+            except AnalysisContractError as exc:
+                raise AdapterParseError(
+                    f"JSON config selector cannot be represented safely: {exc}"
+                ) from exc
             if not mappings:
                 raise AdapterParseError("JSON config contains no scalar evidence")
             return _match(
@@ -333,11 +384,16 @@ class JsonAdapter:
                 confidence=0.9,
             )
 
-        mappings = _result_mappings(
-            artifact,
-            adapter_id=self.adapter_id,
-            leaves=leaves,
-        )
+        try:
+            mappings = _result_mappings(
+                artifact,
+                adapter_id=self.adapter_id,
+                leaves=leaves,
+            )
+        except AnalysisContractError as exc:
+            raise AdapterParseError(
+                f"JSON field cannot be represented by the safe selector model: {exc}"
+            ) from exc
         confidence = 0.95 if any(item.target_field == "metric_value" for item in mappings) else 0.45
         return _match(
             artifact,
@@ -353,8 +409,9 @@ class JsonAdapter:
         value = _parse_json(artifact.content)
         if artifact.candidate.kind is ArtifactKind.CONFIG:
             leaves = _pointer_leaves(value)
+            entries = _json_config_entries(leaves)
             allowed = frozenset(
-                _config_target(_dotted_from_pointer(pointer)) for pointer, _item in leaves
+                _config_target(dotted) for _pointer, dotted, _item in entries
             )
             mappings = _validate_match(
                 artifact,
@@ -430,11 +487,16 @@ class JsonLinesAdapter:
             return None
         _verify_integrity(artifact)
         records = _jsonl_records(artifact.content)
-        mappings = _result_mappings(
-            artifact,
-            adapter_id=self.adapter_id,
-            leaves=_common_leaves(records),
-        )
+        try:
+            mappings = _result_mappings(
+                artifact,
+                adapter_id=self.adapter_id,
+                leaves=_common_leaves(records),
+            )
+        except AnalysisContractError as exc:
+            raise AdapterParseError(
+                f"JSONL field cannot be represented by the safe selector model: {exc}"
+            ) from exc
         confidence = 0.95 if any(item.target_field == "metric_value" for item in mappings) else 0.45
         return _match(
             artifact,
