@@ -14,8 +14,9 @@ from .core import (
     AdapterParseError,
     AdapterSelectorError,
 )
+from .dataset import PassiveJsonLinesDatasetAdapter
 from .native import NativeConfigAdapter, NativeManifestAdapter, NativeResultsAdapter
-from .registry import ADAPTERS, get_adapter
+from .registry import ADAPTERS, extract_registered_artifact, get_adapter
 from .structured import JsonAdapter, JsonLinesAdapter
 from .tabular import CsvAdapter
 
@@ -38,7 +39,9 @@ __all__ = [
     "NativeConfigAdapter",
     "NativeManifestAdapter",
     "NativeResultsAdapter",
+    "PassiveJsonLinesDatasetAdapter",
     "TomlConfigAdapter",
     "YamlConfigAdapter",
+    "extract_registered_artifact",
     "get_adapter",
 ]

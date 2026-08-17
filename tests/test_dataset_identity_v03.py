@@ -18,12 +18,21 @@ from claimci.analysis import (
     FieldProvenance,
     MappingCandidate,
     MappingTrust,
+    NormalizedEvidence,
+    PassiveArtifact,
     ProvenanceKind,
     RepoMapping,
     RepositoryIdentity,
     RepositoryPath,
     Sha256Digest,
     to_jsonable,
+)
+from claimci.analysis.adapters import (
+    MAX_ARTIFACT_BYTES,
+    AdapterLimitError,
+    PassiveJsonLinesDatasetAdapter,
+    extract_registered_artifact,
+    get_adapter,
 )
 
 
@@ -121,3 +130,88 @@ def test_artifact_candidate_still_binds_exact_dataset_bytes() -> None:
 
     assert candidate.size == len(content)
 
+
+def _passive_dataset(
+    content: bytes = b'{"id":"one"}\n',
+    *,
+    path: str = "data/baseline-train.jsonl",
+    kind: ArtifactKind = ArtifactKind.DATASET,
+) -> PassiveArtifact:
+    return PassiveArtifact(
+        ArtifactCandidate(
+            path=RepositoryPath(path),
+            kind=kind,
+            sha256=Sha256Digest(hashlib.sha256(content).hexdigest()),
+            size=len(content),
+            confidence=Confidence(0.9),
+            discovery_reason="dataset fixture",
+            relevant_claim_ids=("claim-1",),
+            provenance=PROVENANCE,
+        ),
+        content,
+    )
+
+
+def test_passive_jsonl_dataset_adapter_is_registered_identity_only_evidence() -> None:
+    artifact = _passive_dataset()
+    adapter = get_adapter("claimci-jsonl-dataset-v1")
+
+    assert type(adapter) is PassiveJsonLinesDatasetAdapter
+    match = adapter.probe(artifact)
+    assert match is not None
+    assert match.adapter_id == "claimci-jsonl-dataset-v1"
+    assert match.path == artifact.candidate.path
+    assert match.mappings == ()
+    evidence = adapter.extract(artifact, match)
+    assert type(evidence) is NormalizedEvidence
+    assert evidence.adapter_match == match
+    assert len(evidence.observations) == 1
+    observation = evidence.observations[0]
+    assert observation.experiment_role is ExperimentRole.UNSPECIFIED
+    assert len(observation.dataset_references) == 1
+    reference = observation.dataset_references[0]
+    assert reference.path == artifact.candidate.path
+    assert reference.split is None
+
+
+def test_dataset_adapter_preserves_arbitrary_bytes_without_row_interpretation() -> None:
+    artifact = _passive_dataset(b"not parsed as JSONL by the identity adapter\xff")
+    adapter = PassiveJsonLinesDatasetAdapter()
+
+    match = adapter.probe(artifact)
+    assert match is not None
+    evidence = adapter.extract(artifact, match)
+    assert evidence.artifact.sha256 == artifact.candidate.sha256
+    assert evidence.observations[0].dataset_references[0].path == artifact.candidate.path
+
+
+@pytest.mark.parametrize(
+    ("path", "kind"),
+    [
+        ("data/train.json", ArtifactKind.DATASET),
+        ("data/train.jsonl", ArtifactKind.RESULTS),
+    ],
+)
+def test_dataset_adapter_requires_exact_jsonl_dataset_kind(
+    path: str,
+    kind: ArtifactKind,
+) -> None:
+    assert PassiveJsonLinesDatasetAdapter().probe(
+        _passive_dataset(path=path, kind=kind)
+    ) is None
+
+
+def test_dataset_adapter_enforces_existing_passive_byte_limit() -> None:
+    artifact = _passive_dataset(b"x" * (MAX_ARTIFACT_BYTES + 1))
+
+    with pytest.raises(AdapterLimitError, match="8 MiB|bytes"):
+        PassiveJsonLinesDatasetAdapter().probe(artifact)
+
+
+def test_fixed_registry_helper_extracts_dataset_without_extension_fallback() -> None:
+    artifact = _passive_dataset()
+
+    evidence = extract_registered_artifact(artifact)
+
+    assert evidence is not None
+    assert evidence.adapter_match.adapter_id == "claimci-jsonl-dataset-v1"
