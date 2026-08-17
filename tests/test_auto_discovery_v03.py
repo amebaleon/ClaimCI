@@ -26,8 +26,14 @@ from claimci.analysis.discovery import (
     ArtifactIssue,
     ClaimedValue,
     DiscoveredClaim,
+    DiscoveryError,
     DiscoveryLimits,
     DiscoveryResult,
+)
+from claimci.analysis.discovery.repository import (
+    collect_repository_context,
+    inspect_artifact,
+    read_artifact_text,
 )
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 
@@ -305,3 +311,149 @@ def test_artifact_issue_requires_a_confined_path_and_bounded_reason() -> None:
     with pytest.raises(ValueError):
         ArtifactIssue(RepositoryPath("results.json"), "x" * 4_097)
 
+
+def test_repository_context_reuses_bounded_review_index_and_changed_sources(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+    (base / "README.md").write_text("Old claim.\n", encoding="utf-8")
+    (head / "README.md").write_text("Accuracy improved.\n", encoding="utf-8")
+    (head / "candidate_results.json").write_text("{}\n", encoding="utf-8")
+
+    context = collect_repository_context(
+        head,
+        base_root=base,
+        pr_title="Candidate study",
+        pr_description="Bounded description",
+        limits=DiscoveryLimits(),
+    )
+
+    assert context.repository_paths == (
+        RepositoryPath("README.md"),
+        RepositoryPath("candidate_results.json"),
+    )
+    assert context.changed_paths == (RepositoryPath("README.md"),)
+    assert tuple(source.text for source in context.source_bundle.sources) == (
+        "Candidate study",
+        "Bounded description",
+        "Accuracy improved.\n",
+    )
+
+
+def test_repository_context_excludes_symlinked_files_and_directories(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    head = tmp_path / "head"
+    outside.mkdir()
+    head.mkdir()
+    (outside / "secret.json").write_text('{"secret": true}\n', encoding="utf-8")
+    (head / "safe_results.json").write_text("{}\n", encoding="utf-8")
+    try:
+        (head / "linked_results.json").symlink_to(outside / "secret.json")
+        (head / "linked_directory").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    context = collect_repository_context(head, limits=DiscoveryLimits())
+
+    assert context.repository_paths == (RepositoryPath("safe_results.json"),)
+
+
+def test_artifact_inspection_rejects_unindexed_paths_and_isolates_oversize(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    (head / "small_results.json").write_bytes(b"{}\n")
+    (head / "large_results.json").write_bytes(b"x" * 33)
+    limits = DiscoveryLimits(max_artifact_bytes=32)
+    context = collect_repository_context(head, limits=limits)
+
+    small = inspect_artifact(
+        context,
+        RepositoryPath("small_results.json"),
+        limits=limits,
+    )
+    large = inspect_artifact(
+        context,
+        RepositoryPath("large_results.json"),
+        limits=limits,
+    )
+
+    assert small.path == "small_results.json"
+    assert small.size == 3
+    assert small.sha256 == Sha256Digest(
+        "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    )
+    assert large == ArtifactIssue(
+        RepositoryPath("large_results.json"),
+        "artifact exceeds the 32-byte discovery limit",
+    )
+    with pytest.raises(DiscoveryError, match="indexed"):
+        inspect_artifact(
+            context,
+            RepositoryPath("missing.json"),
+            limits=limits,
+        )
+
+
+def test_artifact_text_isolates_invalid_utf8_without_losing_other_artifacts(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    (head / "good.yaml").write_text("metric: accuracy\n", encoding="utf-8")
+    (head / "bad.yaml").write_bytes(b"\xff\xfe\x00")
+    context = collect_repository_context(head, limits=DiscoveryLimits())
+
+    good = read_artifact_text(
+        context,
+        RepositoryPath("good.yaml"),
+        limits=DiscoveryLimits(),
+    )
+    bad = read_artifact_text(
+        context,
+        RepositoryPath("bad.yaml"),
+        limits=DiscoveryLimits(),
+    )
+
+    assert good[1] == "metric: accuracy\n"
+    assert bad == ArtifactIssue(
+        RepositoryPath("bad.yaml"),
+        "artifact is not valid UTF-8 text",
+    )
+
+
+def test_repository_context_is_deterministic_for_creation_order(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    for name in ("z_results.json", "A_config.yaml", "middle.md"):
+        (head / name).write_text(f"{name}\n", encoding="utf-8")
+
+    first = collect_repository_context(head, limits=DiscoveryLimits())
+    second = collect_repository_context(head, limits=DiscoveryLimits())
+
+    assert first.repository_paths == second.repository_paths == (
+        RepositoryPath("A_config.yaml"),
+        RepositoryPath("middle.md"),
+        RepositoryPath("z_results.json"),
+    )
+
+
+def test_repository_context_rejects_repository_depth_beyond_existing_bound(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    cursor = head
+    for _ in range(66):
+        cursor = cursor / "d"
+        cursor.mkdir()
+    (cursor / "results.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(DiscoveryError, match="repository"):
+        collect_repository_context(head, limits=DiscoveryLimits())
