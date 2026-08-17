@@ -38,6 +38,7 @@ from claimci.analysis.discovery.repository import (
 )
 from claimci.analysis.discovery.claims import as_scientific_claim, discover_claims
 from claimci.analysis.discovery.artifacts import discover_artifacts
+from claimci.analysis.discovery.mappings import resolve_mappings
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 
 
@@ -816,3 +817,279 @@ def test_malformed_manifest_is_isolated_while_other_artifacts_survive(
             "manifest is not a valid confined mapping hint",
         ),
     )
+
+
+def _mapping_fixture(tmp_path: Path, names: tuple[str, ...]):
+    head = tmp_path / "head"
+    head.mkdir()
+    for name in names:
+        path = head / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    context = collect_repository_context(
+        head,
+        pr_description="Accuracy improved 71 to 79.",
+        limits=DiscoveryLimits(),
+    )
+    claims = discover_claims(context, limits=DiscoveryLimits())
+    artifacts = discover_artifacts(context, claims, limits=DiscoveryLimits())
+    return context, claims, artifacts
+
+
+def test_obvious_result_and_config_names_produce_mapping_without_question(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        (
+            "results/baseline_results.json",
+            "results/candidate_results.json",
+            "configs/baseline_config.yaml",
+            "configs/candidate_config.yaml",
+        ),
+    )
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        discovered.manifest_mappings,
+        repository=REPOSITORY,
+        limits=DiscoveryLimits(),
+    )
+
+    assert resolution.question is None
+    inferred = next(
+        item for item in resolution.candidates if item.trust is MappingTrust.INFERRED
+    )
+    assert {
+        (binding.kind, binding.role, str(binding.path))
+        for binding in inferred.bindings
+    } == {
+        (
+            ArtifactKind.RESULTS,
+            ExperimentRole.BASELINE,
+            "results/baseline_results.json",
+        ),
+        (
+            ArtifactKind.RESULTS,
+            ExperimentRole.CANDIDATE,
+            "results/candidate_results.json",
+        ),
+        (
+            ArtifactKind.CONFIG,
+            ExperimentRole.BASELINE,
+            "configs/baseline_config.yaml",
+        ),
+        (
+            ArtifactKind.CONFIG,
+            ExperimentRole.CANDIDATE,
+            "configs/candidate_config.yaml",
+        ),
+    }
+
+
+def test_ambiguous_candidate_results_create_one_minimal_mapping_question(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        (
+            "results/baseline_results.json",
+            "results/candidate_a_results.json",
+            "results/candidate_b_results.json",
+            "configs/baseline_config.yaml",
+            "configs/candidate_config.yaml",
+        ),
+    )
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        discovered.manifest_mappings,
+        repository=REPOSITORY,
+        limits=DiscoveryLimits(),
+    )
+
+    question = resolution.question
+    assert question is not None
+    assert question.prompt == "Which file contains the candidate results?"
+    assert tuple(choice.label for choice in question.choices) == (
+        "results/candidate_a_results.json",
+        "results/candidate_b_results.json",
+    )
+    assert all(len(choice.bindings) == 1 for choice in question.choices)
+    assert all(
+        choice.bindings[0].role is ExperimentRole.CANDIDATE
+        and choice.bindings[0].kind is ArtifactKind.RESULTS
+        for choice in question.choices
+    )
+
+
+def test_question_selection_prefers_candidate_results_over_other_ambiguities(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        (
+            "results/baseline_results.json",
+            "results/candidate_a_results.json",
+            "results/candidate_b_results.json",
+            "configs/baseline_a_config.yaml",
+            "configs/baseline_b_config.yaml",
+            "configs/candidate_config.yaml",
+        ),
+    )
+
+    resolution = resolve_mappings(
+        tuple(reversed(discovered.artifacts)),
+        claims,
+        (),
+        repository=REPOSITORY,
+        limits=DiscoveryLimits(),
+    )
+
+    assert resolution.question is not None
+    assert resolution.question.prompt == "Which file contains the candidate results?"
+    assert len(resolution.question.choices) == 2
+
+
+def test_approved_mapping_suppresses_lower_tier_questions_and_is_not_rebuilt(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        (
+            "results/baseline_results.json",
+            "results/candidate_a_results.json",
+            "results/candidate_b_results.json",
+        ),
+    )
+    source = _mapping(
+        "approved-source",
+        trust=MappingTrust.INFERRED,
+        confidence=0.3,
+        path="results/candidate_a_results.json",
+    )
+    approved = RepoMapping.approve(REPOSITORY, source, approved_by="owner")
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        discovered.manifest_mappings,
+        repository=REPOSITORY,
+        approved_mapping=approved,
+        limits=DiscoveryLimits(),
+    )
+
+    assert resolution.approved_mapping is approved
+    assert resolution.question is None
+
+    foreign = RepoMapping.approve(
+        RepositoryIdentity(owner="other", name="repository"),
+        source,
+        approved_by="owner",
+    )
+    with pytest.raises(DiscoveryError, match="repository"):
+        resolve_mappings(
+            discovered.artifacts,
+            claims,
+            (),
+            repository=REPOSITORY,
+            approved_mapping=foreign,
+            limits=DiscoveryLimits(),
+        )
+
+
+def _provider_mapping_payload(path: str) -> dict[str, object]:
+    return {
+        "mappings": [
+            {
+                "confidence": 0.81,
+                "bindings": [
+                    {
+                        "path": path,
+                        "kind": "results",
+                        "role": "candidate",
+                        "adapter_id": "json.metrics",
+                        "mappings": [
+                            {
+                                "target_field": "metric_value",
+                                "selector": {
+                                    "kind": "json_pointer",
+                                    "expression": "/metrics/accuracy",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_provider_mapping_is_validated_proposal_without_trust_elevation(
+    tmp_path: Path,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        ("results/candidate_results.json",),
+    )
+    payload = _provider_mapping_payload("results/candidate_results.json")
+
+    resolution = resolve_mappings(
+        discovered.artifacts,
+        claims,
+        (),
+        repository=REPOSITORY,
+        provider_payload=payload,
+        limits=DiscoveryLimits(),
+    )
+
+    provider = next(
+        item
+        for item in resolution.candidates
+        if item.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+    )
+    assert provider.trust is MappingTrust.INFERRED
+    assert provider.confidence == Confidence(0.81)
+    binding = provider.bindings[0]
+    assert binding.path == "results/candidate_results.json"
+    assert binding.adapter_id == "json.metrics"
+    assert binding.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+    assert binding.mappings[0].selector.expression == "/metrics/accuracy"
+    assert binding.mappings[0].provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["mappings"][0]["bindings"][0].update(
+            {"path": "../outside.json"}
+        ),
+        lambda payload: payload["mappings"][0]["bindings"][0]["mappings"][0][
+            "selector"
+        ].update({"expression": "metrics[0]"}),
+        lambda payload: payload["mappings"][0].update({"trust": "user_approved"}),
+        lambda payload: payload["mappings"][0].update({"verdict": "SUPPORTED"}),
+    ],
+)
+def test_provider_mapping_rejects_unsafe_selectors_and_authority_fields(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        ("results/candidate_results.json",),
+    )
+    payload = _provider_mapping_payload("results/candidate_results.json")
+    mutate(payload)
+
+    with pytest.raises(DiscoveryError, match="provider"):
+        resolve_mappings(
+            discovered.artifacts,
+            claims,
+            (),
+            repository=REPOSITORY,
+            provider_payload=payload,
+            limits=DiscoveryLimits(),
+        )
