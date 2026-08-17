@@ -4,6 +4,7 @@ from .confidence import Confidence
 from .contracts import (
     Adapter,
     AdapterMatch,
+    AdvisoryResearchInterpretation,
     AnalysisAuthority,
     AnalysisContractError,
     AnalysisState,
@@ -14,6 +15,7 @@ from .contracts import (
     ComputeEvidence,
     ConfigValue,
     DatasetReference,
+    DeterministicAuditOutcome,
     EphemeralAuditPlan,
     EvidenceSelector,
     ExperimentRole,
@@ -34,11 +36,14 @@ from .contracts import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    UnifiedAnalysisResult,
+    to_jsonable,
 )
 
 __all__ = [
     "Adapter",
     "AdapterMatch",
+    "AdvisoryResearchInterpretation",
     "AnalysisAuthority",
     "AnalysisContractError",
     "AnalysisState",
@@ -50,6 +55,7 @@ __all__ = [
     "Confidence",
     "ConfigValue",
     "DatasetReference",
+    "DeterministicAuditOutcome",
     "EphemeralAuditPlan",
     "EvidenceSelector",
     "ExperimentRole",
@@ -70,4 +76,6 @@ __all__ = [
     "RepositoryPath",
     "SelectorKind",
     "Sha256Digest",
+    "UnifiedAnalysisResult",
+    "to_jsonable",
 ]

@@ -8,12 +8,18 @@ workflow behavior.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 from typing import Protocol
+
+from claimci.models import AuditResult, Verdict
+from claimci.report import render_json
 
 from .confidence import Confidence
 
@@ -28,6 +34,22 @@ _ADAPTER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _TARGET_FIELD = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\Z")
 _DOTTED_SEGMENT = re.compile(r"[A-Za-z0-9_-]+\Z")
 _COLUMN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. -]{0,255}\Z")
+_INVALID_JSON_POINTER_ESCAPE = re.compile(r"~(?:[^01]|$)")
+_WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+        *(f"COM{number}" for number in "¹²³"),
+        *(f"LPT{number}" for number in "¹²³"),
+    }
+)
 
 
 def _bounded_text(value: object, label: str, *, maximum: int) -> str:
@@ -40,7 +62,7 @@ def _bounded_text(value: object, label: str, *, maximum: int) -> str:
 
 def _bounded_id(value: object, label: str, *, maximum: int = 128) -> str:
     text = _bounded_text(value, label, maximum=maximum)
-    if text != text.strip() or any(ord(character) < 32 for character in text):
+    if text != text.strip() or _has_control(text):
         raise AnalysisContractError(f"{label} must be a canonical text identifier")
     return text
 
@@ -69,6 +91,16 @@ class RepositoryPath(str):
             or windows.is_absolute()
             or bool(windows.drive)
             or any(part in {"", ".", ".."} for part in parts)
+            or _has_control(value)
+            or any(
+                character in _WINDOWS_FORBIDDEN_PATH_CHARACTERS
+                for character in value
+            )
+            or any(part != part.strip() or part.endswith(".") for part in parts)
+            or any(
+                part.split(".", 1)[0].upper() in _WINDOWS_RESERVED_BASENAMES
+                for part in parts
+            )
             or posix.as_posix() != value
         ):
             raise AnalysisContractError(
@@ -188,8 +220,13 @@ class EvidenceSelector:
         )
         if _has_control(expression):
             raise AnalysisContractError("selector expression contains control characters")
-        if self.kind is SelectorKind.JSON_POINTER and not expression.startswith("/"):
-            raise AnalysisContractError("JSON pointer selector must start with '/'")
+        if self.kind is SelectorKind.JSON_POINTER and (
+            not expression.startswith("/")
+            or _INVALID_JSON_POINTER_ESCAPE.search(expression) is not None
+        ):
+            raise AnalysisContractError(
+                "JSON pointer selector must start with '/' and use valid escapes"
+            )
         if self.kind is SelectorKind.DOTTED_PATH and (
             expression.startswith(".")
             or expression.endswith(".")
@@ -244,16 +281,12 @@ class ArtifactCandidate:
         if not isinstance(self.confidence, Confidence):
             raise TypeError("artifact confidence must be Confidence")
         _bounded_text(self.discovery_reason, "discovery reason", maximum=4_096)
-        if not isinstance(self.relevant_claim_ids, tuple) or not all(
-            isinstance(claim_id, str)
-            and claim_id.strip()
-            and claim_id == claim_id.strip()
-            and len(claim_id) <= 128
-            for claim_id in self.relevant_claim_ids
-        ):
+        if not isinstance(self.relevant_claim_ids, tuple):
             raise AnalysisContractError(
                 "relevant_claim_ids must be a tuple of bounded identifiers"
             )
+        for claim_id in self.relevant_claim_ids:
+            _bounded_id(claim_id, "relevant claim ID", maximum=128)
         if len(set(self.relevant_claim_ids)) != len(self.relevant_claim_ids):
             raise AnalysisContractError("relevant_claim_ids must be unique")
         if not isinstance(self.provenance, FieldProvenance):
@@ -557,6 +590,8 @@ class MappingCandidate:
         _validate_bindings(self.bindings, "mapping bindings")
         if not isinstance(self.confidence, Confidence):
             raise TypeError("mapping confidence must be Confidence")
+        if not isinstance(self.trust, MappingTrust):
+            raise TypeError("mapping trust must be MappingTrust")
         if self.trust not in {MappingTrust.INFERRED, MappingTrust.MANIFEST_HINT}:
             raise AnalysisContractError(
                 "mapping candidates may only be inferred or manifest hints"
@@ -656,6 +691,12 @@ class RepoMapping:
     approval_provenance: FieldProvenance
     trust: MappingTrust
 
+    def __init__(self) -> None:
+        raise TypeError("RepoMapping must be created through RepoMapping.approve")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("RepoMapping is final; use the explicit approval factory")
+
     @classmethod
     def approve(
         cls,
@@ -664,12 +705,12 @@ class RepoMapping:
         *,
         approved_by: str,
     ) -> RepoMapping:
-        if not isinstance(repository, RepositoryIdentity):
+        if type(repository) is not RepositoryIdentity:
             raise TypeError("approved mapping repository must be RepositoryIdentity")
-        if not isinstance(candidate, MappingCandidate):
+        if type(candidate) is not MappingCandidate:
             raise TypeError("approved mapping candidate must be MappingCandidate")
         approver = _bounded_id(approved_by, "approved_by", maximum=256)
-        instance = object.__new__(cls)
+        instance = object.__new__(RepoMapping)
         object.__setattr__(instance, "repository", repository)
         object.__setattr__(instance, "bindings", candidate.bindings)
         object.__setattr__(instance, "approved_by", approver)
@@ -796,9 +837,263 @@ class EphemeralAuditPlan:
             raise TypeError("plan confidence must be Confidence")
 
 
+def _deep_freeze(value: object) -> object:
+    """Copy finite JSON values into recursively immutable containers."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise AnalysisContractError(
+                "deterministic snapshot values must be finite"
+            )
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("deterministic snapshot mapping keys must be text")
+            frozen[key] = _deep_freeze(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    raise TypeError(
+        "deterministic snapshot values must be finite JSON-compatible values"
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class DeterministicAuditOutcome:
+    """An immutable authority snapshot created only from the existing audit."""
+
+    verdict: Verdict
+    payload: Mapping[str, object]
+    authority: AnalysisAuthority
+
+    def __init__(self) -> None:
+        raise TypeError(
+            "DeterministicAuditOutcome must be created through from_audit_result"
+        )
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError(
+            "DeterministicAuditOutcome is final; use the AuditResult factory"
+        )
+
+    @classmethod
+    def from_audit_result(
+        cls,
+        result: AuditResult,
+    ) -> DeterministicAuditOutcome:
+        """Snapshot one actual deterministic result without reinterpreting it."""
+
+        if type(result) is not AuditResult:
+            raise TypeError("deterministic authority requires an actual AuditResult")
+        if type(result.verdict) is not Verdict:
+            raise TypeError("deterministic authority requires an actual Verdict")
+        payload = json.loads(render_json(result))
+        if not isinstance(payload, dict):
+            raise AnalysisContractError(
+                "deterministic audit rendering must produce a JSON object"
+            )
+        instance = object.__new__(DeterministicAuditOutcome)
+        object.__setattr__(instance, "verdict", result.verdict)
+        object.__setattr__(instance, "payload", _deep_freeze(payload))
+        object.__setattr__(instance, "authority", AnalysisAuthority.DETERMINISTIC)
+        return instance
+
+
+def _validate_text_tuple(
+    values: object,
+    label: str,
+    *,
+    item_maximum: int,
+) -> None:
+    if not isinstance(values, tuple) or not all(
+        isinstance(item, str)
+        and bool(item.strip())
+        and len(item) <= item_maximum
+        for item in values
+    ):
+        raise AnalysisContractError(
+            f"{label} must be a tuple of non-empty bounded strings"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AdvisoryResearchInterpretation:
+    """Non-blocking research interpretation with no verdict-bearing fields."""
+
+    summary: str
+    interpretations: tuple[str, ...]
+    missing_evidence: tuple[str, ...]
+    confidence: Confidence
+    authority: AnalysisAuthority = field(
+        default=AnalysisAuthority.ADVISORY,
+        init=False,
+    )
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("AdvisoryResearchInterpretation is a final advisory type")
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.summary, "advisory summary", maximum=16_000)
+        _validate_text_tuple(
+            self.interpretations,
+            "advisory interpretations",
+            item_maximum=16_000,
+        )
+        _validate_text_tuple(
+            self.missing_evidence,
+            "advisory missing_evidence",
+            item_maximum=4_096,
+        )
+        if not isinstance(self.confidence, Confidence):
+            raise TypeError("advisory confidence must be Confidence")
+
+
+@dataclass(frozen=True, slots=True)
+class UnifiedAnalysisResult:
+    """One result envelope with deterministic and advisory lanes kept separate."""
+
+    state: AnalysisState
+    deterministic: DeterministicAuditOutcome | None = None
+    research_interpretation: AdvisoryResearchInterpretation | None = None
+    mapping_question: MappingQuestion | None = None
+    unavailable_reason: str | None = None
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("UnifiedAnalysisResult is final to preserve authority")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, AnalysisState):
+            raise TypeError("analysis state must be AnalysisState")
+        if self.deterministic is not None and type(
+            self.deterministic
+        ) is not DeterministicAuditOutcome:
+            raise TypeError(
+                "deterministic result must be DeterministicAuditOutcome"
+            )
+        if self.research_interpretation is not None and type(
+            self.research_interpretation
+        ) is not AdvisoryResearchInterpretation:
+            raise TypeError(
+                "research interpretation must be AdvisoryResearchInterpretation"
+            )
+        if self.mapping_question is not None and not isinstance(
+            self.mapping_question,
+            MappingQuestion,
+        ):
+            raise TypeError("mapping question must be MappingQuestion")
+        if self.unavailable_reason is not None:
+            _bounded_text(
+                self.unavailable_reason,
+                "unavailable reason",
+                maximum=4_096,
+            )
+
+        if self.state is AnalysisState.COMPLETE:
+            if self.deterministic is None:
+                raise AnalysisContractError(
+                    "complete analysis requires a deterministic outcome"
+                )
+            if self.mapping_question is not None or self.unavailable_reason is not None:
+                raise AnalysisContractError(
+                    "complete analysis cannot carry mapping or unavailable state"
+                )
+        elif self.state is AnalysisState.MAPPING_NEEDED:
+            if self.mapping_question is None:
+                raise AnalysisContractError(
+                    "mapping-needed analysis requires a mapping question"
+                )
+            if self.deterministic is not None:
+                raise AnalysisContractError(
+                    "mapping-needed analysis cannot carry a deterministic outcome"
+                )
+            if self.unavailable_reason is not None:
+                raise AnalysisContractError(
+                    "mapping-needed analysis cannot carry an unavailable reason"
+                )
+        elif self.state is AnalysisState.UNAVAILABLE:
+            if self.unavailable_reason is None:
+                raise AnalysisContractError(
+                    "unavailable analysis requires a reason"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.deterministic,
+                    self.research_interpretation,
+                    self.mapping_question,
+                )
+            ):
+                raise AnalysisContractError(
+                    "unavailable analysis cannot carry an available result"
+                )
+        elif not any(
+            value is not None
+            for value in (
+                self.deterministic,
+                self.research_interpretation,
+                self.mapping_question,
+                self.unavailable_reason,
+            )
+        ):
+            raise AnalysisContractError(
+                "partial analysis requires an available result, question, or reason"
+            )
+
+    @property
+    def authoritative_verdict(self) -> Verdict | None:
+        """Return only the verdict produced by deterministic Audit authority."""
+
+        return None if self.deterministic is None else self.deterministic.verdict
+
+
+def to_jsonable(value: object) -> object:
+    """Return a detached JSON-compatible view of approved analysis values."""
+
+    if isinstance(value, Confidence):
+        return value.value
+    if isinstance(value, Enum):
+        return to_jsonable(value.value)
+    if isinstance(value, (RepositoryPath, Sha256Digest, GitCommitSha)):
+        return str(value)
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        try:
+            json.dumps(value, allow_nan=False)
+        except ValueError as error:
+            raise AnalysisContractError(
+                "serialized integer must fit the standard JSON encoder"
+            ) from error
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise AnalysisContractError("serialized numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        serialized: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("serialized mapping keys must be text")
+            serialized[key] = to_jsonable(item)
+        return serialized
+    if isinstance(value, tuple):
+        return [to_jsonable(item) for item in value]
+    if is_dataclass(value) and type(value).__module__.startswith("claimci.analysis"):
+        return {
+            item.name: to_jsonable(getattr(value, item.name))
+            for item in fields(value)
+        }
+    raise TypeError("value is not an approved JSON-serializable analysis contract")
+
+
 __all__ = [
     "Adapter",
     "AdapterMatch",
+    "AdvisoryResearchInterpretation",
     "AnalysisAuthority",
     "AnalysisContractError",
     "AnalysisState",
@@ -809,6 +1104,7 @@ __all__ = [
     "ComputeEvidence",
     "ConfigValue",
     "DatasetReference",
+    "DeterministicAuditOutcome",
     "EphemeralAuditPlan",
     "EvidenceSelector",
     "ExperimentRole",
@@ -829,4 +1125,6 @@ __all__ = [
     "RepositoryPath",
     "SelectorKind",
     "Sha256Digest",
+    "UnifiedAnalysisResult",
+    "to_jsonable",
 ]

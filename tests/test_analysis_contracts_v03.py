@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
+import json
 import math
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
 from claimci.analysis import (
     Adapter,
     AdapterMatch,
+    AdvisoryResearchInterpretation,
     AnalysisAuthority,
     AnalysisState,
     ArtifactCandidate,
@@ -21,6 +26,7 @@ from claimci.analysis import (
     Confidence,
     ConfigValue,
     DatasetReference,
+    DeterministicAuditOutcome,
     EvidenceSelector,
     EphemeralAuditPlan,
     ExperimentRole,
@@ -41,7 +47,10 @@ from claimci.analysis import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    UnifiedAnalysisResult,
+    to_jsonable,
 )
+from claimci.models import AuditResult, Finding, Impact, Severity, Verdict
 
 
 RAW_RESULTS = b'{"runs":[{"seed":1,"accuracy":0.9}]}\n'
@@ -143,6 +152,17 @@ def test_repository_path_accepts_canonical_portable_file_paths(value: str) -> No
         " data/result.json",
         "data/result.json ",
         "data/\x00result.json",
+        "data/line\nbreak.json",
+        "data/foo:bar.json",
+        "data/CON",
+        "data/aux.txt",
+        "data/CONIN$",
+        "data/conout$.log",
+        "data/COM¹.txt",
+        "data/LPT³",
+        "data/trailing.",
+        "data/trailing /result.json",
+        "data/.. /result.json",
     ],
 )
 def test_repository_path_rejects_nonportable_unconfined_or_noncanonical_values(
@@ -275,6 +295,8 @@ def test_evidence_selector_accepts_bounded_declarative_syntax(
     "kind,expression",
     [
         (SelectorKind.JSON_POINTER, "runs/0/accuracy"),
+        (SelectorKind.JSON_POINTER, "/metrics/~2accuracy"),
+        (SelectorKind.JSON_POINTER, "/metrics/~"),
         (SelectorKind.JSON_POINTER, "/runs\naccuracy"),
         (SelectorKind.DOTTED_PATH, "runs..accuracy"),
         (SelectorKind.DOTTED_PATH, ".runs"),
@@ -330,6 +352,8 @@ def test_artifact_candidate_preserves_typed_metadata_and_is_frozen() -> None:
         {"relevant_claim_ids": ["claim-1"]},
         {"relevant_claim_ids": ("claim-1", "claim-1")},
         {"relevant_claim_ids": ("",)},
+        {"relevant_claim_ids": ("claim\n1",)},
+        {"relevant_claim_ids": ("claim\x7f1",)},
         {"provenance": "repository-index"},
     ],
 )
@@ -641,6 +665,12 @@ def test_mapping_candidate_rejects_approved_trust_and_inconsistent_manifest_hint
     assert manifest.trust is MappingTrust.MANIFEST_HINT
 
 
+@pytest.mark.parametrize("trust", ["inferred", "manifest_hint"])
+def test_mapping_candidate_rejects_raw_string_trust_values(trust: str) -> None:
+    with pytest.raises((TypeError, ValueError), match="trust|MappingTrust"):
+        _mapping_candidate(trust=trust)  # type: ignore[arg-type]
+
+
 def test_mapping_candidate_is_deeply_immutable() -> None:
     mapping = _mapping_candidate()
 
@@ -702,6 +732,8 @@ def test_repo_mapping_requires_explicit_approval_factory() -> None:
     candidate = _mapping_candidate()
 
     with pytest.raises(TypeError):
+        RepoMapping()
+    with pytest.raises(TypeError):
         RepoMapping(  # type: ignore[call-arg]
             repository=repository,
             bindings=candidate.bindings,
@@ -716,6 +748,33 @@ def test_repo_mapping_requires_explicit_approval_factory() -> None:
     assert approved.source_trust is MappingTrust.INFERRED
     assert approved.bindings == candidate.bindings
     assert approved.approval_provenance.kind is ProvenanceKind.USER_APPROVED
+
+
+def test_repo_mapping_approval_rejects_subclassed_trust_inputs() -> None:
+    candidate = _mapping_candidate()
+
+    class MappingCandidateSubclass(MappingCandidate):
+        pass
+
+    class RepositoryIdentitySubclass(RepositoryIdentity):
+        pass
+
+    subclassed_candidate = MappingCandidateSubclass(
+        candidate.mapping_id,
+        candidate.bindings,
+        candidate.confidence,
+        candidate.trust,
+        candidate.provenance,
+    )
+    repository = RepositoryIdentity("amebaleon", "ClaimCI-Demo")
+    with pytest.raises(TypeError, match="MappingCandidate"):
+        RepoMapping.approve(repository, subclassed_candidate, approved_by="owner")
+    with pytest.raises(TypeError, match="RepositoryIdentity"):
+        RepoMapping.approve(
+            RepositoryIdentitySubclass("amebaleon", "ClaimCI-Demo"),
+            candidate,
+            approved_by="owner",
+        )
 
 
 def test_provider_mapping_can_only_become_approved_through_explicit_transition() -> None:
@@ -819,3 +878,373 @@ def test_ephemeral_plan_rejects_role_conflicts_and_invalid_pr_number() -> None:
     shared["pr_number"] = 0
     with pytest.raises((TypeError, ValueError), match="PR|pr_number|positive"):
         EphemeralAuditPlan(**shared)  # type: ignore[arg-type]
+
+
+def _audit_result(
+    verdict: Verdict = Verdict.NOT_SUPPORTED,
+    evidence: dict[str, object] | None = None,
+) -> AuditResult:
+    finding = Finding(
+        rule_id="CONFIG.COMPUTE_MISMATCH",
+        severity=Severity.CRITICAL,
+        title="Candidate compute proxy is too large",
+        explanation="The candidate proxy is three times the baseline proxy.",
+        evidence=evidence or {"ratio": 3.0, "nested": [{"path": "config.yaml"}]},
+        impact=Impact.INVALIDATES,
+    )
+    return AuditResult(
+        verdict=verdict,
+        findings=(finding,),
+        metric="accuracy",
+        minimum_improvement=0.05,
+    )
+
+
+def _advisory() -> AdvisoryResearchInterpretation:
+    return AdvisoryResearchInterpretation(
+        summary="Provider says SUPPORTED, but this remains advisory.",
+        interpretations=("NOT_SUPPORTED", "SUPPORTED"),
+        missing_evidence=("A second candidate run is missing.",),
+        confidence=Confidence(1.0),
+    )
+
+
+def _mapping_question() -> MappingQuestion:
+    return MappingQuestion(
+        question_id="candidate-results",
+        prompt="Which file contains the candidate results?",
+        choices=(
+            _choice("results-a", "results/a.json"),
+            _choice("results-b", "results/b.json"),
+        ),
+        relevant_claim_id="claim-1",
+    )
+
+
+def test_only_actual_audit_result_can_create_deterministic_authority() -> None:
+    with pytest.raises(TypeError):
+        DeterministicAuditOutcome()
+    with pytest.raises(TypeError):
+        DeterministicAuditOutcome.from_audit_result(  # type: ignore[arg-type]
+            {"verdict": "SUPPORTED"}
+        )
+    with pytest.raises(TypeError):
+        DeterministicAuditOutcome.from_audit_result(_advisory())  # type: ignore[arg-type]
+
+    class AuditResultSubclass(AuditResult):
+        pass
+
+    with pytest.raises(TypeError, match="actual AuditResult"):
+        DeterministicAuditOutcome.from_audit_result(
+            AuditResultSubclass(Verdict.SUPPORTED, ())
+        )
+
+    class FakeVerdict:
+        value = "SUPPORTED"
+
+    with pytest.raises(TypeError, match="Verdict"):
+        DeterministicAuditOutcome.from_audit_result(
+            AuditResult(FakeVerdict(), ())  # type: ignore[arg-type]
+        )
+
+    outcome = DeterministicAuditOutcome.from_audit_result(_audit_result())
+
+    assert outcome.verdict is Verdict.NOT_SUPPORTED
+    assert outcome.authority is AnalysisAuthority.DETERMINISTIC
+    assert outcome.payload["verdict"] == "NOT_SUPPORTED"
+
+
+def test_factory_only_trust_types_cannot_be_subclassed() -> None:
+    with pytest.raises(TypeError, match="subclass|final|factory"):
+
+        class ForgedOutcome(DeterministicAuditOutcome):
+            pass
+
+    with pytest.raises(TypeError, match="subclass|final|factory"):
+
+        class ForgedRepoMapping(RepoMapping):
+            pass
+
+    with pytest.raises(TypeError, match="subclass|final|authority"):
+
+        class ForgedAdvisory(AdvisoryResearchInterpretation):
+            verdict = Verdict.SUPPORTED
+
+    with pytest.raises(TypeError, match="subclass|final|authority"):
+
+        class ForgedUnifiedResult(UnifiedAnalysisResult):
+            @property
+            def authoritative_verdict(self) -> Verdict:
+                return Verdict.SUPPORTED
+
+
+def test_deterministic_snapshot_is_deeply_immutable_and_detached() -> None:
+    evidence: dict[str, object] = {
+        "ratio": 3.0,
+        "nested": [{"path": "config.yaml"}],
+    }
+    outcome = DeterministicAuditOutcome.from_audit_result(
+        _audit_result(evidence=evidence)
+    )
+    evidence["ratio"] = 1.0
+    evidence["nested"] = []
+
+    finding = outcome.payload["findings"][0]  # type: ignore[index]
+    assert finding["evidence"]["ratio"] == 3.0  # type: ignore[index]
+    assert finding["evidence"]["nested"][0]["path"] == "config.yaml"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        outcome.payload["verdict"] = "SUPPORTED"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        finding["evidence"]["ratio"] = 1.0  # type: ignore[index]
+
+
+def test_advisory_interpretation_has_fixed_nonblocking_authority_and_no_verdict() -> None:
+    advisory = _advisory()
+
+    assert advisory.authority is AnalysisAuthority.ADVISORY
+    assert not hasattr(advisory, "verdict")
+    assert not hasattr(advisory, "severity")
+    assert not hasattr(advisory, "impact")
+    with pytest.raises(TypeError):
+        AdvisoryResearchInterpretation(  # type: ignore[call-arg]
+            summary="advisory",
+            interpretations=(),
+            missing_evidence=(),
+            confidence=Confidence(0.5),
+            verdict=Verdict.SUPPORTED,
+        )
+
+
+def test_advisory_text_cannot_override_authoritative_verdict() -> None:
+    unified = UnifiedAnalysisResult(
+        state=AnalysisState.COMPLETE,
+        deterministic=DeterministicAuditOutcome.from_audit_result(_audit_result()),
+        research_interpretation=_advisory(),
+    )
+
+    assert unified.authoritative_verdict is Verdict.NOT_SUPPORTED
+    assert unified.research_interpretation is not None
+    assert "SUPPORTED" in unified.research_interpretation.summary
+
+
+def test_unified_result_complete_requires_deterministic_authority() -> None:
+    with pytest.raises((TypeError, ValueError), match="COMPLETE|complete|deterministic"):
+        UnifiedAnalysisResult(
+            state=AnalysisState.COMPLETE,
+            research_interpretation=_advisory(),
+        )
+
+    result = UnifiedAnalysisResult(
+        state=AnalysisState.COMPLETE,
+        deterministic=DeterministicAuditOutcome.from_audit_result(_audit_result()),
+    )
+    assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
+
+
+def test_unified_result_mapping_needed_requires_question_and_no_authority() -> None:
+    with pytest.raises((TypeError, ValueError), match="question|mapping"):
+        UnifiedAnalysisResult(state=AnalysisState.MAPPING_NEEDED)
+    with pytest.raises((TypeError, ValueError), match="deterministic|mapping"):
+        UnifiedAnalysisResult(
+            state=AnalysisState.MAPPING_NEEDED,
+            deterministic=DeterministicAuditOutcome.from_audit_result(_audit_result()),
+            mapping_question=_mapping_question(),
+        )
+
+    result = UnifiedAnalysisResult(
+        state=AnalysisState.MAPPING_NEEDED,
+        mapping_question=_mapping_question(),
+    )
+    assert result.authoritative_verdict is None
+
+
+def test_unified_result_unavailable_requires_reason_and_no_results() -> None:
+    with pytest.raises((TypeError, ValueError), match="reason|unavailable"):
+        UnifiedAnalysisResult(state=AnalysisState.UNAVAILABLE)
+    with pytest.raises((TypeError, ValueError), match="unavailable|result"):
+        UnifiedAnalysisResult(
+            state=AnalysisState.UNAVAILABLE,
+            research_interpretation=_advisory(),
+            unavailable_reason="adapter unavailable",
+        )
+
+    result = UnifiedAnalysisResult(
+        state=AnalysisState.UNAVAILABLE,
+        unavailable_reason="no eligible evidence artifacts were found",
+    )
+    assert result.authoritative_verdict is None
+
+
+def test_unified_result_partial_requires_explicit_available_state() -> None:
+    with pytest.raises((TypeError, ValueError), match="partial|available"):
+        UnifiedAnalysisResult(state=AnalysisState.PARTIAL)
+
+    result = UnifiedAnalysisResult(
+        state=AnalysisState.PARTIAL,
+        research_interpretation=_advisory(),
+        unavailable_reason="deterministic adapter mapping is incomplete",
+    )
+    assert result.authoritative_verdict is None
+
+
+def test_json_serialization_is_detached_finite_and_preserves_ephemeral_marker() -> None:
+    baseline = _normalized_evidence(
+        role=ExperimentRole.BASELINE,
+        evidence_id="evidence-baseline-results",
+    )
+    plan = EphemeralAuditPlan(
+        plan_id="plan-serialization",
+        repository=RepositoryIdentity("amebaleon", "ClaimCI-Demo"),
+        pr_number=None,
+        head_sha=GitCommitSha("a" * 40),
+        claim=ClaimReference(
+            "claim-1",
+            "Candidate improves accuracy.",
+            None,
+            Confidence(0.9),
+            _provenance(),
+        ),
+        baseline_evidence=(baseline,),
+        candidate_evidence=(_normalized_evidence(),),
+        mapping_provenance=(_provenance(),),
+        missing_evidence=(),
+        confidence=Confidence(0.75),
+    )
+
+    serialized = to_jsonable(plan)
+    encoded = json.dumps(serialized, allow_nan=False, sort_keys=True)
+
+    assert serialized["ephemeral"] is True  # type: ignore[index]
+    assert serialized["repository"]["owner"] == "amebaleon"  # type: ignore[index]
+    assert serialized["confidence"] == 0.75  # type: ignore[index]
+    assert '"head_sha": "aaaaaaaa' in encoded
+    serialized["repository"]["owner"] = "mutated"  # type: ignore[index]
+    assert plan.repository.owner == "amebaleon"
+
+    serialized_path = to_jsonable(RepositoryPath("results/candidate.json"))
+    assert type(serialized_path) is str
+    assert serialized_path == "results/candidate.json"
+
+
+def test_json_serialization_rejects_nonfinite_and_unsupported_values() -> None:
+    with pytest.raises((TypeError, ValueError)):
+        to_jsonable(math.nan)
+    with pytest.raises((TypeError, ValueError)):
+        to_jsonable(object())
+    with pytest.raises((TypeError, ValueError), match="integer|JSON"):
+        to_jsonable(10**5_000)
+
+
+def test_legacy_manifest_is_an_optional_high_confidence_mapping_hint() -> None:
+    root = Path(__file__).resolve().parents[1]
+    raw = (root / "research.yaml").read_bytes()
+    manifest_provenance = FieldProvenance(
+        kind=ProvenanceKind.MANIFEST_HINT,
+        detail="legacy research.yaml explicitly maps audit inputs",
+        source_path=RepositoryPath("research.yaml"),
+        source_id="research.yaml",
+    )
+    manifest = ArtifactCandidate(
+        path=RepositoryPath("research.yaml"),
+        kind=ArtifactKind.MANIFEST,
+        sha256=Sha256Digest(hashlib.sha256(raw).hexdigest()),
+        size=len(raw),
+        confidence=Confidence(0.99),
+        discovery_reason="canonical legacy manifest filename",
+        relevant_claim_ids=("claim-legacy",),
+        provenance=manifest_provenance,
+    )
+    bindings = (
+        _binding(
+            "examples/shared/base/config.yaml",
+            ArtifactKind.CONFIG,
+            ExperimentRole.BASELINE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/base/results.json",
+            ArtifactKind.RESULTS,
+            ExperimentRole.BASELINE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/base/train.jsonl",
+            ArtifactKind.DATASET,
+            ExperimentRole.BASELINE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/base/eval.jsonl",
+            ArtifactKind.DATASET,
+            ExperimentRole.BASELINE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/candidate/config.yaml",
+            ArtifactKind.CONFIG,
+            ExperimentRole.CANDIDATE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/candidate/results.json",
+            ArtifactKind.RESULTS,
+            ExperimentRole.CANDIDATE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/candidate/train.jsonl",
+            ArtifactKind.DATASET,
+            ExperimentRole.CANDIDATE,
+            provenance=manifest_provenance,
+        ),
+        _binding(
+            "examples/shared/candidate/eval.jsonl",
+            ArtifactKind.DATASET,
+            ExperimentRole.CANDIDATE,
+            provenance=manifest_provenance,
+        ),
+    )
+    mapping = MappingCandidate(
+        mapping_id="legacy-research-yaml",
+        bindings=bindings,
+        confidence=Confidence(0.99),
+        trust=MappingTrust.MANIFEST_HINT,
+        provenance=manifest_provenance,
+    )
+
+    assert manifest.kind is ArtifactKind.MANIFEST
+    assert float(manifest.confidence) >= 0.9
+    assert mapping.trust is MappingTrust.MANIFEST_HINT
+    assert len(mapping.bindings) == 8
+    assert {binding.role for binding in mapping.bindings} == {
+        ExperimentRole.BASELINE,
+        ExperimentRole.CANDIDATE,
+    }
+    assert "manifest" not in EphemeralAuditPlan.__dataclass_fields__
+
+
+def test_analysis_contracts_import_no_provider_or_execution_surface() -> None:
+    module_path = Path(inspect.getfile(RepositoryPath)).resolve()
+    package_root = module_path.parent
+    forbidden_modules = {
+        "subprocess",
+        "openai",
+        "importlib",
+        "claimci.review.orchestrator",
+        "claimci.review.openai_provider",
+    }
+    forbidden_builtins = {"eval", "exec", "compile", "__import__"}
+    forbidden_attributes = {"system", "popen"}
+
+    for path in package_root.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert not ({alias.name for alias in node.names} & forbidden_modules)
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module not in forbidden_modules
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    assert node.func.id not in forbidden_builtins
+                elif isinstance(node.func, ast.Attribute):
+                    assert node.func.attr not in forbidden_attributes
