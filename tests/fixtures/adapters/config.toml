@@ -1,0 +1,10 @@
+[evaluation]
+metric = "accuracy"
+threshold = 0.8
+
+[model]
+name = "tiny-transformer"
+
+[training]
+batch_size = 16
+deterministic = true
