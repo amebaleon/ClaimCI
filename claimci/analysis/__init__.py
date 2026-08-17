@@ -1,0 +1,45 @@
+"""Shared immutable contracts for ClaimCI zero-configuration analysis."""
+
+from .confidence import Confidence
+from .contracts import (
+    Adapter,
+    AdapterMatch,
+    AnalysisAuthority,
+    AnalysisContractError,
+    AnalysisState,
+    ArtifactCandidate,
+    ArtifactKind,
+    EvidenceSelector,
+    ExperimentRole,
+    FieldMapping,
+    FieldProvenance,
+    GitCommitSha,
+    MappingTrust,
+    PassiveArtifact,
+    ProvenanceKind,
+    RepositoryPath,
+    SelectorKind,
+    Sha256Digest,
+)
+
+__all__ = [
+    "Adapter",
+    "AdapterMatch",
+    "AnalysisAuthority",
+    "AnalysisContractError",
+    "AnalysisState",
+    "ArtifactCandidate",
+    "ArtifactKind",
+    "Confidence",
+    "EvidenceSelector",
+    "ExperimentRole",
+    "FieldMapping",
+    "FieldProvenance",
+    "GitCommitSha",
+    "MappingTrust",
+    "PassiveArtifact",
+    "ProvenanceKind",
+    "RepositoryPath",
+    "SelectorKind",
+    "Sha256Digest",
+]
