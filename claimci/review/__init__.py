@@ -22,8 +22,14 @@ from .models import (
     SourceLocation,
     SourceRecord,
 )
+from .analysis_bridge import (
+    AnalysisReviewContext,
+    run_analysis_review,
+    validate_scientific_claim_for_audit,
+)
 
 __all__ = [
+    "AnalysisReviewContext",
     "ClaimDirection",
     "ClaimMagnitude",
     "ClaimType",
@@ -39,4 +45,6 @@ __all__ = [
     "SourceKind",
     "SourceLocation",
     "SourceRecord",
+    "run_analysis_review",
+    "validate_scientific_claim_for_audit",
 ]
