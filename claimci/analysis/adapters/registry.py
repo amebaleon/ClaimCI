@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import re
 
-from claimci.analysis import Adapter
+from claimci.analysis import Adapter, NormalizedEvidence, PassiveArtifact
 
 from .config import TomlConfigAdapter, YamlConfigAdapter
 from .core import AdapterSelectorError
+from .dataset import PassiveJsonLinesDatasetAdapter
 from .native import NativeConfigAdapter, NativeManifestAdapter, NativeResultsAdapter
 from .structured import JsonAdapter, JsonLinesAdapter
 from .tabular import CsvAdapter
@@ -19,6 +20,7 @@ ADAPTERS = (
     NativeManifestAdapter(),
     NativeResultsAdapter(),
     NativeConfigAdapter(),
+    PassiveJsonLinesDatasetAdapter(),
     JsonAdapter(),
     JsonLinesAdapter(),
     CsvAdapter(),
@@ -38,4 +40,18 @@ def get_adapter(adapter_id: str) -> Adapter:
     raise KeyError(adapter_id)
 
 
-__all__ = ["ADAPTERS", "get_adapter"]
+def extract_registered_artifact(
+    artifact: PassiveArtifact,
+) -> NormalizedEvidence | None:
+    """Extract one passive artifact through the first fixed built-in match."""
+
+    if type(artifact) is not PassiveArtifact:
+        raise TypeError("registered extraction requires PassiveArtifact")
+    for adapter in ADAPTERS:
+        match = adapter.probe(artifact)
+        if match is not None:
+            return adapter.extract(artifact, match)
+    return None
+
+
+__all__ = ["ADAPTERS", "extract_registered_artifact", "get_adapter"]

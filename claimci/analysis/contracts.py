@@ -153,6 +153,13 @@ class ExperimentRole(str, Enum):
     UNSPECIFIED = "unspecified"
 
 
+class DatasetSplit(str, Enum):
+    """A repository mapping identity for one native Audit dataset slot."""
+
+    TRAIN = "train"
+    EVAL = "eval"
+
+
 class ProvenanceKind(str, Enum):
     DETERMINISTIC_DISCOVERY = "deterministic_discovery"
     ADAPTER_EXTRACTION = "adapter_extraction"
@@ -530,6 +537,7 @@ class ArtifactBinding:
     adapter_id: str | None
     mappings: tuple[FieldMapping, ...]
     provenance: FieldProvenance
+    dataset_split: DatasetSplit | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, RepositoryPath):
@@ -554,6 +562,15 @@ class ArtifactBinding:
             raise AnalysisContractError("binding mappings must have unique targets")
         if not isinstance(self.provenance, FieldProvenance):
             raise TypeError("binding provenance must be FieldProvenance")
+        if self.dataset_split is not None and not isinstance(
+            self.dataset_split,
+            DatasetSplit,
+        ):
+            raise TypeError("binding dataset split must be DatasetSplit or null")
+        if self.kind is not ArtifactKind.DATASET and self.dataset_split is not None:
+            raise AnalysisContractError(
+                "only a dataset binding may carry a dataset split"
+            )
 
 
 def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, ...]:
@@ -561,7 +578,10 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
         isinstance(item, ArtifactBinding) for item in bindings
     ):
         raise TypeError(f"{label} must be a non-empty tuple of ArtifactBinding values")
-    keys = tuple((item.path, item.kind, item.role) for item in bindings)
+    keys = tuple(
+        (item.path, item.kind, item.role, item.dataset_split)
+        for item in bindings
+    )
     if len(set(keys)) != len(keys):
         raise AnalysisContractError(f"{label} must not contain duplicate bindings")
     roles_by_path: dict[RepositoryPath, set[ExperimentRole]] = {}
@@ -751,10 +771,16 @@ class RepoMapping:
 
         validated = _validate_bindings(bindings, "runtime-approved bindings")
         approved_by_key = {
-            (item.path, item.kind, item.role): item for item in self.bindings
+            (item.path, item.kind, item.role, item.dataset_split): item
+            for item in self.bindings
         }
         for binding in validated:
-            key = (binding.path, binding.kind, binding.role)
+            key = (
+                binding.path,
+                binding.kind,
+                binding.role,
+                binding.dataset_split,
+            )
             approved = approved_by_key.get(key)
             if approved is None:
                 raise AnalysisContractError(

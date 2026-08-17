@@ -17,6 +17,7 @@ from claimci.analysis import (
     ExperimentRole,
     GitCommitSha,
     MappingCandidate,
+    PassiveArtifact,
     PlanningRequest,
     ProvenanceKind,
     RepositoryPath,
@@ -26,6 +27,7 @@ from claimci.analysis import (
     plan_ephemeral_audit,
     run_unified_analysis,
 )
+from claimci.analysis.adapters import extract_registered_artifact
 from claimci.audit import audit_research
 from claimci.models import Verdict
 from claimci.report import render_json
@@ -195,7 +197,12 @@ def _update_artifact_bytes(
         sha256=Sha256Digest(hashlib.sha256(content).hexdigest()),
         size=len(content),
     )
-    changed = dataclasses.replace(target, artifact=artifact)
+    if target.artifact.kind is ArtifactKind.DATASET:
+        changed = extract_registered_artifact(PassiveArtifact(artifact, content))
+        assert changed is not None
+        assert evidence_transform is None
+    else:
+        changed = dataclasses.replace(target, artifact=artifact)
     if evidence_transform is not None:
         changed = evidence_transform(changed)
     evidence = tuple(

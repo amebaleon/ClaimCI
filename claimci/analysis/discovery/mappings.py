@@ -14,6 +14,7 @@ from claimci.analysis.contracts import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    DatasetSplit,
     EvidenceSelector,
     ExperimentRole,
     FieldMapping,
@@ -43,7 +44,7 @@ class MappingResolution:
 class _Ambiguity:
     kind: ArtifactKind
     role: ExperimentRole
-    split: str | None
+    split: DatasetSplit | None
     artifacts: tuple[ArtifactCandidate, ...]
     affected_claim_ids: tuple[str, ...]
     unlock_count: int
@@ -80,34 +81,58 @@ def _role(path: RepositoryPath) -> ExperimentRole:
     return ExperimentRole.BASELINE if baseline else ExperimentRole.CANDIDATE
 
 
-def _dataset_split(path: RepositoryPath) -> str | None:
+def _dataset_split(path: RepositoryPath) -> DatasetSplit | None:
     tokens = _tokens(path)
     train = bool(tokens & {"train", "training"})
     evaluation = bool(tokens & {"eval", "evaluation", "test"})
     if train == evaluation:
         return None
-    return "train" if train else "eval"
+    return DatasetSplit.TRAIN if train else DatasetSplit.EVAL
 
 
 def _binding(
     artifact: ArtifactCandidate,
     role: ExperimentRole,
     provenance: FieldProvenance,
+    *,
+    dataset_split: DatasetSplit | None = None,
 ) -> ArtifactBinding:
+    binding_provenance = provenance
+    if (
+        provenance.kind is ProvenanceKind.DETERMINISTIC_DISCOVERY
+        and provenance.source_path is None
+    ):
+        slot = (
+            f"; dataset_split={dataset_split.value}"
+            if dataset_split is not None
+            else ""
+        )
+        binding_provenance = FieldProvenance(
+            kind=provenance.kind,
+            detail=f"{provenance.detail}; role={role.value}{slot}",
+            source_path=artifact.path,
+            source_id=provenance.source_id,
+        )
     return ArtifactBinding(
         path=artifact.path,
         kind=artifact.kind,
         role=role,
         adapter_id=None,
         mappings=(),
-        provenance=provenance,
+        provenance=binding_provenance,
+        dataset_split=dataset_split,
     )
 
 
 def _mapping_id(prefix: str, bindings: tuple[ArtifactBinding, ...]) -> str:
     material = json.dumps(
         [
-            (str(binding.path), binding.kind.value, binding.role.value)
+            (
+                str(binding.path),
+                binding.kind.value,
+                binding.role.value,
+                binding.dataset_split.value if binding.dataset_split else None,
+            )
             for binding in bindings
         ],
         sort_keys=True,
@@ -120,7 +145,7 @@ def _inferred_mapping(
     artifacts: tuple[ArtifactCandidate, ...],
 ) -> tuple[MappingCandidate | None, tuple[_Ambiguity, ...]]:
     grouped: dict[
-        tuple[ArtifactKind, ExperimentRole, str | None],
+        tuple[ArtifactKind, ExperimentRole, DatasetSplit | None],
         list[ArtifactCandidate],
     ] = (
         defaultdict(list)
@@ -134,12 +159,14 @@ def _inferred_mapping(
         } and (artifact.kind is not ArtifactKind.DATASET or split is not None):
             grouped[(artifact.kind, role, split)].append(artifact)
 
-    selected: list[tuple[ArtifactCandidate, ExperimentRole]] = []
+    selected: list[
+        tuple[ArtifactCandidate, ExperimentRole, DatasetSplit | None]
+    ] = []
     ambiguities: list[_Ambiguity] = []
     for kind in _MAPPED_KINDS:
         for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE):
-            splits: tuple[str | None, ...] = (
-                ("train", "eval")
+            splits: tuple[DatasetSplit | None, ...] = (
+                (DatasetSplit.TRAIN, DatasetSplit.EVAL)
                 if kind is ArtifactKind.DATASET
                 else (None,)
             )
@@ -180,17 +207,30 @@ def _inferred_mapping(
                         )
                     )
                     continue
-                selected.append((candidates[0], role))
+                selected.append((candidates[0], role, split))
 
     if not selected:
         return None, tuple(ambiguities)
-    selected.sort(key=lambda item: (item[0].kind.value, item[1].value, str(item[0].path)))
+    selected.sort(
+        key=lambda item: (
+            item[0].kind.value,
+            item[1].value,
+            item[2].value if item[2] else "",
+            str(item[0].path),
+        )
+    )
     provenance = FieldProvenance(
         kind=ProvenanceKind.DETERMINISTIC_DISCOVERY,
         detail="experiment roles inferred from complete repository path tokens",
     )
     bindings = tuple(
-        _binding(artifact, role, provenance) for artifact, role in selected
+        _binding(
+            artifact,
+            role,
+            provenance,
+            dataset_split=split,
+        )
+        for artifact, role, split in selected
     )
     # Mapping confidence represents the unique, complete path-token role/split
     # match. Artifact relevance confidence remains separately preserved.
@@ -239,15 +279,23 @@ def _provider_mappings(
                 raise DiscoveryError("provider mapping bindings are invalid")
             bindings: list[ArtifactBinding] = []
             for binding_index, raw_binding in enumerate(raw_bindings):
-                binding = _strict_fields(
-                    raw_binding,
-                    {"path", "kind", "role", "adapter_id", "mappings"},
-                    f"mapping {index} binding {binding_index}",
-                )
+                base_fields = {"path", "kind", "role", "adapter_id", "mappings"}
+                if not isinstance(raw_binding, Mapping) or frozenset(raw_binding) not in {
+                    frozenset(base_fields),
+                    frozenset((*base_fields, "dataset_split")),
+                }:
+                    raise DiscoveryError(
+                        f"provider mapping {index} binding {binding_index} has invalid fields"
+                    )
+                binding = raw_binding
                 path = RepositoryPath(binding["path"])
                 artifact = by_path.get(path)
                 kind = ArtifactKind(binding["kind"])
                 role = ExperimentRole(binding["role"])
+                raw_split = binding.get("dataset_split")
+                dataset_split = (
+                    None if raw_split is None else DatasetSplit(raw_split)
+                )
                 if artifact is None or artifact.kind is not kind:
                     raise DiscoveryError(
                         "provider mapping path is not a matching artifact candidate"
@@ -292,6 +340,7 @@ def _provider_mappings(
                         adapter_id=binding["adapter_id"],
                         mappings=tuple(field_mappings),
                         provenance=provenance,
+                        dataset_split=dataset_split,
                     )
                 )
             binding_tuple = tuple(bindings)
@@ -319,10 +368,12 @@ def _provider_mappings(
 def _question_prompt(
     kind: ArtifactKind,
     role: ExperimentRole,
-    split: str | None,
+    split: DatasetSplit | None,
 ) -> str:
     role_text = role.value
-    kind_text = f"{split} {kind.value}" if split is not None else kind.value
+    kind_text = (
+        f"{split.value} {kind.value}" if split is not None else kind.value
+    )
     return f"Which file contains the {role_text} {kind_text}?"
 
 
@@ -351,7 +402,12 @@ def _mapping_question(
             detail=f"clarification choice for {ambiguity.role.value} {ambiguity.kind.value}",
             source_path=artifact.path,
         )
-        binding = _binding(artifact, ambiguity.role, provenance)
+        binding = _binding(
+            artifact,
+            ambiguity.role,
+            provenance,
+            dataset_split=ambiguity.split,
+        )
         choice_id = "choice-" + hashlib.sha256(
             f"{ambiguity.kind.value}:{ambiguity.role.value}:{artifact.path}".encode(
                 "utf-8"
