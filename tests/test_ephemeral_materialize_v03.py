@@ -1,0 +1,837 @@
+"""Confined compatibility materialization for zero-configuration audits."""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from claimci.analysis import (
+    AdapterMatch,
+    ArtifactBinding,
+    ArtifactCandidate,
+    ArtifactKind,
+    AuditClaimSpec,
+    ClaimReference,
+    Confidence,
+    ConfigValue,
+    DatasetReference,
+    EphemeralAuditPlan,
+    EvidenceSelector,
+    ExperimentRole,
+    FieldMapping,
+    FieldProvenance,
+    GitCommitSha,
+    MappingCandidate,
+    MappingTrust,
+    MaterializationLimits,
+    MaterializationPartial,
+    MaterializationUnavailable,
+    NormalizedEvidence,
+    NormalizedObservation,
+    ProvenanceKind,
+    RepositoryIdentity,
+    RepositoryPath,
+    RuntimeExecutionContext,
+    SelectorKind,
+    Sha256Digest,
+    execute_ephemeral_audit,
+)
+from claimci.models import AuditResult, Direction, Verdict
+
+
+REPOSITORY = RepositoryIdentity("amebaleon", "ClaimCI-Demo")
+HEAD_SHA = GitCommitSha("a" * 40)
+CLAIM_ID = "claim-1"
+
+
+def _provenance(path: str, source_id: str) -> FieldProvenance:
+    return FieldProvenance(
+        ProvenanceKind.ADAPTER_EXTRACTION,
+        "validated fake adapter extraction",
+        RepositoryPath(path),
+        source_id,
+    )
+
+
+def _write_artifact(
+    checkout: Path,
+    path: str,
+    kind: ArtifactKind,
+    content: bytes,
+) -> ArtifactCandidate:
+    destination = checkout / Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+    return ArtifactCandidate(
+        path=RepositoryPath(path),
+        kind=kind,
+        sha256=Sha256Digest(hashlib.sha256(content).hexdigest()),
+        size=len(content),
+        confidence=Confidence(0.99),
+        discovery_reason="deterministic fixture",
+        relevant_claim_ids=(CLAIM_ID,),
+        provenance=FieldProvenance(
+            ProvenanceKind.DETERMINISTIC_DISCOVERY,
+            "fixture artifact",
+            RepositoryPath(path),
+            f"artifact:{path}",
+        ),
+    )
+
+
+def _normalized_results(
+    artifact: ArtifactCandidate,
+    role: ExperimentRole,
+    values: tuple[tuple[float, int | str | None], ...],
+) -> NormalizedEvidence:
+    provenance = _provenance(str(artifact.path), f"adapter:{artifact.path}")
+    mapping = FieldMapping(
+        "metric_value",
+        EvidenceSelector(SelectorKind.COLUMN, "accuracy", provenance),
+        provenance,
+    )
+    match = AdapterMatch(
+        "fixture.results",
+        artifact.path,
+        Confidence(0.98),
+        (mapping,),
+        (provenance,),
+    )
+    return NormalizedEvidence(
+        f"evidence-{str(artifact.path).replace('/', '-')}",
+        artifact,
+        match,
+        tuple(
+            NormalizedObservation(
+                provenance=provenance,
+                metric_name="accuracy",
+                metric_value=value,
+                run_id=f"run-{index}",
+                seed=seed,
+                experiment_role=role,
+            )
+            for index, (value, seed) in enumerate(values, start=1)
+        ),
+    )
+
+
+def _normalized_config(
+    artifact: ArtifactCandidate,
+    role: ExperimentRole,
+    values: dict[str, object],
+) -> NormalizedEvidence:
+    provenance = _provenance(str(artifact.path), f"adapter:{artifact.path}")
+    mappings = tuple(
+        FieldMapping(
+            f"config.{key}",
+            EvidenceSelector(SelectorKind.DOTTED_PATH, key, provenance),
+            provenance,
+        )
+        for key in sorted(values)
+    )
+    return NormalizedEvidence(
+        f"evidence-{str(artifact.path).replace('/', '-')}",
+        artifact,
+        AdapterMatch(
+            "fixture.config",
+            artifact.path,
+            Confidence(0.98),
+            mappings,
+            (provenance,),
+        ),
+        (
+            NormalizedObservation(
+                provenance=provenance,
+                experiment_role=role,
+                config_values=tuple(
+                    ConfigValue(key, value, provenance)
+                    for key, value in sorted(values.items())
+                ),
+            ),
+        ),
+    )
+
+
+def _normalized_dataset(
+    artifact: ArtifactCandidate,
+    role: ExperimentRole,
+    split: str,
+) -> NormalizedEvidence:
+    provenance = _provenance(str(artifact.path), f"adapter:{artifact.path}")
+    mapping = FieldMapping(
+        "dataset.path",
+        EvidenceSelector(SelectorKind.DOTTED_PATH, "dataset.path", provenance),
+        provenance,
+    )
+    return NormalizedEvidence(
+        f"evidence-{str(artifact.path).replace('/', '-')}",
+        artifact,
+        AdapterMatch(
+            "fixture.dataset",
+            artifact.path,
+            Confidence(0.98),
+            (mapping,),
+            (provenance,),
+        ),
+        (
+            NormalizedObservation(
+                provenance=provenance,
+                experiment_role=role,
+                dataset_references=(
+                    DatasetReference(artifact.path, split, provenance),
+                ),
+            ),
+        ),
+    )
+
+
+def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBinding:
+    return ArtifactBinding(
+        evidence.artifact.path,
+        evidence.artifact.kind,
+        role,
+        evidence.adapter_match.adapter_id,
+        evidence.adapter_match.mappings,
+        evidence.adapter_match.match_evidence[0],
+    )
+
+
+def _plan_fixture(
+    tmp_path: Path,
+    *,
+    candidate_seed: int | str | None = 11,
+    partial_config: bool = False,
+) -> tuple[EphemeralAuditPlan, RuntimeExecutionContext, Path, Path]:
+    checkout = tmp_path / "checkout"
+    scratch = tmp_path / "scratch"
+    checkout.mkdir()
+    scratch.mkdir()
+    baseline_results = _normalized_results(
+        _write_artifact(
+            checkout,
+            "results/baseline.csv",
+            ArtifactKind.RESULTS,
+            b"accuracy,seed\n0.5,1\n0.6,2\n0.7,3\n",
+        ),
+        ExperimentRole.BASELINE,
+        ((0.5, 1), (0.6, 2), (0.7, 3)),
+    )
+    candidate_results = _normalized_results(
+        _write_artifact(
+            checkout,
+            "results/candidate.json",
+            ArtifactKind.RESULTS,
+            b'{"accuracy":0.9,"seed":11}\n',
+        ),
+        ExperimentRole.CANDIDATE,
+        ((0.9, candidate_seed),),
+    )
+    base_config_values: dict[str, object] = {
+        "training_steps": 100,
+        "batch_size": 8,
+    }
+    candidate_config_values: dict[str, object] = {
+        "training_steps": 300,
+        "batch_size": 8,
+    }
+    if not partial_config:
+        common = {
+            "epochs": 2,
+            "learning_rate": 0.001,
+            "model.name": "demo",
+            "model.version": "v1",
+            "dataset.identifier": "train",
+            "dataset.version": "v1",
+            "evaluation.dataset_identifier": "eval",
+            "evaluation.dataset_version": "v1",
+            "evaluation.split": "test",
+        }
+        base_config_values.update(common)
+        candidate_config_values.update(common)
+    baseline_config = _normalized_config(
+        _write_artifact(
+            checkout,
+            "configs/baseline.yaml",
+            ArtifactKind.CONFIG,
+            b"training_steps: 100\n",
+        ),
+        ExperimentRole.BASELINE,
+        base_config_values,
+    )
+    candidate_config = _normalized_config(
+        _write_artifact(
+            checkout,
+            "configs/candidate.json",
+            ArtifactKind.CONFIG,
+            b'{"training_steps":300}\n',
+        ),
+        ExperimentRole.CANDIDATE,
+        candidate_config_values,
+    )
+    datasets = (
+        _normalized_dataset(
+            _write_artifact(
+                checkout,
+                "data/baseline-train.jsonl",
+                ArtifactKind.DATASET,
+                b'{"id":"baseline-train"}\n',
+            ),
+            ExperimentRole.BASELINE,
+            "train",
+        ),
+        _normalized_dataset(
+            _write_artifact(
+                checkout,
+                "data/baseline-eval.jsonl",
+                ArtifactKind.DATASET,
+                b'{"id":"shared"}\n',
+            ),
+            ExperimentRole.BASELINE,
+            "eval",
+        ),
+        _normalized_dataset(
+            _write_artifact(
+                checkout,
+                "data/candidate-train.jsonl",
+                ArtifactKind.DATASET,
+                b'{"id":"shared"}\n{"id":"candidate-train"}\n',
+            ),
+            ExperimentRole.CANDIDATE,
+            "train",
+        ),
+        _normalized_dataset(
+            _write_artifact(
+                checkout,
+                "data/candidate-eval.jsonl",
+                ArtifactKind.DATASET,
+                b'{"id":"shared"}\n',
+            ),
+            ExperimentRole.CANDIDATE,
+            "eval",
+        ),
+    )
+    baseline = (baseline_results, baseline_config, *datasets[:2])
+    candidate = (candidate_results, candidate_config, *datasets[2:])
+    all_evidence = (*baseline, *candidate)
+    mapping = MappingCandidate(
+        "mapping-fixture",
+        tuple(
+            _binding(item, ExperimentRole.BASELINE) for item in baseline
+        )
+        + tuple(_binding(item, ExperimentRole.CANDIDATE) for item in candidate),
+        Confidence(0.98),
+        MappingTrust.INFERRED,
+        FieldProvenance(
+            ProvenanceKind.DETERMINISTIC_DISCOVERY,
+            "deterministic fixture mapping",
+            source_id="mapping-fixture",
+        ),
+    )
+    claim_provenance = FieldProvenance(
+        ProvenanceKind.DETERMINISTIC_DISCOVERY,
+        "validated claim fixture",
+        RepositoryPath("CLAIM.md"),
+        "claim-source",
+    )
+    audit_claim = AuditClaimSpec(
+        CLAIM_ID,
+        "accuracy",
+        Direction.HIGHER,
+        0.05,
+        claim_provenance,
+        claim_provenance,
+        claim_provenance,
+    )
+    plan = EphemeralAuditPlan(
+        plan_id="plan-" + "1" * 24,
+        repository=REPOSITORY,
+        pr_number=7,
+        head_sha=HEAD_SHA,
+        claim=ClaimReference(
+            CLAIM_ID,
+            "Accuracy improved by at least 0.05.",
+            RepositoryPath("CLAIM.md"),
+            Confidence(0.98),
+            claim_provenance,
+        ),
+        baseline_evidence=baseline,
+        candidate_evidence=candidate,
+        mapping_provenance=(mapping.provenance,),
+        missing_evidence=(),
+        confidence=Confidence(0.98),
+        audit_claim=audit_claim,
+        selected_mapping=mapping,
+    )
+    runtime = RuntimeExecutionContext(
+        repository=REPOSITORY,
+        checkout_root=checkout,
+        head_sha=HEAD_SHA,
+        scratch_root=scratch,
+        limits=MaterializationLimits(
+            max_file_bytes=1_000_000,
+            max_total_bytes=5_000_000,
+        ),
+    )
+    return plan, runtime, checkout, scratch
+
+
+def test_runtime_context_rejects_overlapping_or_symlinked_roots(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises((TypeError, ValueError), match="overlap|scratch|checkout"):
+        RuntimeExecutionContext(
+            REPOSITORY,
+            checkout,
+            HEAD_SHA,
+            checkout / "scratch",
+        )
+
+    if hasattr(os, "symlink"):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks are unavailable on this platform")
+        with pytest.raises((TypeError, ValueError), match="symlink|root"):
+            RuntimeExecutionContext(
+                REPOSITORY,
+                link,
+                HEAD_SHA,
+                tmp_path / "scratch",
+            )
+
+
+def test_each_customer_artifact_is_opened_once_then_materialized_from_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    opened: list[Path] = []
+    original = materialize._open_customer_artifact
+
+    def recording_open(path: Path) -> int:
+        opened.append(path)
+        return original(path)
+
+    monkeypatch.setattr(materialize, "_open_customer_artifact", recording_open)
+
+    result = execute_ephemeral_audit(plan, runtime)
+
+    assert type(result) is AuditResult
+    assert result.verdict is Verdict.NOT_SUPPORTED
+    assert len(opened) == len(set(opened)) == 8
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_changed_artifact_hash_fails_unavailable_and_cleans_plan_tree(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    (checkout / "results" / "candidate.json").write_bytes(b"changed\n")
+
+    with pytest.raises(MaterializationUnavailable, match="hash|size|snapshot"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_symlink_substitution_is_unavailable_without_following_target(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    source = checkout / "results" / "candidate.json"
+    target = checkout / "results" / "target.json"
+    target.write_bytes(source.read_bytes())
+    source.unlink()
+    try:
+        source.symlink_to(target)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+
+    with pytest.raises(MaterializationUnavailable, match="symlink|snapshot|regular"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_native_conversion_contains_only_normalized_runs_config_and_passive_datasets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+    from claimci.audit import audit_research as real_audit_research
+
+    plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    observed: dict[str, object] = {}
+
+    def inspect_then_audit(path: Path, *, artifact_root: Path) -> AuditResult:
+        observed["baseline_results"] = json.loads(
+            (artifact_root / "baseline" / "results.json").read_text("utf-8")
+        )
+        observed["candidate_results"] = json.loads(
+            (artifact_root / "candidate" / "results.json").read_text("utf-8")
+        )
+        observed["baseline_config"] = (
+            artifact_root / "baseline" / "config.yaml"
+        ).read_text("utf-8")
+        observed["candidate_train"] = (
+            artifact_root / "candidate" / "train.jsonl"
+        ).read_bytes()
+        observed["manifest"] = path.read_text("utf-8")
+        return real_audit_research(path, artifact_root=artifact_root)
+
+    monkeypatch.setattr(materialize, "audit_research", inspect_then_audit)
+
+    result = execute_ephemeral_audit(plan, runtime)
+
+    assert result.verdict is Verdict.NOT_SUPPORTED
+    assert observed["baseline_results"] == {
+        "runs": [
+            {"accuracy": 0.5, "seed": 1},
+            {"accuracy": 0.6, "seed": 2},
+            {"accuracy": 0.7, "seed": 3},
+        ]
+    }
+    assert observed["candidate_results"] == {
+        "runs": [{"accuracy": 0.9, "seed": 11}]
+    }
+    assert "summary" not in observed["manifest"]
+    assert "model:" in observed["baseline_config"]
+    assert "  name: demo" in observed["baseline_config"]
+    assert observed["candidate_train"] == (
+        checkout / "data" / "candidate-train.jsonl"
+    ).read_bytes()
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_genuinely_absent_seed_remains_absent(tmp_path: Path) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, _scratch = _plan_fixture(
+        tmp_path,
+        candidate_seed=None,
+    )
+    original = materialize.audit_research
+    observed: dict[str, object] = {}
+
+    def inspect_then_audit(path: Path, *, artifact_root: Path) -> AuditResult:
+        observed.update(
+            json.loads(
+                (artifact_root / "candidate" / "results.json").read_text("utf-8")
+            )
+        )
+        return original(path, artifact_root=artifact_root)
+
+    from pytest import MonkeyPatch
+
+    patcher = MonkeyPatch()
+    patcher.setattr(materialize, "audit_research", inspect_then_audit)
+    try:
+        execute_ephemeral_audit(plan, runtime)
+    finally:
+        patcher.undo()
+
+    assert observed == {"runs": [{"accuracy": 0.9}]}
+
+
+def test_present_non_integer_seed_is_partial_and_not_coerced_to_missing(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(
+        tmp_path,
+        candidate_seed="seed-eleven",
+    )
+
+    with pytest.raises(MaterializationPartial, match="seed|represent"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_partial_config_reaches_existing_audit_missing_fields_policy(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(
+        tmp_path,
+        partial_config=True,
+    )
+
+    result = execute_ephemeral_audit(plan, runtime)
+
+    missing = tuple(
+        item for item in result.findings if item.rule_id == "CONFIG.MISSING_FIELDS"
+    )
+    assert len(missing) == 1
+
+
+def test_duplicate_config_key_across_observations_is_partial(tmp_path: Path) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    config = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.kind is ArtifactKind.CONFIG
+    )
+    provenance = config.observations[0].provenance
+    duplicate_observation = NormalizedObservation(
+        provenance=provenance,
+        experiment_role=ExperimentRole.CANDIDATE,
+        config_values=(ConfigValue("training_steps", 999, provenance),),
+    )
+    changed_config = dataclasses.replace(
+        config,
+        observations=(*config.observations, duplicate_observation),
+    )
+    changed_candidate = tuple(
+        changed_config if item is config else item for item in plan.candidate_evidence
+    )
+    changed_plan = dataclasses.replace(plan, candidate_evidence=changed_candidate)
+
+    with pytest.raises(MaterializationPartial, match="duplicate"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_missing_whole_artifact_category_is_partial_without_placeholder(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    config = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.kind is ArtifactKind.CONFIG
+    )
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    changed_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            item
+            for item in plan.selected_mapping.bindings
+            if not (
+                item.path == config.artifact.path
+                and item.kind is ArtifactKind.CONFIG
+            )
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        candidate_evidence=tuple(
+            item for item in plan.candidate_evidence if item is not config
+        ),
+        selected_mapping=changed_mapping,
+    )
+
+    with pytest.raises(MaterializationPartial, match="missing|category"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_existing_plan_tree_collision_is_unavailable_and_not_deleted(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    existing = scratch / plan.plan_id
+    existing.mkdir()
+    marker = existing / "caller-owned.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(MaterializationUnavailable, match="exclusive|exists|collision"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert marker.read_text("utf-8") == "keep"
+
+
+@pytest.mark.parametrize("failure", ["write", "audit"])
+def test_controlled_internal_failures_clean_only_created_plan_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    sibling = scratch / "caller-owned"
+    sibling.mkdir()
+    marker = sibling / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+    if failure == "write":
+        original = materialize._exclusive_text
+        calls = 0
+
+        def fail_second_write(path: Path, content: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected write failure")
+            original(path, content)
+
+        monkeypatch.setattr(materialize, "_exclusive_text", fail_second_write)
+    else:
+        monkeypatch.setattr(
+            materialize,
+            "audit_research",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected audit failure")
+            ),
+        )
+
+    with pytest.raises(MaterializationUnavailable, match="failed closed"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+    assert marker.read_text("utf-8") == "keep"
+    assert scratch.exists()
+
+
+def test_stale_runtime_head_is_unavailable_before_materialization(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    stale = dataclasses.replace(runtime, head_sha=GitCommitSha("b" * 40))
+
+    with pytest.raises(MaterializationUnavailable, match="head|snapshot"):
+        execute_ephemeral_audit(plan, stale)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_provider_originated_normalized_observation_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    results = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.kind is ArtifactKind.RESULTS
+    )
+    provider = FieldProvenance(
+        ProvenanceKind.PROVIDER_PROPOSAL,
+        "provider supplied an untrusted result value",
+        results.artifact.path,
+        "provider-call-1",
+    )
+    changed_results = dataclasses.replace(
+        results,
+        observations=(
+            dataclasses.replace(results.observations[0], provenance=provider),
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        candidate_evidence=tuple(
+            changed_results if item is results else item
+            for item in plan.candidate_evidence
+        ),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="provider|adapter-validated"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_non_jsonl_dataset_representation_is_partial(tmp_path: Path) -> None:
+    plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    dataset = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.kind is ArtifactKind.DATASET
+        and item.observations[0].dataset_references[0].split == "train"
+    )
+    old_source = checkout / Path(str(dataset.artifact.path))
+    new_path = RepositoryPath("data/candidate-train.csv")
+    new_source = checkout / Path(str(new_path))
+    new_source.write_bytes(old_source.read_bytes())
+    old_source.unlink()
+    changed_artifact = dataclasses.replace(dataset.artifact, path=new_path)
+    changed_reference = dataclasses.replace(
+        dataset.observations[0].dataset_references[0],
+        path=new_path,
+    )
+    changed_observation = dataclasses.replace(
+        dataset.observations[0],
+        dataset_references=(changed_reference,),
+    )
+    changed_match = dataclasses.replace(dataset.adapter_match, path=new_path)
+    changed_dataset = dataclasses.replace(
+        dataset,
+        artifact=changed_artifact,
+        adapter_match=changed_match,
+        observations=(changed_observation,),
+    )
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    changed_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            dataclasses.replace(item, path=new_path)
+            if item.path == dataset.artifact.path
+            else item
+            for item in plan.selected_mapping.bindings
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        candidate_evidence=tuple(
+            changed_dataset if item is dataset else item
+            for item in plan.candidate_evidence
+        ),
+        selected_mapping=changed_mapping,
+    )
+
+    with pytest.raises(MaterializationPartial, match="JSONL|dataset"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_individual_native_files_use_exclusive_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    original = materialize._exclusive_text
+    injected = False
+
+    def collide_once(path: Path, content: str) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            path.write_text("caller collision", encoding="utf-8")
+        original(path, content)
+
+    monkeypatch.setattr(materialize, "_exclusive_text", collide_once)
+
+    with pytest.raises(MaterializationUnavailable, match="failed closed"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_materializer_has_no_customer_execution_or_network_surface() -> None:
+    source = Path("claimci/analysis/materialize.py").read_text(encoding="utf-8")
+
+    for forbidden in (
+        "subprocess",
+        "importlib",
+        "requests",
+        "urllib",
+        "socket",
+        "eval(",
+        "exec(",
+    ):
+        assert forbidden not in source

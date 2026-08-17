@@ -52,6 +52,14 @@ from .planner import (
     plan_ephemeral_audit,
     planning_request_from_discovery,
 )
+from .materialize import (
+    MaterializationError,
+    MaterializationLimits,
+    MaterializationPartial,
+    MaterializationUnavailable,
+    RuntimeExecutionContext,
+    execute_ephemeral_audit,
+)
 
 __all__ = [
     "Adapter",
@@ -81,6 +89,10 @@ __all__ = [
     "MappingChoice",
     "MappingQuestion",
     "MappingTrust",
+    "MaterializationError",
+    "MaterializationLimits",
+    "MaterializationPartial",
+    "MaterializationUnavailable",
     "MissingEvidence",
     "NormalizedEvidence",
     "NormalizedObservation",
@@ -92,12 +104,14 @@ __all__ = [
     "RepoMapping",
     "RepositoryIdentity",
     "RepositoryPath",
+    "RuntimeExecutionContext",
     "SelectorKind",
     "Sha256Digest",
     "UnifiedAnalysisResult",
     "to_jsonable",
     "audit_claim_spec_from_research_spec",
     "audit_relevant_claim_projection",
+    "execute_ephemeral_audit",
     "plan_ephemeral_audit",
     "planning_request_from_discovery",
 ]
