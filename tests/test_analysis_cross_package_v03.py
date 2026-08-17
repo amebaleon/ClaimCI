@@ -2,39 +2,30 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 from claimci.analysis import (
-    AdapterMatch,
     AnalysisState,
     ArtifactKind,
-    Confidence,
-    DatasetReference,
-    EvidenceSelector,
+    DatasetSplit,
     ExperimentRole,
-    FieldMapping,
-    FieldProvenance,
     GitCommitSha,
     MaterializationLimits,
     MappingTrust,
     NormalizedEvidence,
-    NormalizedObservation,
     PassiveArtifact,
     PlanningState,
     ProvenanceKind,
     RepositoryIdentity,
-    RepositoryPath,
     RepoMapping,
     RuntimeExecutionContext,
-    SelectorKind,
     execute_ephemeral_audit,
     plan_ephemeral_audit,
     planning_request_from_discovery,
     run_unified_analysis,
 )
-from claimci.analysis.adapters import get_adapter
+from claimci.analysis.adapters import extract_registered_artifact
 from claimci.analysis.discovery import discover_repository
 from claimci.models import Verdict
 from claimci.review import ProviderUsage, ReviewConfig
@@ -168,64 +159,19 @@ candidate:
     )
 
 
-def _dataset_evidence(artifact, content: bytes) -> NormalizedEvidence:
-    path = str(artifact.path)
-    split = "train" if "train" in path else "eval"
-    provenance = FieldProvenance(
-        ProvenanceKind.ADAPTER_EXTRACTION,
-        "bounded passive JSONL dataset identity test stub",
-        artifact.path,
-        "test-passive-dataset-v1",
-    )
-    mapping = FieldMapping(
-        "dataset.path",
-        EvidenceSelector(
-            SelectorKind.DOTTED_PATH,
-            "dataset.path",
-            provenance,
-        ),
-        provenance,
-    )
-    PassiveArtifact(artifact, content)
-    return NormalizedEvidence(
-        "evidence-dataset-" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:16],
-        artifact,
-        AdapterMatch(
-            "test-passive-dataset-v1",
-            artifact.path,
-            Confidence(0.99),
-            (mapping,),
-            (provenance,),
-        ),
-        (
-            NormalizedObservation(
-                provenance=provenance,
-                experiment_role=ExperimentRole.UNSPECIFIED,
-                dataset_references=(
-                    DatasetReference(artifact.path, split, provenance),
-                ),
-            ),
-        ),
-    )
-
-
 def _extract_evidence(root: Path, discovery) -> tuple[NormalizedEvidence, ...]:
     extracted: list[NormalizedEvidence] = []
     for artifact in discovery.artifacts:
         content = (root / Path(str(artifact.path))).read_bytes()
         passive = PassiveArtifact(artifact, content)
-        if artifact.kind is ArtifactKind.RESULTS:
-            adapter = get_adapter("claimci-csv-v1")
-        elif artifact.kind is ArtifactKind.CONFIG:
-            adapter = get_adapter("claimci-yaml-config-v1")
-        elif artifact.kind is ArtifactKind.DATASET:
-            extracted.append(_dataset_evidence(artifact, content))
+        if artifact.kind not in {
+            ArtifactKind.RESULTS,
+            ArtifactKind.CONFIG,
+            ArtifactKind.DATASET,
+        }:
             continue
-        else:
-            continue
-        match = adapter.probe(passive)
-        assert match is not None
-        evidence = adapter.extract(passive, match)
+        evidence = extract_registered_artifact(passive)
+        assert evidence is not None
         assert {
             item.experiment_role for item in evidence.observations
         } == {ExperimentRole.UNSPECIFIED}
@@ -240,24 +186,27 @@ def _provider_mapping_payload(
     for item in evidence:
         path = str(item.artifact.path)
         role = "baseline" if "baseline" in path else "candidate"
-        bindings.append(
-            {
-                "path": path,
-                "kind": item.artifact.kind.value,
-                "role": role,
-                "adapter_id": item.adapter_match.adapter_id,
-                "mappings": [
-                    {
-                        "target_field": mapping.target_field,
-                        "selector": {
-                            "kind": mapping.selector.kind.value,
-                            "expression": mapping.selector.expression,
-                        },
-                    }
-                    for mapping in item.adapter_match.mappings
-                ],
-            }
-        )
+        binding: dict[str, object] = {
+            "path": path,
+            "kind": item.artifact.kind.value,
+            "role": role,
+            "adapter_id": item.adapter_match.adapter_id,
+            "mappings": [
+                {
+                    "target_field": mapping.target_field,
+                    "selector": {
+                        "kind": mapping.selector.kind.value,
+                        "expression": mapping.selector.expression,
+                    },
+                }
+                for mapping in item.adapter_match.mappings
+            ],
+        }
+        if item.artifact.kind is ArtifactKind.DATASET:
+            binding["dataset_split"] = (
+                DatasetSplit.TRAIN.value if "_train_" in path else DatasetSplit.EVAL.value
+            )
+        bindings.append(binding)
     return {"mappings": [{"confidence": 1.0, "bindings": bindings}]}
 
 
@@ -290,6 +239,7 @@ def test_real_discovery_adapters_planner_materializer_audit_and_unified_result(
     )
     planning = plan_ephemeral_audit(request)
 
+    assert not (head / "research.yaml").exists()
     assert planning.state is PlanningState.READY
     assert planning.plan is not None
     assert planning.plan.head_sha == HEAD_SHA
@@ -300,6 +250,18 @@ def test_real_discovery_adapters_planner_materializer_audit_and_unified_result(
     assert {
         binding.role for binding in planning.plan.selected_mapping.bindings
     } == {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}
+    assert {
+        reference.split
+        for item in (*planning.plan.baseline_evidence, *planning.plan.candidate_evidence)
+        if item.artifact.kind is ArtifactKind.DATASET
+        for observation in item.observations
+        for reference in observation.dataset_references
+    } == {None}
+    assert {
+        binding.dataset_split
+        for binding in planning.plan.selected_mapping.bindings
+        if binding.kind is ArtifactKind.DATASET
+    } == {DatasetSplit.TRAIN, DatasetSplit.EVAL}
 
     runtime = RuntimeExecutionContext(
         repository=REPOSITORY,
@@ -328,6 +290,7 @@ def test_real_discovery_adapters_planner_materializer_audit_and_unified_result(
     assert result.research_interpretation is not None
     assert len(provider.calls) == 1
     assert list(scratch.iterdir()) == []
+    assert not (head / "research.yaml").exists()
 
 
 def test_real_multi_claim_discovery_scopes_artifacts_evidence_and_mapping(
@@ -460,6 +423,11 @@ def test_real_provider_proposal_requires_approval_then_precedes_inference(
         for candidate in proposed.mapping_candidates
         if candidate.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
     )
+    assert {
+        binding.dataset_split
+        for binding in provider_candidate.bindings
+        if binding.kind is ArtifactKind.DATASET
+    } == {DatasetSplit.TRAIN, DatasetSplit.EVAL}
     approved = RepoMapping.approve(
         REPOSITORY,
         provider_candidate,
