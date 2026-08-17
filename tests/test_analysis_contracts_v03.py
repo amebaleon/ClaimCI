@@ -9,20 +9,35 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from claimci.analysis import (
+    Adapter,
     AdapterMatch,
     AnalysisAuthority,
     AnalysisState,
     ArtifactCandidate,
+    ArtifactBinding,
     ArtifactKind,
+    ClaimReference,
+    ComputeEvidence,
     Confidence,
+    ConfigValue,
+    DatasetReference,
     EvidenceSelector,
+    EphemeralAuditPlan,
     ExperimentRole,
     FieldMapping,
     FieldProvenance,
     GitCommitSha,
+    MappingCandidate,
+    MappingChoice,
+    MappingQuestion,
     MappingTrust,
+    MissingEvidence,
+    NormalizedEvidence,
+    NormalizedObservation,
     PassiveArtifact,
     ProvenanceKind,
+    RepoMapping,
+    RepositoryIdentity,
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
@@ -265,6 +280,9 @@ def test_evidence_selector_accepts_bounded_declarative_syntax(
         (SelectorKind.DOTTED_PATH, ".runs"),
         (SelectorKind.COLUMN, ""),
         (SelectorKind.COLUMN, "accuracy\nvalue"),
+        (SelectorKind.COLUMN, "SELECT * FROM results"),
+        (SelectorKind.COLUMN, "accuracy; command"),
+        (SelectorKind.COLUMN, "__import__('os')"),
     ],
 )
 def test_evidence_selector_rejects_malformed_or_active_syntax(
@@ -382,3 +400,422 @@ def test_adapter_match_rejects_invalid_or_executable_contract_fields(
     values.update(changes)
     with pytest.raises((TypeError, ValueError)):
         AdapterMatch(**values)  # type: ignore[arg-type]
+
+
+def _adapter_match(path: str = "results/candidate.json") -> AdapterMatch:
+    return AdapterMatch(
+        adapter_id="json-runs-v1",
+        path=RepositoryPath(path),
+        confidence=Confidence(0.95),
+        mappings=(_mapping(),),
+        match_evidence=(_provenance(),),
+    )
+
+
+def _observation(
+    role: ExperimentRole = ExperimentRole.CANDIDATE,
+) -> NormalizedObservation:
+    provenance = _provenance(ProvenanceKind.ADAPTER_EXTRACTION)
+    return NormalizedObservation(
+        provenance=provenance,
+        metric_name="accuracy",
+        metric_value=0.9,
+        run_id="candidate-run-1",
+        seed=7,
+        experiment_role=role,
+        config_values=(ConfigValue("batch_size", 32, provenance),),
+        dataset_references=(
+            DatasetReference(
+                RepositoryPath("data/candidate-eval.jsonl"),
+                "eval",
+                provenance,
+            ),
+        ),
+        compute_evidence=(
+            ComputeEvidence("training_steps", 1_000, "steps", provenance),
+        ),
+    )
+
+
+def _normalized_evidence(
+    *,
+    role: ExperimentRole = ExperimentRole.CANDIDATE,
+    evidence_id: str = "evidence-candidate-results",
+) -> NormalizedEvidence:
+    candidate = _candidate()
+    return NormalizedEvidence(
+        evidence_id=evidence_id,
+        artifact=candidate,
+        adapter_match=_adapter_match(),
+        observations=(_observation(role),),
+    )
+
+
+def _binding(
+    path: str,
+    kind: ArtifactKind,
+    role: ExperimentRole,
+    *,
+    provenance: FieldProvenance | None = None,
+) -> ArtifactBinding:
+    return ArtifactBinding(
+        path=RepositoryPath(path),
+        kind=kind,
+        role=role,
+        adapter_id="json-runs-v1" if kind is ArtifactKind.RESULTS else None,
+        mappings=(_mapping(),) if kind is ArtifactKind.RESULTS else (),
+        provenance=provenance or _provenance(),
+    )
+
+
+def _mapping_candidate(
+    *,
+    trust: MappingTrust = MappingTrust.INFERRED,
+    provenance: FieldProvenance | None = None,
+    bindings: tuple[ArtifactBinding, ...] | None = None,
+) -> MappingCandidate:
+    return MappingCandidate(
+        mapping_id="mapping-1",
+        bindings=bindings
+        or (
+            _binding("base/results.json", ArtifactKind.RESULTS, ExperimentRole.BASELINE),
+            _binding(
+                "candidate/results.json",
+                ArtifactKind.RESULTS,
+                ExperimentRole.CANDIDATE,
+            ),
+        ),
+        confidence=Confidence(0.8),
+        trust=trust,
+        provenance=provenance or _provenance(),
+    )
+
+
+def test_normalized_observation_represents_optional_typed_evidence() -> None:
+    observation = _observation()
+
+    assert observation.metric_name == "accuracy"
+    assert observation.metric_value == 0.9
+    assert observation.run_id == "candidate-run-1"
+    assert observation.seed == 7
+    assert observation.experiment_role is ExperimentRole.CANDIDATE
+    assert observation.config_values[0].value == 32
+    assert observation.dataset_references[0].path == "data/candidate-eval.jsonl"
+    assert observation.compute_evidence[0].value == 1_000
+    with pytest.raises(FrozenInstanceError):
+        observation.metric_value = 1.0  # type: ignore[misc]
+
+
+def test_normalized_observation_does_not_force_every_evidence_category() -> None:
+    observation = NormalizedObservation(
+        provenance=_provenance(),
+        config_values=(ConfigValue("model", "resnet", _provenance()),),
+    )
+
+    assert observation.metric_name is None
+    assert observation.dataset_references == ()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"metric_name": "accuracy", "metric_value": None},
+        {"metric_name": None, "metric_value": 0.9},
+        {"metric_name": "accuracy", "metric_value": math.nan},
+        {"seed": True},
+        {"experiment_role": "candidate"},
+        {"config_values": []},
+        {"dataset_references": []},
+        {"compute_evidence": []},
+        {"provenance": "adapter"},
+    ],
+)
+def test_normalized_observation_rejects_inconsistent_or_mutable_fields(
+    changes: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "provenance": _provenance(),
+        "metric_name": "accuracy",
+        "metric_value": 0.9,
+    }
+    values.update(changes)
+    with pytest.raises((TypeError, ValueError)):
+        NormalizedObservation(**values)  # type: ignore[arg-type]
+
+
+def test_normalized_observation_rejects_empty_content() -> None:
+    with pytest.raises((TypeError, ValueError), match="evidence|observation"):
+        NormalizedObservation(provenance=_provenance())
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ConfigValue("metric", math.inf, _provenance()),
+        lambda: ConfigValue("", 1, _provenance()),
+        lambda: DatasetReference("../outside.jsonl", "eval", _provenance()),
+        lambda: DatasetReference("data/eval.jsonl", "", _provenance()),
+        lambda: ComputeEvidence("steps", True, "steps", _provenance()),
+        lambda: ComputeEvidence("steps", math.nan, "steps", _provenance()),
+    ],
+)
+def test_normalized_subvalues_reject_malformed_values(factory) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        factory()
+
+
+def test_normalized_evidence_ties_observations_to_artifact_and_adapter() -> None:
+    evidence = _normalized_evidence()
+
+    assert evidence.artifact.path == evidence.adapter_match.path
+    assert evidence.observations[0].experiment_role is ExperimentRole.CANDIDATE
+
+
+def test_normalized_evidence_rejects_mismatched_path_or_empty_observations() -> None:
+    with pytest.raises((TypeError, ValueError), match="path"):
+        NormalizedEvidence(
+            evidence_id="evidence-1",
+            artifact=_candidate(),
+            adapter_match=_adapter_match("results/other.json"),
+            observations=(_observation(),),
+        )
+    with pytest.raises((TypeError, ValueError), match="observation"):
+        NormalizedEvidence(
+            evidence_id="evidence-1",
+            artifact=_candidate(),
+            adapter_match=_adapter_match(),
+            observations=(),
+        )
+
+
+def test_trivial_adapter_operates_only_on_passive_bytes() -> None:
+    class FakeAdapter:
+        def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
+            assert isinstance(artifact.content, bytes)
+            return _adapter_match()
+
+        def extract(
+            self,
+            artifact: PassiveArtifact,
+            match: AdapterMatch,
+        ) -> NormalizedEvidence:
+            return NormalizedEvidence(
+                evidence_id="fake-evidence",
+                artifact=artifact.candidate,
+                adapter_match=match,
+                observations=(_observation(),),
+            )
+
+    fake: Adapter = FakeAdapter()
+    passive = PassiveArtifact(_candidate(), RAW_RESULTS)
+    match = fake.probe(passive)
+    assert match is not None
+    assert fake.extract(passive, match).evidence_id == "fake-evidence"
+
+
+def test_mapping_candidate_rejects_conflicting_experiment_roles_for_same_path() -> None:
+    bindings = (
+        _binding("results/shared.json", ArtifactKind.RESULTS, ExperimentRole.BASELINE),
+        _binding("results/shared.json", ArtifactKind.RESULTS, ExperimentRole.CANDIDATE),
+    )
+
+    with pytest.raises((TypeError, ValueError), match="conflict|baseline|candidate"):
+        _mapping_candidate(bindings=bindings)
+
+
+def test_mapping_candidate_rejects_approved_trust_and_inconsistent_manifest_hint() -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _mapping_candidate(trust=MappingTrust.USER_APPROVED)
+    with pytest.raises((TypeError, ValueError)):
+        _mapping_candidate(trust=MappingTrust.MANIFEST_HINT)
+
+    manifest = _mapping_candidate(
+        trust=MappingTrust.MANIFEST_HINT,
+        provenance=FieldProvenance(
+            ProvenanceKind.MANIFEST_HINT,
+            "explicit research.yaml mapping",
+            RepositoryPath("research.yaml"),
+            "research.yaml",
+        ),
+    )
+    assert manifest.trust is MappingTrust.MANIFEST_HINT
+
+
+def test_mapping_candidate_is_deeply_immutable() -> None:
+    mapping = _mapping_candidate()
+
+    with pytest.raises(FrozenInstanceError):
+        mapping.bindings = ()  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        _mapping_candidate(bindings=list(mapping.bindings))  # type: ignore[arg-type]
+
+
+def _choice(choice_id: str, path: str) -> MappingChoice:
+    return MappingChoice(
+        choice_id=choice_id,
+        label=f"Use {path}",
+        bindings=(
+            _binding(path, ArtifactKind.RESULTS, ExperimentRole.CANDIDATE),
+        ),
+    )
+
+
+def test_mapping_question_has_bounded_unique_candidate_choices() -> None:
+    question = MappingQuestion(
+        question_id="candidate-results",
+        prompt="Which file contains the candidate results?",
+        choices=(
+            _choice("results-a", "results/a.json"),
+            _choice("results-b", "results/b.json"),
+        ),
+        relevant_claim_id="claim-1",
+    )
+
+    assert len(question.choices) == 2
+    assert question.choices[0].bindings[0].role is ExperimentRole.CANDIDATE
+
+
+@pytest.mark.parametrize("count", [0, 1, 9])
+def test_mapping_question_rejects_choice_counts_outside_two_through_eight(
+    count: int,
+) -> None:
+    choices = tuple(
+        _choice(f"choice-{index}", f"results/{index}.json") for index in range(count)
+    )
+    with pytest.raises((TypeError, ValueError), match="two|eight|choice"):
+        MappingQuestion("question", "Which result?", choices)
+
+
+def test_mapping_question_rejects_duplicate_choice_ids_and_mutable_choices() -> None:
+    duplicate = (
+        _choice("same", "results/a.json"),
+        _choice("same", "results/b.json"),
+    )
+    with pytest.raises((TypeError, ValueError), match="unique|duplicate"):
+        MappingQuestion("question", "Which result?", duplicate)
+    with pytest.raises(TypeError):
+        MappingQuestion("question", "Which result?", list(duplicate))  # type: ignore[arg-type]
+
+
+def test_repo_mapping_requires_explicit_approval_factory() -> None:
+    repository = RepositoryIdentity(owner="amebaleon", name="ClaimCI-Demo")
+    candidate = _mapping_candidate()
+
+    with pytest.raises(TypeError):
+        RepoMapping(  # type: ignore[call-arg]
+            repository=repository,
+            bindings=candidate.bindings,
+        )
+
+    approved = RepoMapping.approve(
+        repository=repository,
+        candidate=candidate,
+        approved_by="owner:amebaleon",
+    )
+    assert approved.trust is MappingTrust.USER_APPROVED
+    assert approved.source_trust is MappingTrust.INFERRED
+    assert approved.bindings == candidate.bindings
+    assert approved.approval_provenance.kind is ProvenanceKind.USER_APPROVED
+
+
+def test_provider_mapping_can_only_become_approved_through_explicit_transition() -> None:
+    proposed = _mapping_candidate(
+        provenance=FieldProvenance(
+            ProvenanceKind.PROVIDER_PROPOSAL,
+            "provider proposed a candidate results path",
+            RepositoryPath("candidate/results.json"),
+            "provider-call-1",
+        )
+    )
+    assert proposed.trust is MappingTrust.INFERRED
+
+    approved = RepoMapping.approve(
+        RepositoryIdentity("amebaleon", "ClaimCI-Demo"),
+        proposed,
+        approved_by="owner:amebaleon",
+    )
+    assert approved.trust is MappingTrust.USER_APPROVED
+    assert approved.source_trust is MappingTrust.INFERRED
+
+
+@pytest.mark.parametrize(
+    "owner,name",
+    [("", "repo"), ("owner/name", "repo"), ("owner", ""), ("owner", "bad/name")],
+)
+def test_repository_identity_rejects_invalid_owner_or_name(owner: str, name: str) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        RepositoryIdentity(owner, name)
+
+
+def test_ephemeral_audit_plan_carries_required_identity_and_evidence() -> None:
+    baseline = _normalized_evidence(
+        role=ExperimentRole.BASELINE,
+        evidence_id="evidence-baseline-results",
+    )
+    candidate = _normalized_evidence()
+    plan = EphemeralAuditPlan(
+        plan_id="plan-1",
+        repository=RepositoryIdentity("amebaleon", "ClaimCI-Demo"),
+        pr_number=1,
+        head_sha=GitCommitSha("a" * 40),
+        claim=ClaimReference(
+            claim_id="claim-1",
+            text="Candidate improves accuracy.",
+            source_path=RepositoryPath("CLAIM.md"),
+            confidence=Confidence(0.9),
+            provenance=_provenance(),
+        ),
+        baseline_evidence=(baseline,),
+        candidate_evidence=(candidate,),
+        mapping_provenance=(_provenance(),),
+        missing_evidence=(
+            MissingEvidence(
+                kind=ArtifactKind.DATASET,
+                role=ExperimentRole.CANDIDATE,
+                description="candidate training data is not identified",
+                claim_id="claim-1",
+            ),
+        ),
+        confidence=Confidence(0.75),
+    )
+
+    assert plan.repository.full_name == "amebaleon/ClaimCI-Demo"
+    assert plan.pr_number == 1
+    assert plan.ephemeral is True
+    assert not hasattr(plan, "committed_path")
+    assert not hasattr(plan, "write")
+
+
+def test_ephemeral_plan_rejects_role_conflicts_and_invalid_pr_number() -> None:
+    shared: dict[str, object] = {
+        "plan_id": "plan-1",
+        "repository": RepositoryIdentity("amebaleon", "ClaimCI-Demo"),
+        "pr_number": 1,
+        "head_sha": GitCommitSha("a" * 40),
+        "claim": ClaimReference(
+            "claim-1",
+            "Candidate improves accuracy.",
+            None,
+            Confidence(0.9),
+            _provenance(),
+        ),
+        "baseline_evidence": (
+            _normalized_evidence(role=ExperimentRole.CANDIDATE),
+        ),
+        "candidate_evidence": (_normalized_evidence(),),
+        "mapping_provenance": (_provenance(),),
+        "missing_evidence": (),
+        "confidence": Confidence(0.75),
+    }
+    with pytest.raises((TypeError, ValueError), match="baseline|role"):
+        EphemeralAuditPlan(**shared)  # type: ignore[arg-type]
+
+    shared["baseline_evidence"] = (
+        _normalized_evidence(
+            role=ExperimentRole.BASELINE,
+            evidence_id="evidence-baseline",
+        ),
+    )
+    shared["pr_number"] = 0
+    with pytest.raises((TypeError, ValueError), match="PR|pr_number|positive"):
+        EphemeralAuditPlan(**shared)  # type: ignore[arg-type]
