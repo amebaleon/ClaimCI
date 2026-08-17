@@ -45,6 +45,13 @@ from .contracts import (
     UnifiedAnalysisResult,
     to_jsonable,
 )
+from .planner import (
+    PlanningOutcome,
+    PlanningRequest,
+    PlanningState,
+    plan_ephemeral_audit,
+    planning_request_from_discovery,
+)
 
 __all__ = [
     "Adapter",
@@ -78,6 +85,9 @@ __all__ = [
     "NormalizedEvidence",
     "NormalizedObservation",
     "PassiveArtifact",
+    "PlanningOutcome",
+    "PlanningRequest",
+    "PlanningState",
     "ProvenanceKind",
     "RepoMapping",
     "RepositoryIdentity",
@@ -88,4 +98,6 @@ __all__ = [
     "to_jsonable",
     "audit_claim_spec_from_research_spec",
     "audit_relevant_claim_projection",
+    "plan_ephemeral_audit",
+    "planning_request_from_discovery",
 ]
