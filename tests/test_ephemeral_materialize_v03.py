@@ -40,6 +40,7 @@ from claimci.analysis import (
     SelectorKind,
     Sha256Digest,
     execute_ephemeral_audit,
+    derive_ephemeral_plan_id,
 )
 from claimci.models import AuditResult, Direction, Verdict
 
@@ -367,6 +368,7 @@ def _plan_fixture(
         audit_claim=audit_claim,
         selected_mapping=mapping,
     )
+    plan = dataclasses.replace(plan, plan_id=derive_ephemeral_plan_id(plan))
     runtime = RuntimeExecutionContext(
         repository=REPOSITORY,
         checkout_root=checkout,
@@ -409,6 +411,40 @@ def test_runtime_context_rejects_overlapping_or_symlinked_roots(
                 HEAD_SHA,
                 tmp_path / "scratch",
             )
+
+
+def test_runtime_context_rejects_subclassed_security_limits(tmp_path: Path) -> None:
+    class LimitsSubclass(MaterializationLimits):
+        pass
+
+    checkout = tmp_path / "checkout"
+    scratch = tmp_path / "scratch"
+    checkout.mkdir()
+    scratch.mkdir()
+
+    with pytest.raises(TypeError, match="limits|MaterializationLimits"):
+        RuntimeExecutionContext(
+            REPOSITORY,
+            checkout,
+            HEAD_SHA,
+            scratch,
+            LimitsSubclass(),
+        )
+
+
+def test_runtime_scratch_root_substitution_is_unavailable(tmp_path: Path) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    original = tmp_path / "original-scratch"
+    scratch.rename(original)
+    scratch.mkdir()
+    marker = scratch / "replacement.txt"
+    marker.write_text("do not touch", encoding="utf-8")
+
+    with pytest.raises(MaterializationUnavailable, match="scratch|root|identity"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert marker.read_text("utf-8") == "do not touch"
+    assert not (scratch / plan.plan_id).exists()
 
 
 def test_each_customer_artifact_is_opened_once_then_materialized_from_snapshot(
@@ -632,6 +668,10 @@ def test_missing_whole_artifact_category_is_partial_without_placeholder(
         ),
         selected_mapping=changed_mapping,
     )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
 
     with pytest.raises(MaterializationPartial, match="missing|category"):
         execute_ephemeral_audit(changed_plan, runtime)
@@ -790,6 +830,10 @@ def test_non_jsonl_dataset_representation_is_partial(tmp_path: Path) -> None:
         ),
         selected_mapping=changed_mapping,
     )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
 
     with pytest.raises(MaterializationPartial, match="JSONL|dataset"):
         execute_ephemeral_audit(changed_plan, runtime)
@@ -835,3 +879,34 @@ def test_materializer_has_no_customer_execution_or_network_surface() -> None:
         "exec(",
     ):
         assert forbidden not in source
+
+
+def test_executor_rejects_canonical_looking_but_tampered_plan_id(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    tampered = dataclasses.replace(plan, plan_id="plan-" + "f" * 24)
+
+    with pytest.raises(MaterializationUnavailable, match="identity|plan"):
+        execute_ephemeral_audit(tampered, runtime)
+
+    assert not (scratch / tampered.plan_id).exists()
+
+
+def test_executor_rejects_mapping_provenance_drift(tmp_path: Path) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    drifted = dataclasses.replace(
+        plan,
+        mapping_provenance=(
+            FieldProvenance(
+                ProvenanceKind.PROVIDER_PROPOSAL,
+                "forged mapping provenance",
+                source_id="provider-call-9",
+            ),
+        ),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="mapping|provenance"):
+        execute_ephemeral_audit(drifted, runtime)
+
+    assert not (scratch / plan.plan_id).exists()

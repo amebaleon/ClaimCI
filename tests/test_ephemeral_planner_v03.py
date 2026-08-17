@@ -337,6 +337,33 @@ def test_discovery_boundary_rejects_unissued_normalized_evidence() -> None:
         )
 
 
+def test_discovery_boundary_rejects_artifact_outside_issued_repository_index() -> None:
+    claim = _claim()
+    evidence = (
+        _evidence(
+            "results/baseline.json",
+            ArtifactKind.RESULTS,
+            ExperimentRole.BASELINE,
+        ),
+        _evidence(
+            "results/candidate.json",
+            ArtifactKind.RESULTS,
+            ExperimentRole.CANDIDATE,
+        ),
+    )
+    discovery = dataclasses.replace(
+        _discovery(claim, evidence),
+        repository_paths=(RepositoryPath("CLAIM.md"),),
+    )
+
+    with pytest.raises((TypeError, ValueError), match="issued|repository|artifact"):
+        planning_request_from_discovery(
+            discovery,
+            claim_id=CLAIM_ID,
+            normalized_evidence=evidence,
+        )
+
+
 def _complete_evidence() -> tuple[NormalizedEvidence, ...]:
     return (
         _evidence(

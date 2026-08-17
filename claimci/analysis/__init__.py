@@ -53,6 +53,7 @@ from .planner import (
     PlanningOutcome,
     PlanningRequest,
     PlanningState,
+    derive_ephemeral_plan_id,
     plan_ephemeral_audit,
     planning_request_from_discovery,
 )
@@ -138,6 +139,7 @@ __all__ = [
     "to_jsonable",
     "audit_claim_spec_from_research_spec",
     "audit_relevant_claim_projection",
+    "derive_ephemeral_plan_id",
     "execute_ephemeral_audit",
     "plan_ephemeral_audit",
     "planning_request_from_discovery",

@@ -12,7 +12,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from claimci.models import Direction
-from claimci.review.models import ClaimDirection, ClaimType
+from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 
 from .confidence import Confidence
 from .contracts import (
@@ -35,6 +35,7 @@ from .contracts import (
     NormalizedEvidence,
     RepoMapping,
     RepositoryIdentity,
+    RepositoryPath,
     ProvenanceKind,
 )
 from .claims import audit_relevant_claim_projection
@@ -291,12 +292,36 @@ def planning_request_from_discovery(
     mapping_candidates = _discovery_attribute(discovery, "mapping_candidates")
     approved_mapping = _discovery_attribute(discovery, "approved_mapping")
     mapping_question = _discovery_attribute(discovery, "mapping_question")
+    repository_paths = _discovery_attribute(discovery, "repository_paths")
+    changed_paths = _discovery_attribute(discovery, "changed_paths")
+    artifact_issues = _discovery_attribute(discovery, "artifact_issues")
     if type(repository) is not RepositoryIdentity:
         raise TypeError("discovery repository must be RepositoryIdentity")
     if not isinstance(head_sha, GitCommitSha):
         head_sha = GitCommitSha(head_sha)
     if not isinstance(claims, tuple):
         raise TypeError("discovery claims must be a tuple")
+    if not isinstance(repository_paths, tuple) or not all(
+        isinstance(item, RepositoryPath) for item in repository_paths
+    ):
+        raise TypeError("discovery repository_paths must be RepositoryPath values")
+    if len(set(repository_paths)) != len(repository_paths):
+        raise AnalysisContractError("discovery repository_paths must be unique")
+    if not isinstance(changed_paths, tuple) or not all(
+        isinstance(item, RepositoryPath) for item in changed_paths
+    ):
+        raise TypeError("discovery changed_paths must be RepositoryPath values")
+    if not set(changed_paths).issubset(repository_paths):
+        raise AnalysisContractError(
+            "discovery changed_paths must be issued repository paths"
+        )
+    if not isinstance(artifact_issues, tuple):
+        raise TypeError("discovery artifact_issues must be a tuple")
+    for issue in artifact_issues:
+        if not isinstance(getattr(issue, "path", None), RepositoryPath) or not isinstance(
+            getattr(issue, "reason", None), str
+        ):
+            raise TypeError("discovery artifact issue has an invalid shape")
     selected = tuple(
         item
         for item in claims
@@ -311,6 +336,31 @@ def planning_request_from_discovery(
     reference = _discovery_attribute(discovered_claim, "reference")
     if type(reference) is not ClaimReference:
         raise TypeError("discovered claim reference must be ClaimReference")
+    source = _discovery_attribute(discovered_claim, "source")
+    if type(source) is not SourceLocation:
+        raise TypeError("discovered claim source must be SourceLocation")
+    if source.kind is SourceKind.REPOSITORY_FILE:
+        if source.path is None or reference.source_path != RepositoryPath(source.path):
+            raise AnalysisContractError(
+                "discovered claim source path does not match its reference"
+            )
+        if reference.source_path not in set(repository_paths):
+            raise AnalysisContractError(
+                "discovered claim source must be an issued repository path"
+            )
+    elif reference.source_path is not None:
+        raise AnalysisContractError(
+            "pull-request discovered claim cannot carry a repository path"
+        )
+    evidence_hints = _discovery_attribute(discovered_claim, "evidence_hints")
+    if not isinstance(evidence_hints, tuple) or not all(
+        isinstance(item, RepositoryPath) for item in evidence_hints
+    ):
+        raise TypeError("discovered claim evidence_hints must be RepositoryPath values")
+    if any(item not in set(repository_paths) for item in evidence_hints):
+        raise AnalysisContractError(
+            "discovered claim evidence hints must be issued repository paths"
+        )
     if _discovery_attribute(discovered_claim, "claim_type") is not ClaimType.METRIC_IMPROVEMENT:
         raise AnalysisContractError(
             "current deterministic planner supports metric improvement claims"
@@ -355,6 +405,10 @@ def planning_request_from_discovery(
         type(item) is ArtifactCandidate for item in artifacts
     ):
         raise TypeError("discovery artifacts must be ArtifactCandidate values")
+    if any(item.path not in set(repository_paths) for item in artifacts):
+        raise AnalysisContractError(
+            "discovery artifacts must use issued repository paths"
+        )
     if any(reference.claim_id not in item.relevant_claim_ids for item in artifacts):
         raise AnalysisContractError(
             "discovery artifacts must be relevant to the selected claim"
@@ -720,6 +774,25 @@ def _plan_id(
     mapping: MappingCandidate | RepoMapping,
     evidence: tuple[NormalizedEvidence, ...],
 ) -> str:
+    return _plan_id_from_components(
+        repository=request.repository,
+        pr_number=request.pr_number,
+        head_sha=request.head_sha,
+        audit_claim=request.audit_claim,
+        mapping=mapping,
+        evidence=evidence,
+    )
+
+
+def _plan_id_from_components(
+    *,
+    repository: RepositoryIdentity,
+    pr_number: int | None,
+    head_sha: GitCommitSha,
+    audit_claim: AuditClaimSpec,
+    mapping: MappingCandidate | RepoMapping,
+    evidence: tuple[NormalizedEvidence, ...],
+) -> str:
     artifacts = {
         (item.artifact.path, item.artifact.kind): item.artifact
         for item in evidence
@@ -753,12 +826,12 @@ def _plan_id(
         )
     projection = {
         "repository": {
-            "owner": request.repository.owner,
-            "name": request.repository.name,
+            "owner": repository.owner,
+            "name": repository.name,
         },
-        "pr_number": request.pr_number,
-        "head_sha": str(request.head_sha),
-        "claim": audit_relevant_claim_projection(request.audit_claim),
+        "pr_number": pr_number,
+        "head_sha": str(head_sha),
+        "claim": audit_relevant_claim_projection(audit_claim),
         "mapping": _selected_mapping_identity(mapping),
         "bindings": sorted(
             bindings,
@@ -779,7 +852,27 @@ def _plan_id(
     return "plan-" + hashlib.sha256(canonical).hexdigest()[:24]
 
 
+def derive_ephemeral_plan_id(plan: EphemeralAuditPlan) -> str:
+    """Recompute one plan's canonical audit-relevant identity."""
+
+    if type(plan) is not EphemeralAuditPlan:
+        raise TypeError("plan identity derivation requires EphemeralAuditPlan")
+    if plan.audit_claim is None or plan.selected_mapping is None:
+        raise AnalysisContractError(
+            "plan identity derivation requires executable claim and mapping"
+        )
+    return _plan_id_from_components(
+        repository=plan.repository,
+        pr_number=plan.pr_number,
+        head_sha=plan.head_sha,
+        audit_claim=plan.audit_claim,
+        mapping=plan.selected_mapping,
+        evidence=(*plan.baseline_evidence, *plan.candidate_evidence),
+    )
+
+
 __all__ = [
+    "derive_ephemeral_plan_id",
     "PlanningOutcome",
     "PlanningRequest",
     "PlanningState",

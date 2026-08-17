@@ -33,6 +33,7 @@ from .contracts import (
     RepoMapping,
     RepositoryIdentity,
 )
+from .planner import derive_ephemeral_plan_id
 
 
 _PLAN_ID = re.compile(r"plan-[0-9a-f]{24}\Z")
@@ -116,13 +117,15 @@ class RuntimeExecutionContext:
     head_sha: GitCommitSha
     scratch_root: Path
     limits: MaterializationLimits = field(default_factory=MaterializationLimits)
+    _checkout_identity: tuple[int, int, int] = field(init=False, repr=False)
+    _scratch_identity: tuple[int, int, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryIdentity:
             raise TypeError("runtime repository must be RepositoryIdentity")
         if not isinstance(self.head_sha, GitCommitSha):
             object.__setattr__(self, "head_sha", GitCommitSha(self.head_sha))
-        if not isinstance(self.limits, MaterializationLimits):
+        if type(self.limits) is not MaterializationLimits:
             raise TypeError("runtime limits must be MaterializationLimits")
         checkout_input = Path(self.checkout_root)
         scratch_input = Path(self.scratch_root)
@@ -143,6 +146,54 @@ class RuntimeExecutionContext:
             )
         object.__setattr__(self, "checkout_root", checkout)
         object.__setattr__(self, "scratch_root", scratch)
+        checkout_stat = os.lstat(checkout)
+        scratch_stat = os.lstat(scratch)
+        object.__setattr__(
+            self,
+            "_checkout_identity",
+            (checkout_stat.st_dev, checkout_stat.st_ino, checkout_stat.st_mode),
+        )
+        object.__setattr__(
+            self,
+            "_scratch_identity",
+            (scratch_stat.st_dev, scratch_stat.st_ino, scratch_stat.st_mode),
+        )
+
+
+def _validate_runtime_roots(runtime: RuntimeExecutionContext) -> None:
+    for label, path, expected in (
+        (
+            "checkout",
+            runtime.checkout_root,
+            runtime._checkout_identity,
+        ),
+        (
+            "scratch",
+            runtime.scratch_root,
+            runtime._scratch_identity,
+        ),
+    ):
+        try:
+            current = os.lstat(path)
+            resolved = path.resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+            raise MaterializationUnavailable(
+                f"trusted {label} root is unavailable: {error}"
+            ) from error
+        identity = (current.st_dev, current.st_ino, current.st_mode)
+        if (
+            identity != expected
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or resolved != path
+        ):
+            raise MaterializationUnavailable(
+                f"trusted {label} root identity changed"
+            )
+    if _paths_overlap(runtime.checkout_root, runtime.scratch_root):
+        raise MaterializationUnavailable(
+            "trusted checkout and scratch roots now overlap"
+        )
 
 
 def _open_customer_artifact(path: Path) -> int:
@@ -490,7 +541,8 @@ def _write_native_tree(
     plan: EphemeralAuditPlan,
     captured: Mapping[str, PassiveArtifact],
 ) -> Path:
-    assert plan.audit_claim is not None
+    if plan.audit_claim is None:
+        raise MaterializationPartial("plan has no deterministic audit claim")
     for role in ("baseline", "candidate"):
         (plan_root / role).mkdir(exist_ok=False)
     by_role = {
@@ -590,8 +642,17 @@ def execute_ephemeral_audit(
         raise TypeError("ephemeral execution requires EphemeralAuditPlan")
     if type(runtime) is not RuntimeExecutionContext:
         raise TypeError("ephemeral execution requires RuntimeExecutionContext")
+    _validate_runtime_roots(runtime)
     if not _PLAN_ID.fullmatch(plan.plan_id):
         raise MaterializationUnavailable("plan identity is not canonical")
+    try:
+        expected_plan_id = derive_ephemeral_plan_id(plan)
+    except Exception as error:
+        raise MaterializationUnavailable(
+            "plan identity cannot be revalidated"
+        ) from error
+    if plan.plan_id != expected_plan_id:
+        raise MaterializationUnavailable("plan identity does not match its inputs")
     if plan.repository != runtime.repository or plan.head_sha != runtime.head_sha:
         raise MaterializationUnavailable(
             "trusted repository or head snapshot no longer matches the plan"
@@ -601,6 +662,17 @@ def execute_ephemeral_audit(
     if plan.audit_claim is None or plan.audit_claim.minimum_absolute_improvement is None:
         raise MaterializationPartial(
             "the native Audit requires an explicit improvement threshold"
+        )
+    if plan.selected_mapping is None:
+        raise MaterializationPartial("plan has no selected mapping")
+    expected_provenance = (
+        (plan.selected_mapping.approval_provenance,)
+        if type(plan.selected_mapping) is RepoMapping
+        else (plan.selected_mapping.provenance,)
+    )
+    if plan.mapping_provenance != expected_provenance:
+        raise MaterializationUnavailable(
+            "plan mapping provenance does not match the selected mapping"
         )
 
     plan_root = runtime.scratch_root / plan.plan_id
