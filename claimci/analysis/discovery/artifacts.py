@@ -84,6 +84,7 @@ _CLAIM_KIND_ROUTES = {
     ClaimType.METRIC_IMPROVEMENT: {
         ArtifactKind.RESULTS,
         ArtifactKind.CONFIG,
+        ArtifactKind.DATASET,
         ArtifactKind.MANIFEST,
     },
     ClaimType.COMPUTE_EQUIVALENCE: {
@@ -277,15 +278,33 @@ def _manifest_hint(
         )
 
 
-def _claim_ids_for_kind(
+def _claim_ids_for_artifact(
     claims: tuple[DiscoveredClaim, ...],
     kind: ArtifactKind,
+    path: RepositoryPath,
 ) -> set[str]:
-    return {
+    routed = tuple(
+        claim for claim in claims if kind in _CLAIM_KIND_ROUTES[claim.claim_type]
+    )
+    path_tokens = _tokens(str(path))
+    metric_matched = {
         claim.reference.claim_id
-        for claim in claims
-        if kind in _CLAIM_KIND_ROUTES[claim.claim_type]
+        for claim in routed
+        if claim.metric and path_tokens & _tokens(claim.metric)
     }
+    if metric_matched:
+        return metric_matched
+    matched = {
+        claim.reference.claim_id
+        for claim in routed
+        if any(
+            literal and path_tokens & _tokens(literal)
+            for literal in (claim.subject, *claim.qualifiers)
+        )
+    }
+    if matched:
+        return matched
+    return {claim.reference.claim_id for claim in routed}
 
 
 def _path_has_claim_literal(path: RepositoryPath, claims: tuple[DiscoveredClaim, ...]) -> bool:
@@ -359,7 +378,9 @@ def discover_artifacts(
         path = RepositoryPath(reference.path)
         kind = _EVIDENCE_KINDS[reference.kind]
         kinds[path] = kind
-        claim_ids[path].update(reference.claim_ids)
+        routed = _claim_ids_for_artifact(claims, kind, path)
+        referenced = set(reference.claim_ids)
+        claim_ids[path].update(referenced & routed or referenced)
         evidence_paths.add(path)
 
     supplement_kinds = {
@@ -373,14 +394,16 @@ def discover_artifacts(
         kind = _classify_path(path)
         if kind in supplement_kinds:
             kinds.setdefault(path, kind)
-            claim_ids[path].update(_claim_ids_for_kind(claims, kind))
+            claim_ids[path].update(_claim_ids_for_artifact(claims, kind, path))
     approved_paths: set[RepositoryPath] = set()
     if approved_mapping is not None:
         for binding in approved_mapping.bindings:
             if binding.path in set(context.repository_paths):
                 approved_paths.add(binding.path)
                 kinds[binding.path] = binding.kind
-                claim_ids[binding.path].update(_claim_ids_for_kind(claims, binding.kind))
+                claim_ids[binding.path].update(
+                    _claim_ids_for_artifact(claims, binding.kind, binding.path)
+                )
 
     manifest_paths = {
         path for path, kind in kinds.items() if kind is ArtifactKind.MANIFEST

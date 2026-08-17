@@ -12,7 +12,8 @@
 
 - Work only on `feat/ephemeral-plan-v03` in `C:\ClaimCI-worktrees\ephemeral-plan-v03`.
 - Preserve `claimci audit research.yaml`, existing deterministic rules, existing `run_review()`, provider max-two-call/zero-retry limits, workflows, and CLI behavior.
-- Do not implement discovery algorithms or production adapters; test them through exact-shape fakes.
+- Integrate the concrete Auto Discovery and Adapter implementations without
+  duplicating their algorithms or adding new production adapters in this branch.
 - Pull-request content remains passive bytes. Never import or execute customer code, invoke customer hooks/builds/scripts, or download external data.
 - Provider claims/mappings never gain deterministic authority from confidence. `RepoMapping.approve()` is the only provider-mapping approval transition.
 - Only a real `AuditResult` returned by the existing Audit may create `DeterministicAuditOutcome`.
@@ -20,7 +21,10 @@
 - Runtime integrity failures are `UNAVAILABLE`; known scientific/evidence/representation limitations are `PARTIAL`.
 - Materialize only into an invocation-private scratch root outside the customer repository, exclusively create the plan tree/files, capture each customer artifact once, and remove only the created plan tree on every exit.
 - Use test-driven development: add one observable failing test, verify RED for the intended missing behavior, implement minimally, and verify GREEN before the next behavior.
-- Auto Discovery commit `6d4c1240c0c09668c04b66035a5ce2d8598ab813` is not yet in `origin/main`. Keep the conversion in one isolated boundary, refer to concrete discovery names under `TYPE_CHECKING`, and use complete field-shape fakes until that branch is merged; do not copy its implementation.
+- Integrate Auto Discovery commit `6d4c1240c0c09668c04b66035a5ce2d8598ab813`
+  and Adapter commit `f928986` directly for the pre-merge gate. The conversion
+  boundary must require their concrete immutable contracts and scope a
+  repository-wide result to one selected claim.
 
 ---
 
@@ -148,7 +152,12 @@
 
 - [ ] **Step 1: Add failing tests for the Auto Discovery boundary**
 
-  Define full immutable test fakes matching the implemented `DiscoveryResult`, `DiscoveredClaim`, and `ClaimedValue` field shapes. Assert the converter reuses `ClaimReference`, maps `ClaimDirection` to deterministic `Direction`, preserves baseline/candidate values descriptively, revalidates an explicit `at least` threshold, rejects a from-to pair as threshold, forwards mappings without using `preferred_mapping`, and rejects normalized evidence whose artifact was not issued by discovery.
+  Use the concrete immutable `DiscoveryResult`, `DiscoveredClaim`, and
+  `ClaimedValue` contracts. Assert the converter reuses `ClaimReference`, maps
+  `ClaimDirection` to deterministic `Direction`, preserves baseline/candidate
+  values descriptively, revalidates an explicit `at least` threshold, rejects a
+  from-to pair as threshold, scopes artifacts/evidence/mappings/questions to the
+  selected claim, and rejects evidence not issued by discovery.
 
   ```python
   request = planning_request_from_discovery(
@@ -248,7 +257,13 @@
 
 - [ ] **Step 4: Add failing tests for results/config/dataset conversion**
 
-  Use literal normalized observations from JSON- and CSV-style fake adapters. Assert native results contain only ordered `runs`, metric values, and genuine integer seeds; no summaries. Assert absent seeds are omitted, string seeds cause `MaterializationPartial`, config dotted keys nest deterministically, conflicting config paths fail partial, partial config reaches real Audit policy, and dataset bytes are copied exactly.
+  Use literal normalized observations from registered JSON/CSV/YAML adapters
+  where supported and bounded fakes only for unsupported passive dataset
+  identity. Assert native results contain only ordered `runs`, metric values,
+  and genuine integer seeds; no summaries. Assert absent seeds are omitted,
+  string seeds cause `MaterializationPartial`, config dotted keys nest
+  deterministically, conflicting config paths fail partial, partial config
+  reaches real Audit policy, and dataset bytes are copied exactly.
 
 - [ ] **Step 5: Run conversion tests and verify RED**
 
@@ -453,7 +468,10 @@
 
 - [ ] **Step 6: Review scope and public exports**
 
-  Confirm `git diff --name-only origin/main...HEAD` contains only analysis/review integration, tests, and approved docs. Confirm no workflow, CLI command, provider retry, external dependency, discovery implementation, concrete adapter, or customer artifact was changed.
+  Confirm `git diff --name-only origin/main...HEAD` contains only the integrated
+  analysis/discovery/adapter packages, planner/review integration, tests, and
+  approved docs. Confirm no workflow, CLI command, provider retry, external
+  dependency, or customer artifact was changed.
 
 - [ ] **Step 7: Commit final hardening if Task 6 changed files**
 
@@ -465,3 +483,22 @@
 - [ ] **Step 8: Invoke finishing-development-branch**
 
   Re-run the full verification evidence, review commit history/status, push `feat/ephemeral-plan-v03`, open a PR against `main`, and do not merge.
+
+---
+
+## Task 7: Concrete Discovery and Adapter pre-merge integration
+
+- [x] Merge the exact Auto Discovery and Adapter branch heads into the feature
+  branch without copying their implementations.
+- [x] Require exact concrete discovery contracts and scope a repository-wide
+  result, mappings, and questions to the selected claim ID.
+- [x] Apply the same seven-condition hosted gate to `MANIFEST_HINT`; provider
+  provenance never auto-executes.
+- [x] Give a runtime-valid `RepoMapping.approve()` result unconditional
+  precedence over unapproved candidates while failing closed on an invalid
+  approval.
+- [x] Exercise registered CSV/YAML adapters, generic `UNSPECIFIED` evidence,
+  explicit role mapping, materialization, real Audit, and unified Review in one
+  cross-package test.
+- [x] Cover multiple claims, approved/provider/manifest regressions, and hosted
+  scenarios A through I, then run the complete offline gate.

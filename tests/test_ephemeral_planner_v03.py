@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +43,7 @@ from claimci.analysis import (
     to_jsonable,
 )
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
+from claimci.analysis.discovery import ClaimedValue, DiscoveredClaim, DiscoveryResult
 
 
 REPOSITORY = RepositoryIdentity("amebaleon", "ClaimCI-Demo")
@@ -64,48 +65,13 @@ def _provenance(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class FakeClaimedValue:
-    value: float
-    unit: str | None
-    provenance: FieldProvenance
-
-
-@dataclass(frozen=True, slots=True)
-class FakeDiscoveredClaim:
-    reference: object
-    claim_type: ClaimType
-    subject: str
-    source: SourceLocation
-    metric: str | None
-    direction: ClaimDirection
-    baseline_value: FakeClaimedValue | None = None
-    candidate_value: FakeClaimedValue | None = None
-    minimum_improvement: FakeClaimedValue | None = None
-    qualifiers: tuple[str, ...] = ()
-    evidence_hints: tuple[RepositoryPath, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class FakeDiscoveryResult:
-    repository: RepositoryIdentity
-    head_sha: GitCommitSha
-    pr_number: int | None
-    repository_paths: tuple[RepositoryPath, ...]
-    changed_paths: tuple[RepositoryPath, ...]
-    claims: tuple[FakeDiscoveredClaim, ...]
-    artifacts: tuple[ArtifactCandidate, ...]
-    mapping_candidates: tuple[MappingCandidate, ...]
-    approved_mapping: RepoMapping | None = None
-    mapping_question: MappingQuestion | None = None
-    artifact_issues: tuple[object, ...] = ()
-
-    @property
-    def preferred_mapping(self) -> object:
-        raise AssertionError("planner must not use preferred_mapping as authority")
-
-
-def _artifact(path: str, kind: ArtifactKind, content: bytes = b"{}\n") -> ArtifactCandidate:
+def _artifact(
+    path: str,
+    kind: ArtifactKind,
+    content: bytes = b"{}\n",
+    *,
+    claim_ids: tuple[str, ...] = (CLAIM_ID,),
+) -> ArtifactCandidate:
     return ArtifactCandidate(
         path=RepositoryPath(path),
         kind=kind,
@@ -113,7 +79,7 @@ def _artifact(path: str, kind: ArtifactKind, content: bytes = b"{}\n") -> Artifa
         size=len(content),
         confidence=Confidence(0.95),
         discovery_reason="fixture artifact",
-        relevant_claim_ids=(CLAIM_ID,),
+        relevant_claim_ids=claim_ids,
         provenance=_provenance(source_path=path, source_id=f"artifact:{path}"),
     )
 
@@ -146,8 +112,9 @@ def _evidence(
     role: ExperimentRole,
     *,
     split: str | None = None,
+    claim_ids: tuple[str, ...] = (CLAIM_ID,),
 ) -> NormalizedEvidence:
-    artifact = _artifact(path, kind)
+    artifact = _artifact(path, kind, claim_ids=claim_ids)
     target = {
         ArtifactKind.RESULTS: "metric_value",
         ArtifactKind.CONFIG: "config.training_steps",
@@ -209,11 +176,11 @@ def _claim(
     *,
     minimum: float | None = 0.05,
     provenance_kind: ProvenanceKind = ProvenanceKind.DETERMINISTIC_DISCOVERY,
-) -> FakeDiscoveredClaim:
+) -> DiscoveredClaim:
     from claimci.analysis import ClaimReference
 
     provenance = _provenance(provenance_kind)
-    return FakeDiscoveredClaim(
+    return DiscoveredClaim(
         reference=ClaimReference(
             claim_id=CLAIM_ID,
             text=text,
@@ -232,21 +199,21 @@ def _claim(
         ),
         metric="accuracy",
         direction=ClaimDirection.HIGHER,
-        baseline_value=FakeClaimedValue(0.71, None, provenance),
-        candidate_value=FakeClaimedValue(0.79, None, provenance),
+        baseline_value=ClaimedValue(0.71, None, provenance),
+        candidate_value=ClaimedValue(0.79, None, provenance),
         minimum_improvement=None
         if minimum is None
-        else FakeClaimedValue(minimum, None, provenance),
+        else ClaimedValue(minimum, None, provenance),
     )
 
 
 def _discovery(
-    claim: FakeDiscoveredClaim,
+    claim: DiscoveredClaim,
     evidence: tuple[NormalizedEvidence, ...],
     mapping_candidates: tuple[MappingCandidate, ...] = (),
-) -> FakeDiscoveryResult:
+) -> DiscoveryResult:
     artifacts = tuple(item.artifact for item in evidence)
-    return FakeDiscoveryResult(
+    return DiscoveryResult(
         repository=REPOSITORY,
         head_sha=HEAD_SHA,
         pr_number=7,
@@ -257,6 +224,9 @@ def _discovery(
         claims=(claim,),
         artifacts=artifacts,
         mapping_candidates=mapping_candidates,
+        approved_mapping=None,
+        mapping_question=None,
+        artifact_issues=(),
     )
 
 
@@ -351,17 +321,179 @@ def test_discovery_boundary_rejects_artifact_outside_issued_repository_index() -
             ExperimentRole.CANDIDATE,
         ),
     )
-    discovery = dataclasses.replace(
-        _discovery(claim, evidence),
-        repository_paths=(RepositoryPath("CLAIM.md"),),
+    with pytest.raises((TypeError, ValueError), match="issued|repository|artifact"):
+        dataclasses.replace(
+            _discovery(claim, evidence),
+            repository_paths=(RepositoryPath("CLAIM.md"),),
+        )
+
+
+def test_discovery_boundary_requires_the_concrete_discovery_result_contract() -> None:
+    claim = _claim()
+    evidence = (
+        _evidence("results/baseline.json", ArtifactKind.RESULTS, ExperimentRole.BASELINE),
+        _evidence("results/candidate.json", ArtifactKind.RESULTS, ExperimentRole.CANDIDATE),
+    )
+    concrete = _discovery(claim, evidence)
+    structural_clone = SimpleNamespace(
+        **{
+            field.name: getattr(concrete, field.name)
+            for field in dataclasses.fields(DiscoveryResult)
+        }
     )
 
-    with pytest.raises((TypeError, ValueError), match="issued|repository|artifact"):
+    with pytest.raises(TypeError, match="DiscoveryResult"):
         planning_request_from_discovery(
-            discovery,
+            structural_clone,
             claim_id=CLAIM_ID,
             normalized_evidence=evidence,
         )
+
+
+def test_discovery_boundary_scopes_repository_wide_inputs_to_selected_claim() -> None:
+    other_claim_id = "claim-2"
+    selected_claim = _claim()
+    other_claim = dataclasses.replace(
+        selected_claim,
+        reference=dataclasses.replace(
+            selected_claim.reference,
+            claim_id=other_claim_id,
+            text="F1 improved by at least 0.03.",
+        ),
+        metric="f1",
+        minimum_improvement=ClaimedValue(
+            0.03,
+            None,
+            selected_claim.reference.provenance,
+        ),
+    )
+    selected_evidence = (
+        _evidence("accuracy/baseline_results.json", ArtifactKind.RESULTS, ExperimentRole.BASELINE),
+        _evidence("accuracy/candidate_results.json", ArtifactKind.RESULTS, ExperimentRole.CANDIDATE),
+    )
+    unrelated_evidence = (
+        _evidence(
+            "f1/baseline_results.json",
+            ArtifactKind.RESULTS,
+            ExperimentRole.BASELINE,
+            claim_ids=(other_claim_id,),
+        ),
+        _evidence(
+            "f1/candidate_results.json",
+            ArtifactKind.RESULTS,
+            ExperimentRole.CANDIDATE,
+            claim_ids=(other_claim_id,),
+        ),
+    )
+    selected_mapping = _mapping("accuracy-mapping", selected_evidence)
+    unrelated_mapping = _mapping("f1-mapping", unrelated_evidence)
+    unrelated_question = MappingQuestion(
+        question_id="question-f1-results",
+        prompt="Which file contains the candidate F1 results?",
+        choices=(
+            MappingChoice(
+                "f1-choice-1",
+                "first F1 result",
+                (_binding(unrelated_evidence[0], ExperimentRole.CANDIDATE),),
+            ),
+            MappingChoice(
+                "f1-choice-2",
+                "second F1 result",
+                (_binding(unrelated_evidence[1], ExperimentRole.CANDIDATE),),
+            ),
+        ),
+        relevant_claim_id=other_claim_id,
+    )
+    all_evidence = (*selected_evidence, *unrelated_evidence)
+    discovery = DiscoveryResult(
+        repository=REPOSITORY,
+        head_sha=HEAD_SHA,
+        pr_number=7,
+        repository_paths=(RepositoryPath("CLAIM.md"),) + tuple(
+            item.artifact.path for item in all_evidence
+        ),
+        changed_paths=(RepositoryPath("CLAIM.md"),),
+        claims=(selected_claim, other_claim),
+        artifacts=tuple(item.artifact for item in all_evidence),
+        mapping_candidates=(selected_mapping, unrelated_mapping),
+        approved_mapping=None,
+        mapping_question=unrelated_question,
+        artifact_issues=(),
+    )
+
+    request = planning_request_from_discovery(
+        discovery,
+        claim_id=CLAIM_ID,
+        normalized_evidence=all_evidence,
+    )
+
+    assert request.artifacts == tuple(item.artifact for item in selected_evidence)
+    assert request.normalized_evidence == selected_evidence
+    assert len(request.mapping_candidates) == 1
+    assert {
+        (binding.path, binding.kind)
+        for binding in request.mapping_candidates[0].bindings
+    } == {
+        (item.artifact.path, item.artifact.kind) for item in selected_evidence
+    }
+    assert request.upstream_mapping_question is None
+
+
+def test_discovery_boundary_scopes_shared_question_choices_to_selected_claim() -> None:
+    other_claim_id = "claim-2"
+    selected_claim = _claim()
+    selected = _evidence(
+        "accuracy/candidate_results.json",
+        ArtifactKind.RESULTS,
+        ExperimentRole.CANDIDATE,
+    )
+    unrelated = _evidence(
+        "f1/candidate_results.json",
+        ArtifactKind.RESULTS,
+        ExperimentRole.CANDIDATE,
+        claim_ids=(other_claim_id,),
+    )
+    question = MappingQuestion(
+        question_id="question-shared-results",
+        prompt="Which candidate result should be used?",
+        choices=(
+            MappingChoice(
+                "selected-result",
+                "accuracy result",
+                (_binding(selected, ExperimentRole.CANDIDATE),),
+            ),
+            MappingChoice(
+                "unrelated-result",
+                "F1 result",
+                (_binding(unrelated, ExperimentRole.CANDIDATE),),
+            ),
+        ),
+    )
+    discovery = DiscoveryResult(
+        repository=REPOSITORY,
+        head_sha=HEAD_SHA,
+        pr_number=7,
+        repository_paths=(
+            RepositoryPath("CLAIM.md"),
+            selected.artifact.path,
+            unrelated.artifact.path,
+        ),
+        changed_paths=(RepositoryPath("CLAIM.md"),),
+        claims=(selected_claim,),
+        artifacts=(selected.artifact, unrelated.artifact),
+        mapping_candidates=(),
+        approved_mapping=None,
+        mapping_question=question,
+        artifact_issues=(),
+    )
+
+    request = planning_request_from_discovery(
+        discovery,
+        claim_id=CLAIM_ID,
+        normalized_evidence=(selected, unrelated),
+    )
+
+    assert request.upstream_mapping_question is None
 
 
 def _complete_evidence() -> tuple[NormalizedEvidence, ...]:
@@ -441,7 +573,7 @@ def _mapping(
 
 def _request(
     *,
-    claim: FakeDiscoveredClaim | None = None,
+    claim: DiscoveredClaim | None = None,
     evidence: tuple[NormalizedEvidence, ...] | None = None,
     mappings: tuple[MappingCandidate, ...] | None = None,
     approved: RepoMapping | None = None,
@@ -512,7 +644,7 @@ def test_sole_eligible_inferred_mapping_produces_ready_head_bound_plan() -> None
     assert outcome.plan.missing_evidence == ()
 
 
-def test_manifest_hint_can_guide_ephemeral_plan_without_trust_elevation() -> None:
+def test_manifest_hint_can_auto_plan_only_after_the_standard_hosted_gate() -> None:
     evidence = _complete_evidence()
     hint = _mapping(
         "manifest-hint",
@@ -528,6 +660,23 @@ def test_manifest_hint_can_guide_ephemeral_plan_without_trust_elevation() -> Non
     assert outcome.plan is not None
     assert type(outcome.plan.selected_mapping) is MappingCandidate
     assert outcome.plan.selected_mapping.trust is MappingTrust.MANIFEST_HINT
+
+
+def test_low_confidence_manifest_hint_requires_clarification() -> None:
+    evidence = _complete_evidence()
+    hint = _mapping(
+        "manifest-hint-low-confidence",
+        evidence,
+        confidence=0.899,
+        trust=MappingTrust.MANIFEST_HINT,
+        provenance_kind=ProvenanceKind.MANIFEST_HINT,
+    )
+
+    outcome = plan_ephemeral_audit(_request(evidence=evidence, mappings=(hint,)))
+
+    assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.plan is None
+    assert outcome.mapping_question is not None
 
 
 def test_applicable_explicit_repo_mapping_is_selected() -> None:
@@ -554,13 +703,23 @@ def test_applicable_explicit_repo_mapping_is_selected() -> None:
 
 
 def test_ambiguous_strong_mappings_return_bounded_question_without_verdict() -> None:
-    evidence = _complete_evidence()
-    first = _mapping("mapping-first", evidence)
-    second_bindings = tuple(reversed(first.bindings))
-    second = dataclasses.replace(
-        first,
+    primary = _complete_evidence()
+    alternative_result = _evidence(
+        "results/candidate-alternative.json",
+        ArtifactKind.RESULTS,
+        ExperimentRole.CANDIDATE,
+    )
+    evidence = (*primary, alternative_result)
+    first = _mapping("mapping-first", primary)
+    second = MappingCandidate(
         mapping_id="mapping-second",
-        bindings=second_bindings,
+        bindings=tuple(
+            _binding(item, item.observations[0].experiment_role)
+            for item in (*primary[:1], alternative_result, *primary[2:])
+        ),
+        confidence=Confidence(0.95),
+        trust=MappingTrust.INFERRED,
+        provenance=_provenance(source_id="mapping-second"),
     )
 
     outcome = plan_ephemeral_audit(
@@ -608,17 +767,26 @@ def test_low_confidence_inferred_mapping_requires_clarification() -> None:
 
 
 def test_manifest_hint_conflicting_with_strong_candidate_requires_question() -> None:
-    evidence = _complete_evidence()
+    primary = _complete_evidence()
+    alternative_results = _evidence(
+        "results/candidate-alternative.json",
+        ArtifactKind.RESULTS,
+        ExperimentRole.CANDIDATE,
+    )
+    evidence = (*primary, alternative_results)
     hint = _mapping(
         "manifest-hint",
-        evidence,
+        primary,
         trust=MappingTrust.MANIFEST_HINT,
         provenance_kind=ProvenanceKind.MANIFEST_HINT,
     )
-    alternative = dataclasses.replace(
-        _mapping("strong-alternative", evidence),
-        bindings=tuple(reversed(hint.bindings)),
+    alternative_evidence = tuple(
+        alternative_results
+        if item.artifact.path == RepositoryPath("results/candidate.json")
+        else item
+        for item in primary
     )
+    alternative = _mapping("strong-alternative", alternative_evidence)
 
     outcome = plan_ephemeral_audit(
         _request(evidence=evidence, mappings=(hint, alternative))
@@ -628,7 +796,7 @@ def test_manifest_hint_conflicting_with_strong_candidate_requires_question() -> 
     assert outcome.mapping_question is not None
 
 
-def test_approved_mapping_conflict_is_not_silently_resolved() -> None:
+def test_runtime_valid_approved_mapping_precedes_unapproved_conflicts() -> None:
     primary = _complete_evidence()
     alternative_results = _evidence(
         "results/candidate-alternative.json",
@@ -661,8 +829,83 @@ def test_approved_mapping_conflict_is_not_silently_resolved() -> None:
         )
     )
 
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert outcome.plan.selected_mapping is approved
+    assert outcome.mapping_question is None
+
+
+def test_invalid_approved_mapping_blocks_automatic_fallback() -> None:
+    evidence = _complete_evidence()
+    valid = _mapping("valid-inferred", evidence)
+    invalid_source = dataclasses.replace(
+        valid,
+        mapping_id="stale-approved-source",
+        bindings=(
+            dataclasses.replace(
+                valid.bindings[0],
+                adapter_id="stale.adapter",
+            ),
+            *valid.bindings[1:],
+        ),
+    )
+    approved = RepoMapping.approve(
+        REPOSITORY,
+        invalid_source,
+        approved_by="owner:amebaleon",
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=evidence, mappings=(valid,), approved=approved)
+    )
+
     assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.plan is None
     assert outcome.mapping_question is not None
+
+
+def test_generic_unspecified_evidence_uses_only_explicit_mapping_roles() -> None:
+    role_by_path = {
+        item.artifact.path: (
+            ExperimentRole.BASELINE
+            if "baseline" in str(item.artifact.path)
+            else ExperimentRole.CANDIDATE
+        )
+        for item in _complete_evidence()
+    }
+    evidence = tuple(
+        dataclasses.replace(
+            item,
+            observations=tuple(
+                dataclasses.replace(
+                    observation,
+                    experiment_role=ExperimentRole.UNSPECIFIED,
+                )
+                for observation in item.observations
+            ),
+        )
+        for item in _complete_evidence()
+    )
+    explicit = MappingCandidate(
+        mapping_id="explicit-generic-roles",
+        bindings=tuple(
+            _binding(item, role_by_path[item.artifact.path]) for item in evidence
+        ),
+        confidence=Confidence(0.95),
+        trust=MappingTrust.INFERRED,
+        provenance=_provenance(source_id="explicit-generic-roles"),
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=evidence, mappings=(explicit,))
+    )
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert {
+        item.observations[0].experiment_role
+        for item in (*outcome.plan.baseline_evidence, *outcome.plan.candidate_evidence)
+    } == {ExperimentRole.UNSPECIFIED}
 
 
 def test_mapping_with_unissued_selector_or_binding_cannot_auto_execute() -> None:
@@ -786,12 +1029,12 @@ def test_plan_id_ignores_descriptive_claim_and_discovery_prose() -> None:
         ),
     )
     changed_mapping = dataclasses.replace(
-        mapping,
+        original.mapping_candidates[0],
         provenance=dataclasses.replace(
-            mapping.provenance,
+            original.mapping_candidates[0].provenance,
             detail="different unstable provider explanation",
         ),
-        bindings=tuple(reversed(mapping.bindings)),
+        bindings=tuple(reversed(original.mapping_candidates[0].bindings)),
     )
     changed_request = dataclasses.replace(
         original,

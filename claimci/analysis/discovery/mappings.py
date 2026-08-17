@@ -43,6 +43,7 @@ class MappingResolution:
 class _Ambiguity:
     kind: ArtifactKind
     role: ExperimentRole
+    split: str | None
     artifacts: tuple[ArtifactCandidate, ...]
     affected_claim_ids: tuple[str, ...]
     unlock_count: int
@@ -51,12 +52,18 @@ class _Ambiguity:
 _TOKEN = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _BASELINE_TOKENS = frozenset({"baseline", "base", "control", "reference"})
 _CANDIDATE_TOKENS = frozenset({"candidate", "proposed", "new"})
-_MAPPED_KINDS = (ArtifactKind.RESULTS, ArtifactKind.CONFIG)
+_MAPPED_KINDS = (
+    ArtifactKind.RESULTS,
+    ArtifactKind.CONFIG,
+    ArtifactKind.DATASET,
+)
 _SLOT_PRIORITY = {
     (ArtifactKind.RESULTS, ExperimentRole.CANDIDATE): 40,
     (ArtifactKind.RESULTS, ExperimentRole.BASELINE): 30,
     (ArtifactKind.CONFIG, ExperimentRole.CANDIDATE): 20,
     (ArtifactKind.CONFIG, ExperimentRole.BASELINE): 10,
+    (ArtifactKind.DATASET, ExperimentRole.CANDIDATE): 8,
+    (ArtifactKind.DATASET, ExperimentRole.BASELINE): 6,
 }
 
 
@@ -71,6 +78,15 @@ def _role(path: RepositoryPath) -> ExperimentRole:
     if baseline == candidate:
         return ExperimentRole.UNSPECIFIED
     return ExperimentRole.BASELINE if baseline else ExperimentRole.CANDIDATE
+
+
+def _dataset_split(path: RepositoryPath) -> str | None:
+    tokens = _tokens(path)
+    train = bool(tokens & {"train", "training"})
+    evaluation = bool(tokens & {"eval", "evaluation", "test"})
+    if train == evaluation:
+        return None
+    return "train" if train else "eval"
 
 
 def _binding(
@@ -103,57 +119,68 @@ def _mapping_id(prefix: str, bindings: tuple[ArtifactBinding, ...]) -> str:
 def _inferred_mapping(
     artifacts: tuple[ArtifactCandidate, ...],
 ) -> tuple[MappingCandidate | None, tuple[_Ambiguity, ...]]:
-    grouped: dict[tuple[ArtifactKind, ExperimentRole], list[ArtifactCandidate]] = (
+    grouped: dict[
+        tuple[ArtifactKind, ExperimentRole, str | None],
+        list[ArtifactCandidate],
+    ] = (
         defaultdict(list)
     )
     for artifact in artifacts:
         role = _role(artifact.path)
+        split = _dataset_split(artifact.path) if artifact.kind is ArtifactKind.DATASET else None
         if artifact.kind in _MAPPED_KINDS and role in {
             ExperimentRole.BASELINE,
             ExperimentRole.CANDIDATE,
-        }:
-            grouped[(artifact.kind, role)].append(artifact)
+        } and (artifact.kind is not ArtifactKind.DATASET or split is not None):
+            grouped[(artifact.kind, role, split)].append(artifact)
 
     selected: list[tuple[ArtifactCandidate, ExperimentRole]] = []
     ambiguities: list[_Ambiguity] = []
     for kind in _MAPPED_KINDS:
         for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE):
-            candidates = sorted(
-                grouped.get((kind, role), ()),
-                key=lambda item: (
-                    -item.confidence.value,
-                    str(item.path).casefold(),
-                    str(item.path),
-                ),
+            splits: tuple[str | None, ...] = (
+                ("train", "eval")
+                if kind is ArtifactKind.DATASET
+                else (None,)
             )
-            if not candidates:
-                continue
-            if (
-                len(candidates) > 1
-                and candidates[0].confidence.value
-                - candidates[1].confidence.value
-                < 0.10
-            ):
-                affected = tuple(
-                    sorted(
-                        {
-                            claim_id
-                            for artifact in candidates
-                            for claim_id in artifact.relevant_claim_ids
-                        }
-                    )
+            for split in splits:
+                candidates = sorted(
+                    grouped.get((kind, role, split), ()),
+                    key=lambda item: (
+                        -item.confidence.value,
+                        str(item.path).casefold(),
+                        str(item.path),
+                    ),
                 )
-                ambiguities.append(
-                    _Ambiguity(
-                        kind=kind,
-                        role=role,
-                        artifacts=tuple(candidates),
-                        affected_claim_ids=affected,
-                        unlock_count=1,
+                if not candidates:
+                    continue
+                if (
+                    len(candidates) > 1
+                    and candidates[0].confidence.value
+                    - candidates[1].confidence.value
+                    < 0.10
+                ):
+                    affected = tuple(
+                        sorted(
+                            {
+                                claim_id
+                                for artifact in candidates
+                                for claim_id in artifact.relevant_claim_ids
+                            }
+                        )
                     )
-                )
-                continue
-            selected.append((candidates[0], role))
+                    ambiguities.append(
+                        _Ambiguity(
+                            kind=kind,
+                            role=role,
+                            split=split,
+                            artifacts=tuple(candidates),
+                            affected_claim_ids=affected,
+                            unlock_count=1,
+                        )
+                    )
+                    continue
+                selected.append((candidates[0], role))
 
     if not selected:
         return None, tuple(ambiguities)
@@ -165,9 +192,9 @@ def _inferred_mapping(
     bindings = tuple(
         _binding(artifact, role, provenance) for artifact, role in selected
     )
-    confidence = Confidence(
-        min(0.98, sum(item.confidence.value for item, _ in selected) / len(selected))
-    )
+    # Mapping confidence represents the unique, complete path-token role/split
+    # match. Artifact relevance confidence remains separately preserved.
+    confidence = Confidence(0.95)
     return (
         MappingCandidate(
             mapping_id=_mapping_id("inferred", bindings),
@@ -289,9 +316,13 @@ def _provider_mappings(
         raise DiscoveryError("provider mapping proposal is invalid") from error
 
 
-def _question_prompt(kind: ArtifactKind, role: ExperimentRole) -> str:
+def _question_prompt(
+    kind: ArtifactKind,
+    role: ExperimentRole,
+    split: str | None,
+) -> str:
     role_text = role.value
-    kind_text = kind.value
+    kind_text = f"{split} {kind.value}" if split is not None else kind.value
     return f"Which file contains the {role_text} {kind_text}?"
 
 
@@ -342,7 +373,7 @@ def _mapping_question(
     )
     return MappingQuestion(
         question_id=question_id,
-        prompt=_question_prompt(ambiguity.kind, ambiguity.role),
+        prompt=_question_prompt(ambiguity.kind, ambiguity.role, ambiguity.split),
         choices=tuple(choices),
         relevant_claim_id=relevant_claim_id,
     )
@@ -384,10 +415,25 @@ def resolve_mappings(
         if approved_mapping.repository != repository:
             raise DiscoveryError("approved mapping repository does not match discovery repository")
 
-    inferred, ambiguities = _inferred_mapping(artifacts)
+    inferred_candidates: list[MappingCandidate] = []
+    ambiguities: list[_Ambiguity] = []
+    seen_inferred_ids: set[str] = set()
+    artifact_scopes = (
+        tuple(
+            artifact
+            for artifact in artifacts
+            if claim.reference.claim_id in artifact.relevant_claim_ids
+        )
+        for claim in claims
+    ) if claims else (artifacts,)
+    for scoped_artifacts in artifact_scopes:
+        inferred, scoped_ambiguities = _inferred_mapping(scoped_artifacts)
+        ambiguities.extend(scoped_ambiguities)
+        if inferred is not None and inferred.mapping_id not in seen_inferred_ids:
+            inferred_candidates.append(inferred)
+            seen_inferred_ids.add(inferred.mapping_id)
     candidates = list(manifest_mappings)
-    if inferred is not None:
-        candidates.append(inferred)
+    candidates.extend(inferred_candidates)
     if provider_payload is not None:
         candidates.extend(_provider_mappings(provider_payload, artifacts, limits))
     unique: dict[str, MappingCandidate] = {}
@@ -408,9 +454,12 @@ def resolve_mappings(
     )
     question = None
     if approved_mapping is None and not manifest_mappings:
-        selected_slots = 0 if inferred is None else len(inferred.bindings)
+        selected_slots = max(
+            (len(candidate.bindings) for candidate in inferred_candidates),
+            default=0,
+        )
         question = _mapping_question(
-            ambiguities,
+            tuple(ambiguities),
             selected_slot_count=selected_slots,
         )
     return MappingResolution(

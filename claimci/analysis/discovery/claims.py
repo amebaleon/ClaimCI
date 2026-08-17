@@ -53,8 +53,8 @@ _VALUE_PAIR = re.compile(
 )
 _MINIMUM = re.compile(
     rf"(?:improved|increased|rose|grew)\s+by\s+at\s+least\s+"
-    rf"(?P<value>{_NUMBER})\s*"
-    rf"(?P<unit>%|percentage\s+points?|points?)(?![A-Za-z])",
+    rf"(?P<value>{_NUMBER})"
+    rf"(?:\s*(?P<unit>%|percentage\s+points?|points?))?(?![A-Za-z])",
     flags=re.IGNORECASE,
 )
 _WHITESPACE = re.compile(r"\s+")

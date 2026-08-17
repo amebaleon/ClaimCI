@@ -577,6 +577,21 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
     return bindings
 
 
+def _field_mapping_projection(
+    mappings: tuple[FieldMapping, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                item.target_field,
+                item.selector.kind.value,
+                item.selector.expression,
+            )
+            for item in mappings
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MappingCandidate:
     mapping_id: str
@@ -724,6 +739,61 @@ class RepoMapping:
                 detail=f"repository mapping explicitly approved by {approver}",
                 source_id=approver,
             ),
+        )
+        object.__setattr__(instance, "trust", MappingTrust.USER_APPROVED)
+        return instance
+
+    def scope_to_runtime_bindings(
+        self,
+        bindings: tuple[ArtifactBinding, ...],
+    ) -> RepoMapping:
+        """Narrow approved slots and attach only validated runtime adapter data."""
+
+        validated = _validate_bindings(bindings, "runtime-approved bindings")
+        approved_by_key = {
+            (item.path, item.kind, item.role): item for item in self.bindings
+        }
+        for binding in validated:
+            key = (binding.path, binding.kind, binding.role)
+            approved = approved_by_key.get(key)
+            if approved is None:
+                raise AnalysisContractError(
+                    "runtime binding is not an approved repository mapping slot"
+                )
+            if binding.adapter_id is None:
+                raise AnalysisContractError(
+                    "runtime-approved binding requires a validated adapter"
+                )
+            if approved.adapter_id is not None and (
+                binding.adapter_id != approved.adapter_id
+            ):
+                raise AnalysisContractError(
+                    "runtime adapter conflicts with the approved binding"
+                )
+            if approved.mappings and _field_mapping_projection(
+                binding.mappings
+            ) != _field_mapping_projection(approved.mappings):
+                raise AnalysisContractError(
+                    "runtime selectors conflict with the approved binding"
+                )
+            if binding.provenance != approved.provenance:
+                raise AnalysisContractError(
+                    "runtime binding provenance must preserve the approved slot"
+                )
+
+        if validated == self.bindings:
+            return self
+
+        instance = object.__new__(RepoMapping)
+        object.__setattr__(instance, "repository", self.repository)
+        object.__setattr__(instance, "bindings", validated)
+        object.__setattr__(instance, "approved_by", self.approved_by)
+        object.__setattr__(instance, "source_mapping_id", self.source_mapping_id)
+        object.__setattr__(instance, "source_trust", self.source_trust)
+        object.__setattr__(
+            instance,
+            "approval_provenance",
+            self.approval_provenance,
         )
         object.__setattr__(instance, "trust", MappingTrust.USER_APPROVED)
         return instance

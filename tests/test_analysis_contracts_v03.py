@@ -779,6 +779,48 @@ def test_repo_mapping_approval_rejects_subclassed_trust_inputs() -> None:
         )
 
 
+def test_repo_mapping_can_only_narrow_and_runtime_bind_approved_slots() -> None:
+    repository = RepositoryIdentity("amebaleon", "ClaimCI-Demo")
+    source_bindings = (
+        _binding(
+            "base/config.yaml",
+            ArtifactKind.CONFIG,
+            ExperimentRole.BASELINE,
+        ),
+        _binding(
+            "candidate/config.yaml",
+            ArtifactKind.CONFIG,
+            ExperimentRole.CANDIDATE,
+        ),
+    )
+    approved = RepoMapping.approve(
+        repository,
+        _mapping_candidate(bindings=source_bindings),
+        approved_by="owner:amebaleon",
+    )
+    runtime_binding = dataclasses.replace(
+        source_bindings[0],
+        adapter_id="claimci-yaml-config-v1",
+        mappings=(_mapping(),),
+    )
+
+    scoped = approved.scope_to_runtime_bindings((runtime_binding,))
+
+    assert scoped is not approved
+    assert scoped.repository == approved.repository
+    assert scoped.bindings == (runtime_binding,)
+    assert scoped.approved_by == approved.approved_by
+    assert scoped.source_mapping_id == approved.source_mapping_id
+    assert scoped.source_trust is approved.source_trust
+    assert scoped.approval_provenance == approved.approval_provenance
+    assert scoped.trust is MappingTrust.USER_APPROVED
+
+    with pytest.raises((TypeError, ValueError), match="approved|binding|slot"):
+        approved.scope_to_runtime_bindings(
+            (dataclasses.replace(runtime_binding, path=RepositoryPath("other.yaml")),)
+        )
+
+
 def test_provider_mapping_can_only_become_approved_through_explicit_transition() -> None:
     proposed = _mapping_candidate(
         provenance=FieldProvenance(

@@ -162,11 +162,17 @@ from-to value pair alone never supplies that threshold.
 
 Repository identity, head SHA, PR number, artifacts, mapping candidates,
 approved mapping, and any upstream bounded mapping question are carried forward
-without trust elevation. Normalized evidence must refer to artifacts issued by
-the same `DiscoveryResult` and relevant to the selected claim. Artifact issues
-may inform controlled missing-evidence reporting but are never treated as
-observations. The converter does not use `DiscoveryResult.preferred_mapping` as
-an authorization shortcut; the planner applies the full mapping policy itself.
+without trust elevation. The repository-wide `DiscoveryResult` is narrowed to
+the selected claim ID: only artifacts whose `relevant_claim_ids` contain that
+claim, normalized evidence issued for those artifacts, mapping bindings over
+those artifacts, and a question relevant to that claim may cross the boundary.
+An unrelated artifact or question for another discovered claim cannot reject or
+block the selected claim. Normalized evidence must still refer to an artifact
+issued by the exact concrete `DiscoveryResult`; structurally similar duck-typed
+objects are rejected. Artifact issues may inform controlled missing-evidence
+reporting but are never treated as observations. The converter does not use
+`DiscoveryResult.preferred_mapping` as an authorization shortcut; the planner
+applies the full mapping policy itself.
 
 The conversion preserves provider provenance. A provider-discovered claim still
 requires this validation boundary, and a provider-originated mapping still
@@ -206,8 +212,11 @@ native representation.
 
 ## Mapping trust and automatic selection
 
-An applicable `RepoMapping` is a separate, explicit user-approval transition
-and has higher trust than an inferred proposal. A current-head manifest hint is
+An applicable, runtime-valid `RepoMapping` is a separate, explicit
+user-approval transition and has precedence over every manifest, inferred, or
+provider proposal. Unapproved alternatives neither override nor block that
+mapping. A stale or runtime-invalid approved binding fails closed and prevents
+fallback to lower-trust candidates. A current-head manifest hint is
 an optional high-confidence advanced input. In the hosted path,
 `MappingTrust.MANIFEST_HINT` and confidence such as `0.99` do not elevate the
 candidate to `USER_APPROVED`, create a reusable repository mapping, or bypass
@@ -473,10 +482,10 @@ provider or artifact content is not copied into controlled public error text.
 The branch must pass these end-to-end acceptance scenarios through public
 interfaces:
 
-- **A. Zero-manifest full audit:** JSON/CSV-style adapter fakes provide valid
-  normalized results and config evidence plus selected passive JSONL datasets;
-  the hosted entry point creates an ephemeral plan, runs the existing Audit,
-  runs one advisory synthesis, and returns one unified result.
+- **A. Zero-manifest full audit:** registered CSV/YAML adapters provide valid
+  normalized results and config evidence plus bounded selected passive JSONL
+  dataset identity; the hosted entry point creates an ephemeral plan, runs the
+  existing Audit, runs one advisory synthesis, and returns one unified result.
 - **B. Native-manifest compatibility:** an existing user-authored
   `research.yaml` follows the unchanged native path and produces the same
   deterministic verdict and rendered bytes as before where applicable.
@@ -526,9 +535,21 @@ Focused tests cover:
 17. completed `INSUFFICIENT_EVIDENCE` Audit plus Review yielding `COMPLETE`;
 18. all requested scenarios A through I through the hosted entry point.
 
-Test fakes implement only the shared discovery/adapter/provider interfaces.
-They do not become production discovery algorithms or concrete adapters. Tests
+Remaining dataset/provider fakes implement only bounded shared interfaces. They
+do not become production discovery algorithms or concrete adapters. Tests
 perform no provider, network, workflow, or customer-code execution.
+
+The pre-merge integration gate additionally uses the concrete Auto Discovery
+and Adapter implementations. It exercises `discover_repository()`, registered
+CSV/YAML adapter `probe()` and `extract()`, generic `UNSPECIFIED` normalized
+observations plus explicit mapping roles, planner conversion, confined
+materialization, the real `audit_research()`, and `run_unified_analysis()`.
+Because the current registered adapters intentionally do not parse dataset
+formats, those integration tests use only a bounded passive dataset-identity
+stub; production dataset bytes remain selected and copied without execution.
+The concrete regression matrix includes a repository with multiple claims,
+approved-versus-inferred precedence, the manifest automatic-use gate, explicit
+provider approval, and hosted scenarios A through I.
 
 The final branch gate is:
 
@@ -545,11 +566,13 @@ all A-I scenarios against this design before publication.
 ## Compatibility and consumer guidance
 
 - Existing CLI and user-authored manifest behavior remain unchanged.
-- Auto Discovery supplies `ClaimReference`, optional `ClaimedMetricValue`
-  records, artifacts, and inferred provenance; it does not grant mapping or
-  verdict authority.
-- Adapter branches supply typed mappings and normalized evidence from passive
-  bytes; they must not execute repository content.
+- Auto Discovery supplies concrete `DiscoveryResult`, `DiscoveredClaim`,
+  `ClaimReference`, optional `ClaimedMetricValue`, scoped artifacts, mapping
+  proposals, and provenance; it does not grant mapping or verdict authority.
+- Registered adapters supply typed selectors and normalized evidence from
+  passive bytes with `UNSPECIFIED` experiment roles where the artifact itself
+  does not encode a role. The selected mapping assigns baseline/candidate roles;
+  adapters must not execute repository content.
 - The hosted runner supplies a trusted current-head `RuntimeExecutionContext`
   with repository identity, checkout root, and invocation-private scratch root,
   then calls `run_unified_analysis()`.

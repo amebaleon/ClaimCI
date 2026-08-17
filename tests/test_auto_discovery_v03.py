@@ -511,6 +511,26 @@ def test_metric_claims_capture_only_explicit_values_and_thresholds(tmp_path: Pat
     )
 
 
+def test_metric_claim_captures_unitless_explicit_absolute_threshold(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    context = collect_repository_context(
+        head,
+        pr_description="Accuracy improved by at least 0.05.",
+        limits=DiscoveryLimits(),
+    )
+
+    claims = discover_claims(context, limits=DiscoveryLimits())
+
+    assert len(claims) == 1
+    assert claims[0].metric == "accuracy"
+    assert claims[0].minimum_improvement is not None
+    assert claims[0].minimum_improvement.value == 0.05
+    assert claims[0].minimum_improvement.unit is None
+
+
 def test_discovery_supports_all_existing_claim_categories_and_multiple_claims(
     tmp_path: Path,
 ) -> None:

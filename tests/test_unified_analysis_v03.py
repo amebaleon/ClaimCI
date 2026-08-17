@@ -14,10 +14,12 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactKind,
     Confidence,
+    ExperimentRole,
     GitCommitSha,
     MappingCandidate,
     PlanningRequest,
     ProvenanceKind,
+    RepositoryPath,
     RepositoryIdentity,
     Sha256Digest,
     UnifiedAnalysisResult,
@@ -114,12 +116,47 @@ def _without_datasets(request: PlanningRequest) -> PlanningRequest:
 
 def _ambiguous(request: PlanningRequest) -> PlanningRequest:
     first = request.mapping_candidates[0]
+    original = next(
+        item
+        for item in request.normalized_evidence
+        if item.artifact.kind is ArtifactKind.RESULTS
+        and {
+            observation.experiment_role for observation in item.observations
+        } == {ExperimentRole.CANDIDATE}
+    )
+    alternative_path = RepositoryPath("results/candidate-alternative.json")
+    alternative_artifact = dataclasses.replace(
+        original.artifact,
+        path=alternative_path,
+        sha256=Sha256Digest("b" * 64),
+        discovery_reason="second current-head candidate results artifact",
+    )
+    alternative_evidence = dataclasses.replace(
+        original,
+        evidence_id="evidence-candidate-results-alternative",
+        artifact=alternative_artifact,
+        adapter_match=dataclasses.replace(
+            original.adapter_match,
+            path=alternative_path,
+        ),
+    )
     second = dataclasses.replace(
         first,
         mapping_id="mapping-alternative",
-        bindings=tuple(reversed(first.bindings)),
+        bindings=tuple(
+            dataclasses.replace(binding, path=alternative_path)
+            if binding.path == original.artifact.path
+            and binding.kind is ArtifactKind.RESULTS
+            else binding
+            for binding in first.bindings
+        ),
     )
-    return dataclasses.replace(request, mapping_candidates=(first, second))
+    return dataclasses.replace(
+        request,
+        artifacts=(*request.artifacts, alternative_artifact),
+        normalized_evidence=(*request.normalized_evidence, alternative_evidence),
+        mapping_candidates=(first, second),
+    )
 
 
 def _provider_mapping(request: PlanningRequest) -> PlanningRequest:

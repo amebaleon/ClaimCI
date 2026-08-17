@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -25,6 +25,7 @@ from .contracts import (
     ClaimedMetricValue,
     EphemeralAuditPlan,
     ExperimentRole,
+    FieldMapping,
     FieldProvenance,
     GitCommitSha,
     MappingCandidate,
@@ -212,20 +213,17 @@ class PlanningOutcome:
             )
 
 
-def _discovery_attribute(value: object, name: str) -> object:
-    try:
-        return getattr(value, name)
-    except AttributeError as error:
-        raise TypeError(f"discovery result is missing {name}") from error
-
-
 def _claimed_value(
     value: object,
     role: ExperimentRole,
 ) -> ClaimedMetricValue:
-    number = _discovery_attribute(value, "value")
-    unit = _discovery_attribute(value, "unit")
-    provenance = _discovery_attribute(value, "provenance")
+    from .discovery.models import ClaimedValue
+
+    if type(value) is not ClaimedValue:
+        raise TypeError("discovery claimed value must be ClaimedValue")
+    number = value.value
+    unit = value.unit
+    provenance = value.provenance
     if isinstance(number, bool) or not isinstance(number, (int, float)):
         raise TypeError("discovery claimed value must be numeric")
     if not math.isfinite(float(number)):
@@ -246,14 +244,18 @@ def _validated_explicit_threshold(
     source_text: str,
     minimum: object | None,
 ) -> tuple[float | None, FieldProvenance | None]:
+    from .discovery.models import ClaimedValue
+
     if minimum is None:
         return None, None
+    if type(minimum) is not ClaimedValue:
+        raise TypeError("discovery threshold must be ClaimedValue")
     match = _BOUNDED_THRESHOLD.search(source_text)
     if match is None:
         return None, None
-    raw_value = _discovery_attribute(minimum, "value")
-    unit = _discovery_attribute(minimum, "unit")
-    provenance = _discovery_attribute(minimum, "provenance")
+    raw_value = minimum.value
+    unit = minimum.unit
+    provenance = minimum.provenance
     if unit is not None:
         # Auto Discovery does not yet normalize percentage-point units into
         # native metric units, so conversion would be lossy.
@@ -276,6 +278,226 @@ def _validated_explicit_threshold(
     return float(source_value), provenance
 
 
+def _binding_key(binding: ArtifactBinding) -> tuple[RepositoryPath, ArtifactKind]:
+    return binding.path, binding.kind
+
+
+def _field_mapping_projection(
+    mappings: tuple[FieldMapping, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                item.target_field,
+                item.selector.kind.value,
+                item.selector.expression,
+            )
+            for item in mappings
+        )
+    )
+
+
+def _hydrate_binding(
+    binding: ArtifactBinding,
+    evidence_by_key: dict[
+        tuple[RepositoryPath, ArtifactKind],
+        NormalizedEvidence,
+    ],
+) -> ArtifactBinding:
+    evidence = evidence_by_key.get(_binding_key(binding))
+    if evidence is None:
+        return binding
+    runtime = evidence.adapter_match
+    if binding.adapter_id is not None and binding.adapter_id != runtime.adapter_id:
+        return binding
+    if binding.mappings and _field_mapping_projection(
+        binding.mappings
+    ) != _field_mapping_projection(runtime.mappings):
+        return binding
+    return replace(
+        binding,
+        adapter_id=runtime.adapter_id,
+        mappings=runtime.mappings,
+    )
+
+
+def _scoped_mapping_id(
+    claim_id: str,
+    candidate: MappingCandidate,
+    bindings: tuple[ArtifactBinding, ...],
+) -> str:
+    material = {
+        "claim_id": claim_id,
+        "trust": candidate.trust.value,
+        "provenance_kind": candidate.provenance.kind.value,
+        "bindings": sorted(_binding_signature(item) for item in bindings),
+    }
+    canonical = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "mapping-scoped-" + hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _scoped_candidate_confidence(
+    candidate: MappingCandidate,
+) -> Confidence:
+    # Claim scoping narrows an already-issued mapping; it does not create a new
+    # inference or justify changing the issuer's confidence assessment.
+    return candidate.confidence
+
+
+def _scope_mapping_candidates(
+    candidates: tuple[MappingCandidate, ...],
+    *,
+    claim_id: str,
+    selected_artifacts: tuple[ArtifactCandidate, ...],
+    selected_evidence: tuple[NormalizedEvidence, ...],
+) -> tuple[MappingCandidate, ...]:
+    selected_keys = {
+        (item.path, item.kind) for item in selected_artifacts
+    }
+    evidence_by_key = {
+        (item.artifact.path, item.artifact.kind): item for item in selected_evidence
+    }
+    scoped: list[MappingCandidate] = []
+    seen: set[tuple[object, ...]] = set()
+    for candidate in candidates:
+        if type(candidate) is not MappingCandidate:
+            raise TypeError("discovery mapping candidates must be MappingCandidate values")
+        bindings = tuple(
+            _hydrate_binding(binding, evidence_by_key)
+            for binding in candidate.bindings
+            if _binding_key(binding) in selected_keys
+        )
+        if not bindings:
+            continue
+        signature = (
+            candidate.trust,
+            candidate.provenance.kind,
+            tuple(sorted(_binding_signature(item) for item in bindings)),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        scoped.append(
+            MappingCandidate(
+                mapping_id=_scoped_mapping_id(claim_id, candidate, bindings),
+                bindings=bindings,
+                confidence=_scoped_candidate_confidence(candidate),
+                trust=candidate.trust,
+                provenance=candidate.provenance,
+            )
+        )
+    return tuple(scoped)
+
+
+def _scope_approved_mapping(
+    approved: RepoMapping | None,
+    *,
+    all_artifacts: tuple[ArtifactCandidate, ...],
+    selected_artifacts: tuple[ArtifactCandidate, ...],
+    selected_evidence: tuple[NormalizedEvidence, ...],
+) -> RepoMapping | None:
+    if approved is None:
+        return None
+    if type(approved) is not RepoMapping:
+        raise TypeError("discovery approved mapping must be RepoMapping")
+    all_keys = {(item.path, item.kind) for item in all_artifacts}
+    selected_keys = {(item.path, item.kind) for item in selected_artifacts}
+    evidence_by_key = {
+        (item.artifact.path, item.artifact.kind): item for item in selected_evidence
+    }
+    selected_bindings: list[ArtifactBinding] = []
+    stale = False
+    for binding in approved.bindings:
+        key = _binding_key(binding)
+        if key in selected_keys:
+            selected_bindings.append(_hydrate_binding(binding, evidence_by_key))
+        elif key not in all_keys:
+            stale = True
+    if stale:
+        return approved
+    if not selected_bindings:
+        return None
+    try:
+        return approved.scope_to_runtime_bindings(tuple(selected_bindings))
+    except (AnalysisContractError, TypeError):
+        # Preserve the invalid approval so planning cannot silently fall back
+        # to a lower-trust automatic proposal.
+        return approved
+
+
+def _scoped_choice_id(
+    claim_id: str,
+    bindings: tuple[ArtifactBinding, ...],
+) -> str:
+    canonical = json.dumps(
+        {
+            "claim_id": claim_id,
+            "bindings": sorted(_binding_signature(item) for item in bindings),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "choice-scoped-" + hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _scope_mapping_question(
+    question: MappingQuestion | None,
+    *,
+    claim_id: str,
+    selected_artifacts: tuple[ArtifactCandidate, ...],
+    selected_evidence: tuple[NormalizedEvidence, ...],
+) -> MappingQuestion | None:
+    if question is None:
+        return None
+    if type(question) is not MappingQuestion:
+        raise TypeError("discovery mapping question must be MappingQuestion")
+    if question.relevant_claim_id not in {None, claim_id}:
+        return None
+    selected_keys = {(item.path, item.kind) for item in selected_artifacts}
+    evidence_by_key = {
+        (item.artifact.path, item.artifact.kind): item for item in selected_evidence
+    }
+    choices: list[MappingChoice] = []
+    seen: set[tuple[tuple[object, ...], ...]] = set()
+    for choice in question.choices:
+        bindings = tuple(
+            _hydrate_binding(binding, evidence_by_key)
+            for binding in choice.bindings
+            if _binding_key(binding) in selected_keys
+        )
+        if not bindings:
+            continue
+        signature = tuple(sorted(_binding_signature(item) for item in bindings))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        choices.append(
+            MappingChoice(
+                choice_id=_scoped_choice_id(claim_id, bindings),
+                label=choice.label,
+                bindings=bindings,
+            )
+        )
+    if not 2 <= len(choices) <= 8:
+        return None
+    question_material = "|".join(item.choice_id for item in choices)
+    return MappingQuestion(
+        question_id="question-scoped-"
+        + hashlib.sha256(question_material.encode("utf-8")).hexdigest()[:16],
+        prompt=question.prompt,
+        choices=tuple(choices),
+        relevant_claim_id=claim_id,
+    )
+
+
 def planning_request_from_discovery(
     discovery: "DiscoveryResult",
     *,
@@ -284,59 +506,30 @@ def planning_request_from_discovery(
 ) -> PlanningRequest:
     """Convert one issued discovery claim without elevating mapping trust."""
 
-    repository = _discovery_attribute(discovery, "repository")
-    head_sha = _discovery_attribute(discovery, "head_sha")
-    pr_number = _discovery_attribute(discovery, "pr_number")
-    claims = _discovery_attribute(discovery, "claims")
-    artifacts = _discovery_attribute(discovery, "artifacts")
-    mapping_candidates = _discovery_attribute(discovery, "mapping_candidates")
-    approved_mapping = _discovery_attribute(discovery, "approved_mapping")
-    mapping_question = _discovery_attribute(discovery, "mapping_question")
-    repository_paths = _discovery_attribute(discovery, "repository_paths")
-    changed_paths = _discovery_attribute(discovery, "changed_paths")
-    artifact_issues = _discovery_attribute(discovery, "artifact_issues")
-    if type(repository) is not RepositoryIdentity:
-        raise TypeError("discovery repository must be RepositoryIdentity")
-    if not isinstance(head_sha, GitCommitSha):
-        head_sha = GitCommitSha(head_sha)
-    if not isinstance(claims, tuple):
-        raise TypeError("discovery claims must be a tuple")
-    if not isinstance(repository_paths, tuple) or not all(
-        isinstance(item, RepositoryPath) for item in repository_paths
-    ):
-        raise TypeError("discovery repository_paths must be RepositoryPath values")
-    if len(set(repository_paths)) != len(repository_paths):
-        raise AnalysisContractError("discovery repository_paths must be unique")
-    if not isinstance(changed_paths, tuple) or not all(
-        isinstance(item, RepositoryPath) for item in changed_paths
-    ):
-        raise TypeError("discovery changed_paths must be RepositoryPath values")
-    if not set(changed_paths).issubset(repository_paths):
-        raise AnalysisContractError(
-            "discovery changed_paths must be issued repository paths"
-        )
-    if not isinstance(artifact_issues, tuple):
-        raise TypeError("discovery artifact_issues must be a tuple")
-    for issue in artifact_issues:
-        if not isinstance(getattr(issue, "path", None), RepositoryPath) or not isinstance(
-            getattr(issue, "reason", None), str
-        ):
-            raise TypeError("discovery artifact issue has an invalid shape")
+    from .discovery.models import DiscoveredClaim, DiscoveryResult
+
+    if type(discovery) is not DiscoveryResult:
+        raise TypeError("planning conversion requires concrete DiscoveryResult")
+    repository = discovery.repository
+    head_sha = discovery.head_sha
+    pr_number = discovery.pr_number
+    claims = discovery.claims
+    artifacts = discovery.artifacts
+    repository_paths = discovery.repository_paths
     selected = tuple(
         item
         for item in claims
-        if isinstance(getattr(item, "reference", None), ClaimReference)
-        and item.reference.claim_id == claim_id
+        if type(item) is DiscoveredClaim and item.reference.claim_id == claim_id
     )
     if len(selected) != 1:
         raise AnalysisContractError(
             "discovery must issue exactly one selected claim identifier"
         )
     discovered_claim = selected[0]
-    reference = _discovery_attribute(discovered_claim, "reference")
+    reference = discovered_claim.reference
     if type(reference) is not ClaimReference:
         raise TypeError("discovered claim reference must be ClaimReference")
-    source = _discovery_attribute(discovered_claim, "source")
+    source = discovered_claim.source
     if type(source) is not SourceLocation:
         raise TypeError("discovered claim source must be SourceLocation")
     if source.kind is SourceKind.REPOSITORY_FILE:
@@ -352,7 +545,7 @@ def planning_request_from_discovery(
         raise AnalysisContractError(
             "pull-request discovered claim cannot carry a repository path"
         )
-    evidence_hints = _discovery_attribute(discovered_claim, "evidence_hints")
+    evidence_hints = discovered_claim.evidence_hints
     if not isinstance(evidence_hints, tuple) or not all(
         isinstance(item, RepositoryPath) for item in evidence_hints
     ):
@@ -361,22 +554,22 @@ def planning_request_from_discovery(
         raise AnalysisContractError(
             "discovered claim evidence hints must be issued repository paths"
         )
-    if _discovery_attribute(discovered_claim, "claim_type") is not ClaimType.METRIC_IMPROVEMENT:
+    if discovered_claim.claim_type is not ClaimType.METRIC_IMPROVEMENT:
         raise AnalysisContractError(
             "current deterministic planner supports metric improvement claims"
         )
-    metric = _discovery_attribute(discovered_claim, "metric")
+    metric = discovered_claim.metric
     if not isinstance(metric, str) or not metric.strip():
         raise AnalysisContractError("discovered audit metric is unavailable")
-    discovered_direction = _discovery_attribute(discovered_claim, "direction")
+    discovered_direction = discovered_claim.direction
     direction = {
         ClaimDirection.HIGHER: Direction.HIGHER,
         ClaimDirection.LOWER: Direction.LOWER,
     }.get(discovered_direction)
     if direction is None:
         raise AnalysisContractError("discovered audit direction is unavailable")
-    baseline = _discovery_attribute(discovered_claim, "baseline_value")
-    candidate = _discovery_attribute(discovered_claim, "candidate_value")
+    baseline = discovered_claim.baseline_value
+    candidate = discovered_claim.candidate_value
     claimed_values: tuple[ClaimedMetricValue, ...] = ()
     if (baseline is None) != (candidate is None):
         raise AnalysisContractError(
@@ -389,7 +582,7 @@ def planning_request_from_discovery(
         )
     threshold, threshold_provenance = _validated_explicit_threshold(
         reference.text,
-        _discovery_attribute(discovered_claim, "minimum_improvement"),
+        discovered_claim.minimum_improvement,
     )
     audit_claim = AuditClaimSpec(
         claim_id=reference.claim_id,
@@ -409,21 +602,51 @@ def planning_request_from_discovery(
         raise AnalysisContractError(
             "discovery artifacts must use issued repository paths"
         )
-    if any(reference.claim_id not in item.relevant_claim_ids for item in artifacts):
+    if not isinstance(normalized_evidence, tuple) or not all(
+        type(item) is NormalizedEvidence for item in normalized_evidence
+    ):
+        raise TypeError("normalized_evidence must contain NormalizedEvidence values")
+    issued_artifacts = set(artifacts)
+    if any(item.artifact not in issued_artifacts for item in normalized_evidence):
         raise AnalysisContractError(
-            "discovery artifacts must be relevant to the selected claim"
+            "normalized evidence artifact was not issued by discovery"
         )
+    selected_artifacts = tuple(
+        item for item in artifacts if reference.claim_id in item.relevant_claim_ids
+    )
+    selected_artifact_set = set(selected_artifacts)
+    selected_evidence = tuple(
+        item for item in normalized_evidence if item.artifact in selected_artifact_set
+    )
+    scoped_candidates = _scope_mapping_candidates(
+        discovery.mapping_candidates,
+        claim_id=reference.claim_id,
+        selected_artifacts=selected_artifacts,
+        selected_evidence=selected_evidence,
+    )
+    scoped_approved = _scope_approved_mapping(
+        discovery.approved_mapping,
+        all_artifacts=artifacts,
+        selected_artifacts=selected_artifacts,
+        selected_evidence=selected_evidence,
+    )
+    scoped_question = _scope_mapping_question(
+        discovery.mapping_question,
+        claim_id=reference.claim_id,
+        selected_artifacts=selected_artifacts,
+        selected_evidence=selected_evidence,
+    )
     return PlanningRequest(
         repository=repository,
         pr_number=pr_number,
         head_sha=head_sha,
         claim=reference,
         audit_claim=audit_claim,
-        artifacts=artifacts,  # type: ignore[arg-type]
-        normalized_evidence=normalized_evidence,
-        mapping_candidates=mapping_candidates,  # type: ignore[arg-type]
-        approved_mapping=approved_mapping,  # type: ignore[arg-type]
-        upstream_mapping_question=mapping_question,  # type: ignore[arg-type]
+        artifacts=selected_artifacts,
+        normalized_evidence=selected_evidence,
+        mapping_candidates=scoped_candidates,
+        approved_mapping=scoped_approved,
+        upstream_mapping_question=scoped_question,
     )
 
 
@@ -659,35 +882,34 @@ def _select_mapping(
         if _mapping_is_runtime_revalidatable(item, request)
     )
     approved = request.approved_mapping
-    if approved is not None and _mapping_is_runtime_revalidatable(approved, request):
-        approved_signature = _mapping_signature(approved)
-        strong_conflicts = tuple(
-            item
-            for item in valid_candidates
-            if item.confidence.value >= 0.90
-            and _mapping_signature(item) != approved_signature
-        )
-        if not strong_conflicts:
+    if approved is not None:
+        if _mapping_is_runtime_revalidatable(approved, request):
             return approved
         return None
 
-    if len(valid_candidates) != 1:
+    signatures = {_mapping_signature(item) for item in valid_candidates}
+    if len(signatures) != 1:
         return None
-    candidate = valid_candidates[0]
-    strong_others = tuple(
+    eligible = tuple(
         item
-        for item in request.mapping_candidates
-        if item is not candidate and item.confidence.value >= 0.90
+        for item in valid_candidates
+        if item.confidence.value >= 0.90
+        and item.provenance.kind is not ProvenanceKind.PROVIDER_PROPOSAL
     )
-    if strong_others:
+    if not eligible:
         return None
-    if candidate.trust is MappingTrust.MANIFEST_HINT:
-        return candidate
-    if candidate.confidence.value < 0.90:
-        return None
-    if candidate.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL:
-        return None
-    return candidate
+    provenance_priority = {
+        ProvenanceKind.DETERMINISTIC_DISCOVERY: 0,
+        ProvenanceKind.MANIFEST_HINT: 1,
+    }
+    return min(
+        eligible,
+        key=lambda item: (
+            provenance_priority.get(item.provenance.kind, 2),
+            -item.confidence.value,
+            item.mapping_id,
+        ),
+    )
 
 
 def _mapping_question(
