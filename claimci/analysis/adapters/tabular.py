@@ -186,6 +186,7 @@ def _row_value(
 class CsvAdapter:
     """Generic CSV observations with exact-column selectors only."""
 
+    __slots__ = ()
     adapter_id = "claimci-csv-v1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:

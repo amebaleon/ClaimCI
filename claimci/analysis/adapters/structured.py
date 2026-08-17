@@ -299,6 +299,7 @@ def _common_leaves(
 class JsonAdapter:
     """Generic finite JSON evidence adapter."""
 
+    __slots__ = ()
     adapter_id = "claimci-json-v1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
@@ -417,6 +418,7 @@ class JsonAdapter:
 class JsonLinesAdapter:
     """Generic JSONL adapter whose selectors apply to each record."""
 
+    __slots__ = ()
     adapter_id = "claimci-jsonl-v1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:

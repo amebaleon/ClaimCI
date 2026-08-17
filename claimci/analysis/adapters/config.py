@@ -82,6 +82,7 @@ def _parse_toml(content: bytes) -> Mapping[str, object]:
 
 
 class _ConfigAdapter:
+    __slots__ = ()
     adapter_id: str
     suffixes: frozenset[str]
 
@@ -180,6 +181,7 @@ class _ConfigAdapter:
 class YamlConfigAdapter(_ConfigAdapter):
     """Safe duplicate-rejecting YAML config adapter."""
 
+    __slots__ = ()
     adapter_id = "claimci-yaml-config-v1"
     suffixes = frozenset({".yaml", ".yml"})
 
@@ -195,6 +197,7 @@ class YamlConfigAdapter(_ConfigAdapter):
 class TomlConfigAdapter(_ConfigAdapter):
     """Standard-library TOML config adapter."""
 
+    __slots__ = ()
     adapter_id = "claimci-toml-config-v1"
     suffixes = frozenset({".toml"})
 
