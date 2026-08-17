@@ -19,7 +19,7 @@ from claimci.analysis import (
     ClaimReference,
     Confidence,
     ConfigValue,
-    DatasetReference,
+    DatasetSplit,
     EphemeralAuditPlan,
     EvidenceSelector,
     ExperimentRole,
@@ -33,6 +33,7 @@ from claimci.analysis import (
     MaterializationUnavailable,
     NormalizedEvidence,
     NormalizedObservation,
+    PassiveArtifact,
     ProvenanceKind,
     RepositoryIdentity,
     RepositoryPath,
@@ -42,6 +43,7 @@ from claimci.analysis import (
     execute_ephemeral_audit,
     derive_ephemeral_plan_id,
 )
+from claimci.analysis.adapters import extract_registered_artifact
 from claimci.models import AuditResult, Direction, Verdict
 
 
@@ -160,38 +162,20 @@ def _normalized_config(
 
 def _normalized_dataset(
     artifact: ArtifactCandidate,
-    role: ExperimentRole,
-    split: str,
+    content: bytes,
 ) -> NormalizedEvidence:
-    provenance = _provenance(str(artifact.path), f"adapter:{artifact.path}")
-    mapping = FieldMapping(
-        "dataset.path",
-        EvidenceSelector(SelectorKind.DOTTED_PATH, "dataset.path", provenance),
-        provenance,
-    )
-    return NormalizedEvidence(
-        f"evidence-{str(artifact.path).replace('/', '-')}",
-        artifact,
-        AdapterMatch(
-            "fixture.dataset",
-            artifact.path,
-            Confidence(0.98),
-            (mapping,),
-            (provenance,),
-        ),
-        (
-            NormalizedObservation(
-                provenance=provenance,
-                experiment_role=role,
-                dataset_references=(
-                    DatasetReference(artifact.path, split, provenance),
-                ),
-            ),
-        ),
-    )
+    evidence = extract_registered_artifact(PassiveArtifact(artifact, content))
+    assert evidence is not None
+    assert evidence.adapter_match.adapter_id == "claimci-jsonl-dataset-v1"
+    return evidence
 
 
-def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBinding:
+def _binding(
+    evidence: NormalizedEvidence,
+    role: ExperimentRole,
+    *,
+    dataset_split: DatasetSplit | None = None,
+) -> ArtifactBinding:
     return ArtifactBinding(
         evidence.artifact.path,
         evidence.artifact.kind,
@@ -199,6 +183,7 @@ def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBind
         evidence.adapter_match.adapter_id,
         evidence.adapter_match.mappings,
         evidence.adapter_match.match_evidence[0],
+        dataset_split,
     )
 
 
@@ -207,6 +192,7 @@ def _plan_fixture(
     *,
     candidate_seed: int | str | None = 11,
     partial_config: bool = False,
+    candidate_train_content: bytes = b'{"id":"shared"}\n{"id":"candidate-train"}\n',
 ) -> tuple[EphemeralAuditPlan, RuntimeExecutionContext, Path, Path]:
     checkout = tmp_path / "checkout"
     scratch = tmp_path / "scratch"
@@ -274,57 +260,78 @@ def _plan_fixture(
         ExperimentRole.CANDIDATE,
         candidate_config_values,
     )
+    baseline_train_content = b'{"id":"baseline-train"}\n'
+    baseline_eval_content = b'{"id":"shared"}\n'
+    candidate_eval_content = b'{"id":"shared"}\n'
     datasets = (
         _normalized_dataset(
             _write_artifact(
                 checkout,
                 "data/baseline-train.jsonl",
                 ArtifactKind.DATASET,
-                b'{"id":"baseline-train"}\n',
+                baseline_train_content,
             ),
-            ExperimentRole.BASELINE,
-            "train",
+            baseline_train_content,
         ),
         _normalized_dataset(
             _write_artifact(
                 checkout,
                 "data/baseline-eval.jsonl",
                 ArtifactKind.DATASET,
-                b'{"id":"shared"}\n',
+                baseline_eval_content,
             ),
-            ExperimentRole.BASELINE,
-            "eval",
+            baseline_eval_content,
         ),
         _normalized_dataset(
             _write_artifact(
                 checkout,
                 "data/candidate-train.jsonl",
                 ArtifactKind.DATASET,
-                b'{"id":"shared"}\n{"id":"candidate-train"}\n',
+                candidate_train_content,
             ),
-            ExperimentRole.CANDIDATE,
-            "train",
+            candidate_train_content,
         ),
         _normalized_dataset(
             _write_artifact(
                 checkout,
                 "data/candidate-eval.jsonl",
                 ArtifactKind.DATASET,
-                b'{"id":"shared"}\n',
+                candidate_eval_content,
             ),
-            ExperimentRole.CANDIDATE,
-            "eval",
+            candidate_eval_content,
         ),
     )
     baseline = (baseline_results, baseline_config, *datasets[:2])
     candidate = (candidate_results, candidate_config, *datasets[2:])
-    all_evidence = (*baseline, *candidate)
+    bindings = (
+        _binding(baseline_results, ExperimentRole.BASELINE),
+        _binding(baseline_config, ExperimentRole.BASELINE),
+        _binding(
+            datasets[0],
+            ExperimentRole.BASELINE,
+            dataset_split=DatasetSplit.TRAIN,
+        ),
+        _binding(
+            datasets[1],
+            ExperimentRole.BASELINE,
+            dataset_split=DatasetSplit.EVAL,
+        ),
+        _binding(candidate_results, ExperimentRole.CANDIDATE),
+        _binding(candidate_config, ExperimentRole.CANDIDATE),
+        _binding(
+            datasets[2],
+            ExperimentRole.CANDIDATE,
+            dataset_split=DatasetSplit.TRAIN,
+        ),
+        _binding(
+            datasets[3],
+            ExperimentRole.CANDIDATE,
+            dataset_split=DatasetSplit.EVAL,
+        ),
+    )
     mapping = MappingCandidate(
         "mapping-fixture",
-        tuple(
-            _binding(item, ExperimentRole.BASELINE) for item in baseline
-        )
-        + tuple(_binding(item, ExperimentRole.CANDIDATE) for item in candidate),
+        bindings,
         Confidence(0.98),
         MappingTrust.INFERRED,
         FieldProvenance(
@@ -522,9 +529,13 @@ def test_native_conversion_contains_only_normalized_runs_config_and_passive_data
         observed["baseline_config"] = (
             artifact_root / "baseline" / "config.yaml"
         ).read_text("utf-8")
-        observed["candidate_train"] = (
-            artifact_root / "candidate" / "train.jsonl"
-        ).read_bytes()
+        observed["datasets"] = {
+            f"{role}/{split}": (
+                artifact_root / role / f"{split}.jsonl"
+            ).read_bytes()
+            for role in ("baseline", "candidate")
+            for split in ("train", "eval")
+        }
         observed["manifest"] = path.read_text("utf-8")
         return real_audit_research(path, artifact_root=artifact_root)
 
@@ -546,10 +557,307 @@ def test_native_conversion_contains_only_normalized_runs_config_and_passive_data
     assert "summary" not in observed["manifest"]
     assert "model:" in observed["baseline_config"]
     assert "  name: demo" in observed["baseline_config"]
-    assert observed["candidate_train"] == (
-        checkout / "data" / "candidate-train.jsonl"
-    ).read_bytes()
+    assert observed["datasets"] == {
+        f"{role}/{split}": (
+            checkout / "data" / f"{role}-{split}.jsonl"
+        ).read_bytes()
+        for role in ("baseline", "candidate")
+        for split in ("train", "eval")
+    }
     assert not (scratch / plan.plan_id).exists()
+
+
+def test_one_passive_dataset_can_fill_both_splits_and_is_captured_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    baseline_dataset_bindings = tuple(
+        item
+        for item in plan.selected_mapping.bindings
+        if item.kind is ArtifactKind.DATASET
+        and item.role is ExperimentRole.BASELINE
+    )
+    train_binding = next(
+        item
+        for item in baseline_dataset_bindings
+        if item.dataset_split is DatasetSplit.TRAIN
+    )
+    eval_binding = next(
+        item
+        for item in baseline_dataset_bindings
+        if item.dataset_split is DatasetSplit.EVAL
+    )
+    train_evidence = next(
+        item
+        for item in plan.baseline_evidence
+        if item.artifact.path == train_binding.path
+    )
+    changed_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            item
+            for item in plan.selected_mapping.bindings
+            if item is not eval_binding
+        )
+        + (dataclasses.replace(train_binding, dataset_split=DatasetSplit.EVAL),),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        baseline_evidence=tuple(
+            item
+            for item in plan.baseline_evidence
+            if item.artifact.path != eval_binding.path
+        ),
+        selected_mapping=changed_mapping,
+        mapping_provenance=(changed_mapping.provenance,),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+    original_capture = materialize._capture_artifact
+    captures: list[RepositoryPath] = []
+
+    def count_capture(*args: object, **kwargs: object) -> PassiveArtifact:
+        candidate = args[0]
+        assert isinstance(candidate, ArtifactCandidate)
+        captures.append(candidate.path)
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(materialize, "_capture_artifact", count_capture)
+
+    result = execute_ephemeral_audit(changed_plan, runtime)
+
+    assert captures.count(train_evidence.artifact.path) == 1
+    assert any(
+        item.rule_id == "DATASET.EXACT_LEAKAGE"
+        and item.evidence["experiment"] == "baseline"
+        for item in result.findings
+    )
+    assert not (scratch / changed_plan.plan_id).exists()
+
+
+def test_dataset_normalized_split_injection_fails_fresh_adapter_revalidation(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    split_by_path = {
+        item.path: item.dataset_split
+        for item in plan.selected_mapping.bindings
+        if item.kind is ArtifactKind.DATASET
+    }
+
+    def inject_split(item: NormalizedEvidence) -> NormalizedEvidence:
+        if item.artifact.kind is not ArtifactKind.DATASET:
+            return item
+        split = split_by_path[item.artifact.path]
+        assert split is not None
+        observation = item.observations[0]
+        reference = observation.dataset_references[0]
+        return dataclasses.replace(
+            item,
+            observations=(
+                dataclasses.replace(
+                    observation,
+                    dataset_references=(
+                        dataclasses.replace(reference, split=split.value),
+                    ),
+                ),
+            ),
+        )
+
+    changed_plan = dataclasses.replace(
+        plan,
+        baseline_evidence=tuple(inject_split(item) for item in plan.baseline_evidence),
+        candidate_evidence=tuple(inject_split(item) for item in plan.candidate_evidence),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="adapter|identity|normalized"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / changed_plan.plan_id).exists()
+
+
+def test_dataset_adapter_is_revalidated_once_per_unique_captured_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.adapters as adapters
+
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    original = adapters.get_adapter
+    selected: list[str] = []
+
+    def record(adapter_id: str) -> object:
+        selected.append(adapter_id)
+        return original(adapter_id)
+
+    monkeypatch.setattr(adapters, "get_adapter", record)
+
+    execute_ephemeral_audit(plan, runtime)
+
+    assert selected == ["claimci-jsonl-dataset-v1"] * 4
+
+
+def test_dataset_adapter_identity_drift_fails_closed_before_audit(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    dataset = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.kind is ArtifactKind.DATASET
+    )
+    changed_dataset = dataclasses.replace(
+        dataset,
+        adapter_match=dataclasses.replace(
+            dataset.adapter_match,
+            adapter_id="fixture.dataset",
+        ),
+    )
+    changed_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            dataclasses.replace(item, adapter_id="fixture.dataset")
+            if item.path == dataset.artifact.path
+            else item
+            for item in plan.selected_mapping.bindings
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        candidate_evidence=tuple(
+            changed_dataset if item is dataset else item
+            for item in plan.candidate_evidence
+        ),
+        selected_mapping=changed_mapping,
+        mapping_provenance=(changed_mapping.provenance,),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="adapter"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / changed_plan.plan_id).exists()
+
+
+def test_dataset_selector_injection_fails_closed_before_audit(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    dataset = next(
+        item
+        for item in plan.baseline_evidence
+        if item.artifact.kind is ArtifactKind.DATASET
+    )
+    provenance = dataset.adapter_match.match_evidence[0]
+    injected = FieldMapping(
+        "dataset.path",
+        EvidenceSelector(
+            SelectorKind.DOTTED_PATH,
+            "dataset.path",
+            provenance,
+        ),
+        provenance,
+    )
+    changed_dataset = dataclasses.replace(
+        dataset,
+        adapter_match=dataclasses.replace(
+            dataset.adapter_match,
+            mappings=(injected,),
+        ),
+    )
+    changed_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            dataclasses.replace(item, mappings=(injected,))
+            if item.path == dataset.artifact.path
+            else item
+            for item in plan.selected_mapping.bindings
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        baseline_evidence=tuple(
+            changed_dataset if item is dataset else item
+            for item in plan.baseline_evidence
+        ),
+        selected_mapping=changed_mapping,
+        mapping_provenance=(changed_mapping.provenance,),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="selector"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / changed_plan.plan_id).exists()
+
+
+def test_duplicate_dataset_split_binding_fails_closed_before_audit(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    candidate_eval = next(
+        item
+        for item in plan.selected_mapping.bindings
+        if item.kind is ArtifactKind.DATASET
+        and item.role is ExperimentRole.CANDIDATE
+        and item.dataset_split is DatasetSplit.EVAL
+    )
+    changed_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            dataclasses.replace(item, dataset_split=DatasetSplit.TRAIN)
+            if item is candidate_eval
+            else item
+            for item in plan.selected_mapping.bindings
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        selected_mapping=changed_mapping,
+        mapping_provenance=(changed_mapping.provenance,),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="duplicate split|train and one eval"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / changed_plan.plan_id).exists()
+
+
+def test_malformed_jsonl_is_left_for_the_existing_deterministic_audit(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(
+        tmp_path,
+        candidate_train_content=b"not JSON\n",
+    )
+
+    result = execute_ephemeral_audit(plan, runtime)
+
+    assert any(item.rule_id == "DATASET.INVALID" for item in result.findings)
 
 
 def test_genuinely_absent_seed_remains_absent(tmp_path: Path) -> None:
@@ -785,11 +1093,19 @@ def test_provider_originated_normalized_observation_is_unavailable(
 
 def test_non_jsonl_dataset_representation_is_partial(tmp_path: Path) -> None:
     plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    train_binding = next(
+        item
+        for item in plan.selected_mapping.bindings
+        if item.kind is ArtifactKind.DATASET
+        and item.role is ExperimentRole.CANDIDATE
+        and item.dataset_split is DatasetSplit.TRAIN
+    )
     dataset = next(
         item
         for item in plan.candidate_evidence
         if item.artifact.kind is ArtifactKind.DATASET
-        and item.observations[0].dataset_references[0].split == "train"
+        and item.artifact.path == train_binding.path
     )
     old_source = checkout / Path(str(dataset.artifact.path))
     new_path = RepositoryPath("data/candidate-train.csv")
@@ -812,7 +1128,6 @@ def test_non_jsonl_dataset_representation_is_partial(tmp_path: Path) -> None:
         adapter_match=changed_match,
         observations=(changed_observation,),
     )
-    assert isinstance(plan.selected_mapping, MappingCandidate)
     changed_mapping = dataclasses.replace(
         plan.selected_mapping,
         bindings=tuple(

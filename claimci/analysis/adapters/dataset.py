@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactKind,
@@ -16,11 +18,17 @@ from claimci.analysis import (
 
 from .core import (
     _adapter_provenance,
-    _evidence_id,
     _supports,
     _validate_match,
     _verify_integrity,
 )
+
+
+def _dataset_evidence_id(adapter_id: str, artifact: PassiveArtifact) -> str:
+    material = (
+        f"{adapter_id}\0{artifact.candidate.path}\0{artifact.candidate.sha256}"
+    ).encode("utf-8")
+    return f"evidence-{adapter_id}-{hashlib.sha256(material).hexdigest()[:24]}"
 
 
 class PassiveJsonLinesDatasetAdapter:
@@ -71,7 +79,7 @@ class PassiveJsonLinesDatasetAdapter:
             inferred=False,
         )
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_dataset_evidence_id(self.adapter_id, artifact),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=(
@@ -91,4 +99,3 @@ class PassiveJsonLinesDatasetAdapter:
 
 
 __all__ = ["PassiveJsonLinesDatasetAdapter"]
-

@@ -19,9 +19,11 @@ from claimci.models import AuditResult
 
 from .contracts import (
     AnalysisContractError,
+    ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
     ConfigValue,
+    DatasetSplit,
     EphemeralAuditPlan,
     ExperimentRole,
     GitCommitSha,
@@ -302,7 +304,7 @@ def _capture_artifact(
 
 def _evidence_by_binding(
     plan: EphemeralAuditPlan,
-) -> tuple[tuple[NormalizedEvidence, ExperimentRole], ...]:
+) -> tuple[tuple[NormalizedEvidence, ArtifactBinding], ...]:
     if plan.audit_claim is None or plan.selected_mapping is None:
         raise MaterializationPartial(
             "ephemeral execution requires an audit claim and selected mapping"
@@ -351,7 +353,7 @@ def _evidence_by_binding(
     }
     if len(by_key) != len(evidence):
         raise MaterializationUnavailable("plan evidence paths are not unique")
-    bound: list[tuple[NormalizedEvidence, ExperimentRole]] = []
+    bound: list[tuple[NormalizedEvidence, ArtifactBinding]] = []
     for binding in selected.bindings:
         item = by_key.get((binding.path, binding.kind))
         if item is None:
@@ -370,8 +372,15 @@ def _evidence_by_binding(
         )
         if binding.role is not expected:
             raise MaterializationUnavailable("selected experiment role changed")
-        bound.append((item, binding.role))
-    if {item.evidence_id for item, _role in bound} != {
+        if binding.kind is ArtifactKind.DATASET and binding.dataset_split not in {
+            DatasetSplit.TRAIN,
+            DatasetSplit.EVAL,
+        }:
+            raise MaterializationUnavailable(
+                "selected dataset binding has no validated train/eval split"
+            )
+        bound.append((item, binding))
+    if {item.evidence_id for item, _binding in bound} != {
         item.evidence_id for item in evidence
     }:
         raise MaterializationUnavailable(
@@ -405,21 +414,86 @@ def _validate_normalized_provenance(evidence: NormalizedEvidence) -> None:
 
 
 def _capture_plan_artifacts(
-    plan: EphemeralAuditPlan,
     runtime: RuntimeExecutionContext,
-    bound: tuple[tuple[NormalizedEvidence, ExperimentRole], ...],
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
 ) -> Mapping[str, PassiveArtifact]:
     captured: dict[str, PassiveArtifact] = {}
+    captured_kinds: dict[str, ArtifactKind] = {}
+    revalidated_datasets: set[str] = set()
     total = 0
-    for evidence, _role in sorted(bound, key=lambda item: str(item[0].artifact.path)):
-        passive = _capture_artifact(
-            evidence.artifact,
-            runtime,
-            aggregate_before=total,
-        )
-        captured[str(evidence.artifact.path)] = passive
-        total += len(passive.content)
+    for evidence, binding in sorted(
+        bound,
+        key=lambda item: (
+            str(item[0].artifact.path),
+            item[1].dataset_split.value if item[1].dataset_split else "",
+        ),
+    ):
+        path = str(evidence.artifact.path)
+        existing_kind = captured_kinds.get(path)
+        if existing_kind is not None and existing_kind is not evidence.artifact.kind:
+            raise MaterializationUnavailable(
+                "one captured repository path cannot have conflicting artifact kinds"
+            )
+        passive = captured.get(path)
+        if passive is None:
+            passive = _capture_artifact(
+                evidence.artifact,
+                runtime,
+                aggregate_before=total,
+            )
+            captured[path] = passive
+            captured_kinds[path] = evidence.artifact.kind
+            total += len(passive.content)
+        elif passive.candidate != evidence.artifact:
+            raise MaterializationUnavailable(
+                "duplicate selected path has conflicting artifact identity"
+            )
+        if (
+            evidence.artifact.kind is ArtifactKind.DATASET
+            and path not in revalidated_datasets
+        ):
+            _revalidate_dataset_identity(evidence, binding, passive)
+            revalidated_datasets.add(path)
     return captured
+
+
+def _revalidate_dataset_identity(
+    evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
+    passive: PassiveArtifact,
+) -> None:
+    if not str(evidence.artifact.path).casefold().endswith(".jsonl"):
+        raise MaterializationPartial(
+            "dataset evidence is not a losslessly supported JSONL artifact"
+        )
+    if binding.adapter_id != "claimci-jsonl-dataset-v1":
+        raise MaterializationUnavailable(
+            "selected dataset adapter is not the fixed passive JSONL adapter"
+        )
+    if binding.mappings or evidence.adapter_match.mappings:
+        raise MaterializationUnavailable(
+            "passive dataset identity must not contain executable selectors"
+        )
+    try:
+        from .adapters import get_adapter
+
+        adapter = get_adapter(binding.adapter_id)
+        match = adapter.probe(passive)
+        if match is None:
+            raise MaterializationUnavailable(
+                "selected dataset adapter no longer matches captured bytes"
+            )
+        fresh = adapter.extract(passive, match)
+    except MaterializationUnavailable:
+        raise
+    except Exception as error:
+        raise MaterializationUnavailable(
+            f"fresh passive dataset adapter revalidation failed: {error}"
+        ) from error
+    if type(fresh) is not NormalizedEvidence or fresh != evidence:
+        raise MaterializationUnavailable(
+            "planned dataset evidence no longer matches fresh adapter identity"
+        )
 
 
 def _results_payload(
@@ -495,11 +569,17 @@ def _config_payload(evidence: tuple[NormalizedEvidence, ...]) -> dict[str, objec
 
 
 def _dataset_artifacts(
-    evidence: tuple[NormalizedEvidence, ...],
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    role: ExperimentRole,
     captured: Mapping[str, PassiveArtifact],
 ) -> dict[str, bytes]:
     splits: dict[str, bytes] = {}
-    for item in evidence:
+    selected = tuple(
+        (item, binding)
+        for item, binding in bound
+        if binding.role is role and binding.kind is ArtifactKind.DATASET
+    )
+    for item, binding in selected:
         if not str(item.artifact.path).casefold().endswith(".jsonl"):
             raise MaterializationPartial(
                 "dataset evidence is not a losslessly supported JSONL artifact"
@@ -513,15 +593,19 @@ def _dataset_artifacts(
             raise MaterializationPartial(
                 "dataset evidence does not identify one selected passive artifact"
             )
-        split = references[0].split.casefold() if references[0].split else None
-        if split not in {"train", "eval"} or split in splits:
-            raise MaterializationPartial(
-                "dataset evidence must identify one train and one eval split"
+        split = binding.dataset_split
+        if split not in {DatasetSplit.TRAIN, DatasetSplit.EVAL}:
+            raise MaterializationUnavailable(
+                "selected dataset mapping lost its validated train/eval split"
             )
-        splits[split] = captured[str(item.artifact.path)].content
+        if split.value in splits:
+            raise MaterializationUnavailable(
+                "selected dataset mapping contains a duplicate split"
+            )
+        splits[split.value] = captured[str(item.artifact.path)].content
     if set(splits) != {"train", "eval"}:
-        raise MaterializationPartial(
-            "dataset evidence must identify one train and one eval split"
+        raise MaterializationUnavailable(
+            "selected dataset mapping must contain one train and one eval split"
         )
     return splits
 
@@ -540,6 +624,7 @@ def _write_native_tree(
     plan_root: Path,
     plan: EphemeralAuditPlan,
     captured: Mapping[str, PassiveArtifact],
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
 ) -> Path:
     if plan.audit_claim is None:
         raise MaterializationPartial("plan has no deterministic audit claim")
@@ -566,7 +651,7 @@ def _write_native_tree(
             )
         results = _results_payload(result_evidence, plan.audit_claim.metric)
         config = _config_payload(config_evidence)
-        datasets = _dataset_artifacts(dataset_evidence, captured)
+        datasets = _dataset_artifacts(bound, role, captured)
         _exclusive_text(
             plan_root / role_name / "results.json",
             json.dumps(
@@ -684,7 +769,7 @@ def execute_ephemeral_audit(
     created_identity: tuple[int, int] | None = None
     try:
         bound = _evidence_by_binding(plan)
-        captured = _capture_plan_artifacts(plan, runtime, bound)
+        captured = _capture_plan_artifacts(runtime, bound)
         try:
             plan_root.mkdir(exist_ok=False)
         except FileExistsError as error:
@@ -694,7 +779,7 @@ def execute_ephemeral_audit(
         created = True
         root_stat = os.lstat(plan_root)
         created_identity = (root_stat.st_dev, root_stat.st_ino)
-        manifest = _write_native_tree(plan_root, plan, captured)
+        manifest = _write_native_tree(plan_root, plan, captured, bound)
         result = audit_research(manifest, artifact_root=plan_root)
         if type(result) is not AuditResult:
             raise MaterializationUnavailable(

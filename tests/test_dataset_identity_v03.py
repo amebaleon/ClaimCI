@@ -203,6 +203,22 @@ def test_dataset_adapter_preserves_arbitrary_bytes_without_row_interpretation() 
     assert evidence.observations[0].dataset_references[0].path == artifact.candidate.path
 
 
+def test_identical_dataset_bytes_at_distinct_paths_have_distinct_evidence_ids() -> None:
+    adapter = PassiveJsonLinesDatasetAdapter()
+    first = _passive_dataset(path="data/baseline-eval.jsonl")
+    second = _passive_dataset(path="data/candidate-eval.jsonl")
+
+    first_match = adapter.probe(first)
+    second_match = adapter.probe(second)
+    assert first_match is not None
+    assert second_match is not None
+
+    assert adapter.extract(first, first_match).evidence_id != adapter.extract(
+        second,
+        second_match,
+    ).evidence_id
+
+
 @pytest.mark.parametrize(
     ("path", "kind"),
     [
