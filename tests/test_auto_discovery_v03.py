@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ from claimci.analysis.discovery.repository import (
     read_artifact_text,
 )
 from claimci.analysis.discovery.claims import as_scientific_claim, discover_claims
+from claimci.analysis.discovery.artifacts import discover_artifacts
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 
 
@@ -652,3 +654,165 @@ def test_provider_claims_reject_authority_fields_bad_quotes_and_excess_items(
     ):
         with pytest.raises(DiscoveryError, match="provider"):
             discover_claims(context, provider_payload=payload, limits=limits)
+
+
+def test_discover_artifacts_ranks_obvious_evidence_without_manifest(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    (head / "experiments").mkdir(parents=True)
+    (head / "configs").mkdir()
+    (head / "data").mkdir()
+    (head / "README.md").write_text(
+        "Accuracy improved 71 to 79.\n",
+        encoding="utf-8",
+    )
+    files = {
+        "experiments/baseline_results.json": b'{"accuracy": [71]}\n',
+        "experiments/candidate_results.json": b'{"accuracy": [79]}\n',
+        "configs/baseline_config.yaml": b"seed: 1\n",
+        "configs/candidate_config.yaml": b"seed: 2\n",
+        "data/train.jsonl": b'{"id": 1}\n',
+        "data/eval.jsonl": b'{"id": 2}\n',
+    }
+    for relative, content in files.items():
+        (head / relative).write_bytes(content)
+    context = collect_repository_context(head, limits=DiscoveryLimits())
+    claims = discover_claims(context, limits=DiscoveryLimits())
+
+    discovery = discover_artifacts(context, claims, limits=DiscoveryLimits())
+    by_path = {str(item.path): item for item in discovery.artifacts}
+
+    assert set(by_path) == set(files)
+    assert by_path["experiments/baseline_results.json"].kind is ArtifactKind.RESULTS
+    assert by_path["configs/candidate_config.yaml"].kind is ArtifactKind.CONFIG
+    assert by_path["data/train.jsonl"].kind is ArtifactKind.DATASET
+    for relative, content in files.items():
+        assert by_path[relative].sha256 == hashlib.sha256(content).hexdigest()
+        assert by_path[relative].size == len(content)
+    claim_id = claims[0].reference.claim_id
+    assert claim_id in by_path["experiments/candidate_results.json"].relevant_claim_ids
+    assert by_path["experiments/candidate_results.json"].confidence > by_path[
+        "data/eval.jsonl"
+    ].confidence
+    assert discovery.manifest_mappings == ()
+    assert discovery.issues == ()
+    assert discover_artifacts(context, claims, limits=DiscoveryLimits()) == discovery
+
+
+def _write_manifest_study(root: Path, *, include_manifest: bool = True) -> None:
+    study = root / "study"
+    (study / "base").mkdir(parents=True)
+    (study / "candidate").mkdir()
+    for role in ("base", "candidate"):
+        (study / role / "config.yaml").write_text("seed: 1\n", encoding="utf-8")
+        (study / role / "results.json").write_text(
+            '{"accuracy": [0.7]}\n', encoding="utf-8"
+        )
+        (study / role / "train.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+        (study / role / "eval.jsonl").write_text('{"id": 2}\n', encoding="utf-8")
+    if include_manifest:
+        (study / "research.yaml").write_text(
+            """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: base/config.yaml
+  results: base/results.json
+  train_dataset: base/train.jsonl
+  eval_dataset: base/eval.jsonl
+candidate:
+  config: candidate/config.yaml
+  results: candidate/results.json
+  train_dataset: candidate/train.jsonl
+  eval_dataset: candidate/eval.jsonl
+""",
+            encoding="utf-8",
+        )
+
+
+def test_valid_head_manifest_is_high_confidence_hint_without_trust_elevation(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    _write_manifest_study(base, include_manifest=False)
+    _write_manifest_study(head, include_manifest=True)
+    context = collect_repository_context(head, base_root=base, limits=DiscoveryLimits())
+
+    discovery = discover_artifacts(context, (), limits=DiscoveryLimits())
+    manifest = next(
+        item for item in discovery.artifacts if item.path == "study/research.yaml"
+    )
+    mapping = discovery.manifest_mappings[0]
+
+    assert manifest.kind is ArtifactKind.MANIFEST
+    assert manifest.confidence == Confidence(0.99)
+    assert manifest.provenance.kind is ProvenanceKind.MANIFEST_HINT
+    assert mapping.confidence == Confidence(0.99)
+    assert mapping.trust is MappingTrust.MANIFEST_HINT
+    assert mapping.provenance.kind is ProvenanceKind.MANIFEST_HINT
+    assert {str(binding.path) for binding in mapping.bindings} == {
+        "study/base/config.yaml",
+        "study/base/results.json",
+        "study/base/train.jsonl",
+        "study/base/eval.jsonl",
+        "study/candidate/config.yaml",
+        "study/candidate/results.json",
+        "study/candidate/train.jsonl",
+        "study/candidate/eval.jsonl",
+    }
+    assert not isinstance(mapping, RepoMapping)
+    assert discovery.issues == ()
+
+
+@pytest.mark.parametrize(
+    "manifest_text",
+    [
+        """claim:
+  metric: accuracy
+  metric: loss
+baseline: {}
+candidate: {}
+""",
+        """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: ../outside.yaml
+  results: results.json
+  train_dataset: train.jsonl
+  eval_dataset: eval.jsonl
+candidate:
+  config: config.yaml
+  results: results.json
+  train_dataset: train.jsonl
+  eval_dataset: eval.jsonl
+""",
+    ],
+)
+def test_malformed_manifest_is_isolated_while_other_artifacts_survive(
+    tmp_path: Path,
+    manifest_text: str,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    (head / "research.yaml").write_text(manifest_text, encoding="utf-8")
+    (head / "candidate_results.json").write_text("{}\n", encoding="utf-8")
+    context = collect_repository_context(
+        head,
+        pr_description="Accuracy improved.",
+        limits=DiscoveryLimits(),
+    )
+    claims = discover_claims(context, limits=DiscoveryLimits())
+
+    discovery = discover_artifacts(context, claims, limits=DiscoveryLimits())
+
+    assert tuple(str(item.path) for item in discovery.artifacts) == (
+        "candidate_results.json",
+    )
+    assert discovery.manifest_mappings == ()
+    assert discovery.issues == (
+        ArtifactIssue(
+            RepositoryPath("research.yaml"),
+            "manifest is not a valid confined mapping hint",
+        ),
+    )
