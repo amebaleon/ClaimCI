@@ -185,6 +185,12 @@ by an explicit future mapping capability rather than guessed. Generic config
 adapters omit unrepresentable leaves from automatic mappings and lower match
 confidence. An externally supplied v1 dotted selector still cannot name them.
 
+Each generated config mapping uses target field
+`config.k<first-16-lowercase-sha256-of-selector>`. The hash is only a stable,
+collision-checked mapping identifier; it carries no semantic inference.
+`ConfigValue.key` remains the exact dotted selector expression. This avoids
+case-folding or rewriting source keys to satisfy normalized target-field syntax.
+
 YAML uses the existing duplicate-rejecting `UniqueKeySafeLoader`; arbitrary
 constructors, Python tags, recursive aliases, and unsafe loaders are forbidden.
 TOML uses standard-library `tomllib` only.
@@ -259,6 +265,15 @@ artifact is fully parsed under all bounds. A confident, unambiguous shape
 returns an `AdapterMatch` with validated mappings and high confidence. A valid
 but ambiguous shape returns a lower-confidence match whose mapping tuple omits
 the ambiguous target.
+
+The supported kind/suffix pairs are exact: generic JSON accepts `.json` for
+`RESULTS`, `BENCHMARK`, `DOCUMENT`, or `CONFIG`; JSONL accepts `.jsonl` for
+`RESULTS`, `BENCHMARK`, or `DOCUMENT`; CSV accepts `.csv` for `RESULTS`,
+`BENCHMARK`, or `DOCUMENT`; YAML/TOML accept `.yaml`, `.yml`, or `.toml` only for
+`CONFIG`. Native manifest accepts `.yaml`/`.yml` only for `MANIFEST`; native
+results accepts `.json` only for `RESULTS`; native config accepts `.yaml`/`.yml`
+only for `CONFIG`. `DATASET`, `SOURCE`, and `TEST` artifacts are not parsed by
+this branch.
 
 `extract()` accepts only a match whose adapter ID and path equal the receiving
 adapter and artifact. It reparses after immediate integrity verification. Every
