@@ -8,6 +8,7 @@ from .models import (
     DiscoveryLimits,
     DiscoveryResult,
 )
+from .service import discover_repository
 
 __all__ = [
     "ArtifactIssue",
@@ -16,4 +17,5 @@ __all__ = [
     "DiscoveryError",
     "DiscoveryLimits",
     "DiscoveryResult",
+    "discover_repository",
 ]
