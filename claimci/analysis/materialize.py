@@ -311,9 +311,13 @@ def _evidence_by_binding(
         )
     selected = plan.selected_mapping
     if type(selected) is MappingCandidate:
-        if selected.trust is MappingTrust.INFERRED and (
-            selected.confidence.value < 0.90
-            or selected.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+        if selected.confidence.value < 0.90:
+            raise MaterializationUnavailable(
+                "selected mapping confidence is below the runtime trust floor"
+            )
+        if (
+            selected.trust is MappingTrust.INFERRED
+            and selected.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
         ):
             raise MaterializationUnavailable(
                 "selected inferred mapping does not satisfy deterministic trust"

@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from claimci.passive_files import PassiveFileError, capture_confined_regular_file
+
 from .models import (
     ClaimDirection,
     ClaimMagnitude,
@@ -147,17 +149,6 @@ def _change_candidate(path: str) -> bool:
     )
 
 
-def _stream_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            while block := handle.read(64 * 1024):
-                digest.update(block)
-    except OSError as exc:
-        raise ReviewError(f"could not hash review source {path}: {exc}") from exc
-    return digest.hexdigest()
-
-
 def _changed(
     path: str,
     head: Path,
@@ -198,17 +189,39 @@ def _changed(
         )
     comparison_budget["files"] -= 1
     comparison_budget["bytes"] -= required_bytes
-    return _stream_digest(head_path) != _stream_digest(base_path)
-
-
-def _bounded_text(path: Path, max_chars: int) -> str:
     try:
+        head_capture = capture_confined_regular_file(
+            head,
+            path,
+            max_bytes=head_size,
+        )
+        base_capture = capture_confined_regular_file(
+            base,
+            path,
+            max_bytes=base_size,
+        )
+    except PassiveFileError as exc:
+        raise ReviewError(f"review source identity changed during comparison: {path}") from exc
+    if head_capture.size != head_size or base_capture.size != base_size:
+        raise ReviewError(f"review source size changed during comparison: {path}")
+    return head_capture.sha256 != base_capture.sha256
+
+
+def _bounded_text(root: Path, relative: str, max_chars: int) -> str:
+    try:
+        capture = capture_confined_regular_file(
+            root,
+            relative,
+            max_bytes=MAX_SOURCE_FILE_BYTES,
+        )
+        text = capture.content.decode("utf-8")
         # Universal-newline normalization keeps source locations and exact
         # quotes stable across Windows and POSIX checkouts.
-        with path.open("r", encoding="utf-8") as handle:
-            return handle.read(max_chars)
-    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
-        raise ReviewError(f"could not read review source {path}: {exc}") from exc
+        return text.replace("\r\n", "\n").replace("\r", "\n")[:max_chars]
+    except (PassiveFileError, UnicodeError, ValueError, RecursionError) as exc:
+        raise ReviewError(
+            f"could not read confined review source {relative}: {exc}"
+        ) from exc
 
 
 def _source_id(kind: SourceKind, path: str | None, text: str) -> str:
@@ -282,12 +295,11 @@ def collect_review_sources(
             break
         if not _eligible_document(relative) or relative not in changed_set:
             continue
-        resolved = (head / Path(relative)).resolve()
-        try:
-            resolved.relative_to(head)
-        except ValueError as exc:
-            raise ReviewError(f"review source resolves outside repository: {relative}") from exc
-        text = _bounded_text(resolved, min(limits.max_file_chars, remaining))
+        text = _bounded_text(
+            head,
+            relative,
+            min(limits.max_file_chars, remaining),
+        )
         records.append(_record(SourceKind.REPOSITORY_FILE, relative, text))
         remaining -= len(text)
         selected += 1
