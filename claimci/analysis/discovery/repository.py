@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from claimci.analysis.contracts import RepositoryPath, Sha256Digest
+from claimci.passive_files import PassiveFileError, capture_confined_regular_file
 from claimci.review.models import ReviewError, ReviewLimits, SourceBundle
 from claimci.review.sources import collect_review_sources
 
@@ -113,14 +113,6 @@ def _confined_regular_file(root: Path, path: RepositoryPath) -> Path | None:
         return None
 
 
-def _stream_digest(path: Path) -> Sha256Digest:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while block := handle.read(64 * 1024):
-            digest.update(block)
-    return Sha256Digest(digest.hexdigest())
-
-
 def inspect_artifact(
     context: RepositoryContext,
     path: RepositoryPath,
@@ -144,21 +136,26 @@ def inspect_artifact(
     if resolved is None:
         return ArtifactIssue(path, "artifact is not a confined regular file")
     try:
-        size = resolved.stat().st_size
-    except OSError:
-        return ArtifactIssue(path, "artifact metadata is unavailable")
-    if size < 0:
-        return ArtifactIssue(path, "artifact has invalid file metadata")
-    if size > limits.max_artifact_bytes:
+        capture = capture_confined_regular_file(
+            context.head_root,
+            str(path),
+            max_bytes=limits.max_artifact_bytes,
+        )
+    except PassiveFileError as error:
+        if error.code == "too_large":
+            return ArtifactIssue(
+                path,
+                f"artifact exceeds the {limits.max_artifact_bytes}-byte discovery limit",
+            )
         return ArtifactIssue(
             path,
-            f"artifact exceeds the {limits.max_artifact_bytes}-byte discovery limit",
+            "artifact changed or is not a confined regular file",
         )
-    try:
-        digest = _stream_digest(resolved)
-    except OSError:
-        return ArtifactIssue(path, "artifact could not be read")
-    return InspectedArtifact(path=path, sha256=digest, size=size)
+    return InspectedArtifact(
+        path=path,
+        sha256=Sha256Digest(capture.sha256),
+        size=capture.size,
+    )
 
 
 def read_artifact_text(
@@ -169,20 +166,37 @@ def read_artifact_text(
 ) -> tuple[InspectedArtifact, str] | ArtifactIssue:
     """Read one already-issued bounded artifact as passive UTF-8 text."""
 
-    inspection = inspect_artifact(context, path, limits=limits)
-    if isinstance(inspection, ArtifactIssue):
-        return inspection
-    resolved = _confined_regular_file(context.head_root, inspection.path)
-    if resolved is None:
-        return ArtifactIssue(inspection.path, "artifact is not a confined regular file")
+    if not isinstance(context, RepositoryContext):
+        raise TypeError("repository context must be RepositoryContext")
+    if not isinstance(limits, DiscoveryLimits):
+        raise TypeError("discovery limits must be DiscoveryLimits")
+    if not isinstance(path, RepositoryPath):
+        try:
+            path = RepositoryPath(path)
+        except (TypeError, ValueError) as error:
+            raise DiscoveryError("artifact path is unsafe") from error
+    if path not in set(context.repository_paths):
+        raise DiscoveryError("artifact path is not an indexed repository path")
     try:
-        content = resolved.read_bytes()
-    except OSError:
-        return ArtifactIssue(inspection.path, "artifact could not be read")
-    if len(content) != inspection.size or hashlib.sha256(content).hexdigest() != inspection.sha256:
-        return ArtifactIssue(inspection.path, "artifact changed during discovery")
+        capture = capture_confined_regular_file(
+            context.head_root,
+            str(path),
+            max_bytes=limits.max_artifact_bytes,
+        )
+    except PassiveFileError as error:
+        if error.code == "too_large":
+            return ArtifactIssue(
+                path,
+                f"artifact exceeds the {limits.max_artifact_bytes}-byte discovery limit",
+            )
+        return ArtifactIssue(path, "artifact changed or is not a confined regular file")
+    inspection = InspectedArtifact(
+        path=path,
+        sha256=Sha256Digest(capture.sha256),
+        size=capture.size,
+    )
     try:
-        text = content.decode("utf-8")
+        text = capture.content.decode("utf-8")
     except UnicodeError:
         return ArtifactIssue(inspection.path, "artifact is not valid UTF-8 text")
     return inspection, text.replace("\r\n", "\n").replace("\r", "\n")
@@ -215,8 +229,13 @@ def artifact_changed(
     budget.remaining_files -= 1
     budget.remaining_bytes -= required_bytes
     try:
-        return _stream_digest(base_path) != inspection.sha256
-    except OSError:
+        capture = capture_confined_regular_file(
+            context.base_root,
+            str(inspection.path),
+            max_bytes=inspection.size,
+        )
+        return capture.sha256 != inspection.sha256
+    except (OSError, PassiveFileError):
         return None
 
 

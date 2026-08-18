@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from claimci.passive_files import PassiveFileError, capture_confined_regular_file
+
 from .models import ClaimType, ReviewError, ReviewLimits, ScientificClaim
 
 
@@ -275,19 +277,6 @@ def _matches(
     return False
 
 
-def _digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while block := handle.read(64 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _excerpt(path: Path, limit: int) -> str:
-    with path.open("r", encoding="utf-8") as handle:
-        return handle.read(limit)
-
-
 def _validate_regular(root: Path, relative: str) -> tuple[Path | None, str]:
     try:
         candidate = root / Path(relative)
@@ -489,9 +478,16 @@ def discover_evidence(
             continue
         char_limit = min(limits.max_file_chars, remaining)
         try:
-            excerpt = _excerpt(resolved, char_limit)
-            digest = _digest(resolved)
-        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            capture = capture_confined_regular_file(
+                root,
+                relative,
+                max_bytes=MAX_EVIDENCE_FILE_BYTES,
+            )
+            text = capture.content.decode("utf-8")
+            excerpt = text.replace("\r\n", "\n").replace("\r", "\n")[:char_limit]
+            digest = capture.sha256
+            size = capture.size
+        except (PassiveFileError, UnicodeError, ValueError, RecursionError) as exc:
             for claim_id in sorted(by_path[relative]):
                 missing.append(
                     MissingEvidence(

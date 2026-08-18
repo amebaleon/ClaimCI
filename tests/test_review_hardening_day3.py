@@ -226,13 +226,13 @@ def test_equal_size_change_hashing_obeys_configured_file_and_context_budgets(
         _write(head, f"note-{index}.md", "same\n")
 
     digested: list[Path] = []
-    original = sources_module._stream_digest
+    original = sources_module.capture_confined_regular_file
 
-    def traced(path: Path) -> str:
-        digested.append(path)
-        return original(path)
+    def traced(root: Path, relative: str, *, max_bytes: int):
+        digested.append(root / relative)
+        return original(root, relative, max_bytes=max_bytes)
 
-    monkeypatch.setattr(sources_module, "_stream_digest", traced)
+    monkeypatch.setattr(sources_module, "capture_confined_regular_file", traced)
     monkeypatch.setattr(
         sources_module,
         "MAX_CHANGE_COMPARISON_FILES",
@@ -582,12 +582,12 @@ def test_huge_artifact_is_rejected_before_unbounded_hash_inspection(
 
     digest_called = False
 
-    def fail_if_hashed(path: Path) -> str:
+    def fail_if_hashed(root: Path, relative: str, *, max_bytes: int):
         nonlocal digest_called
         digest_called = True
-        raise OSError(f"unbounded digest attempted for {path}")
+        raise OSError(f"unbounded digest attempted for {root / relative}")
 
-    monkeypatch.setattr(evidence_module, "_digest", fail_if_hashed)
+    monkeypatch.setattr(evidence_module, "capture_confined_regular_file", fail_if_hashed)
     bundle = discover_evidence(
         tmp_path,
         [_claim()],
@@ -811,14 +811,17 @@ def test_changed_oversized_markdown_is_not_fully_hashed_for_source_selection(
 
     hashed_head = False
 
-    def guarded_digest(path: Path) -> str:
+    original = sources_module.capture_confined_regular_file
+
+    def guarded_digest(root: Path, relative: str, *, max_bytes: int):
         nonlocal hashed_head
+        path = root / relative
         if path.resolve() == head_readme.resolve():
             hashed_head = True
             raise OSError("oversized source digest must be bounded")
-        return "base-digest"
+        return original(root, relative, max_bytes=max_bytes)
 
-    monkeypatch.setattr(sources_module, "_stream_digest", guarded_digest)
+    monkeypatch.setattr(sources_module, "capture_confined_regular_file", guarded_digest)
     try:
         collect_review_sources(
             head,

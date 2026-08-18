@@ -509,6 +509,66 @@ def test_symlink_substitution_is_unavailable_without_following_target(
     assert not (scratch / plan.plan_id).exists()
 
 
+def test_open_time_redirection_is_rejected_by_descriptor_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A link-swap-equivalent open cannot substitute another regular file."""
+
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    victim = checkout / "results" / "candidate.json"
+    outside = tmp_path / "outside-candidate.json"
+    outside.write_bytes(victim.read_bytes())
+    original = materialize._open_customer_artifact
+
+    def redirected_open(path: Path) -> int:
+        return original(outside if path == victim else path)
+
+    monkeypatch.setattr(materialize, "_open_customer_artifact", redirected_open)
+
+    with pytest.raises(MaterializationUnavailable, match="identity|snapshot"):
+        execute_ephemeral_audit(plan, runtime)
+
+    assert not (scratch / plan.plan_id).exists()
+
+
+def test_low_confidence_manifest_hint_cannot_bypass_runtime_mapping_gate(
+    tmp_path: Path,
+) -> None:
+    """Materialization independently enforces the planner's hosted trust floor."""
+
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    assert type(plan.selected_mapping) is MappingCandidate
+    manifest_provenance = FieldProvenance(
+        ProvenanceKind.MANIFEST_HINT,
+        "unapproved low-confidence manifest hint",
+        RepositoryPath("research.yaml"),
+        "manifest-hint-hostile",
+    )
+    low_confidence = dataclasses.replace(
+        plan.selected_mapping,
+        confidence=Confidence(0.01),
+        trust=MappingTrust.MANIFEST_HINT,
+        provenance=manifest_provenance,
+    )
+    hostile = dataclasses.replace(
+        plan,
+        selected_mapping=low_confidence,
+        mapping_provenance=(manifest_provenance,),
+    )
+    hostile = dataclasses.replace(
+        hostile,
+        plan_id=derive_ephemeral_plan_id(hostile),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="confidence|trust|mapping"):
+        execute_ephemeral_audit(hostile, runtime)
+
+    assert not (scratch / hostile.plan_id).exists()
+
+
 def test_native_conversion_contains_only_normalized_runs_config_and_passive_datasets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
