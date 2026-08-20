@@ -26,6 +26,11 @@ from .models import (
     Verdict,
     coerce_direction,
 )
+from .measurement import (
+    MeasurementAuditContext,
+    compare_measurement_protocols,
+    recover_measurement_protocol_pair,
+)
 from .result_check import check_results, load_results
 from .parsing import load_unique_yaml
 
@@ -186,7 +191,14 @@ def audit_research(
     path: Path,
     *,
     artifact_root: Path | None = None,
+    measurement_context: MeasurementAuditContext | None = None,
 ) -> AuditResult:
+    if measurement_context is not None and type(
+        measurement_context
+    ) is not MeasurementAuditContext:
+        raise TypeError(
+            "measurement_context must be a trusted MeasurementAuditContext or null"
+        )
     spec = load_research_spec(path, artifact_root=artifact_root)
     findings: list[Finding] = []
     overlaps = []
@@ -286,6 +298,26 @@ def audit_research(
         )
 
     verdict = determine_verdict(findings)
+    measurement_drift = None
+    if measurement_context is not None:
+        baseline_eval = loaded_datasets.get("baseline", {}).get("eval")
+        candidate_eval = loaded_datasets.get("candidate", {}).get("eval")
+        protocols = recover_measurement_protocol_pair(
+            measurement_context,
+            metric=spec.metric,
+            baseline_config=configs.get("baseline"),
+            candidate_config=configs.get("candidate"),
+            baseline_evaluation_hashes=(
+                None if baseline_eval is None else baseline_eval.hashes
+            ),
+            candidate_evaluation_hashes=(
+                None if candidate_eval is None else candidate_eval.hashes
+            ),
+        )
+        measurement_drift = compare_measurement_protocols(
+            protocols,
+            native_rule_ids=tuple(item.rule_id for item in findings),
+        )
     return AuditResult(
         manifest_path=spec.manifest_path,
         metric=spec.metric,
@@ -298,4 +330,5 @@ def audit_research(
         relative_improvement=relative_improvement,
         overlaps=tuple(overlaps),
         direction=spec.direction,
+        measurement_drift=measurement_drift,
     )

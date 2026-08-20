@@ -49,6 +49,7 @@ from .obligations import (
     EvidenceObligationBundle,
     EvidenceObligationDecision,
     EvidenceObligationReason,
+    EvidenceObligationState,
     assess_evidence_obligations,
     legacy_missing_evidence,
 )
@@ -770,9 +771,24 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
             }
             reason = next(
                 (
-                    blocker_by_id[item].reason.value
-                    for item in obligations.blocking_obligation_ids
-                    if item in blocker_by_id
+                    item.reason.value
+                    for item in sorted(
+                        (
+                            blocker_by_id[identifier]
+                            for identifier in obligations.blocking_obligation_ids
+                            if identifier in blocker_by_id
+                        ),
+                        key=lambda item: (
+                            0
+                            if item.state
+                            in {
+                                EvidenceObligationState.MISSING,
+                                EvidenceObligationState.UNSUPPORTED,
+                            }
+                            else 1,
+                            item.obligation_id,
+                        ),
+                    )
                 ),
                 "no bounded mapping clarification can produce a viable plan",
             )

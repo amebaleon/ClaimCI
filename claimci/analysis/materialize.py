@@ -18,6 +18,7 @@ from claimci.audit import audit_research
 from claimci.models import AuditResult
 
 from .claim_types import claim_semantic_projection
+from .measurement import measurement_audit_context_from_materialization
 from .contracts import (
     AnalysisContractError,
     ArtifactBinding,
@@ -1211,7 +1212,24 @@ def execute_ephemeral_audit_with_trace(
         root_stat = os.lstat(plan_root)
         created_identity = (root_stat.st_dev, root_stat.st_ino)
         manifest = _write_native_tree(plan_root, plan, captured, bound)
-        result = audit_research(manifest, artifact_root=plan_root)
+        measurement_context = (
+            None
+            if plan.scientific_claim is None
+            else measurement_audit_context_from_materialization(
+                plan,
+                bound,
+                captured,
+            )
+        )
+        result = (
+            audit_research(manifest, artifact_root=plan_root)
+            if measurement_context is None
+            else audit_research(
+                manifest,
+                artifact_root=plan_root,
+                measurement_context=measurement_context,
+            )
+        )
         if type(result) is not AuditResult:
             raise MaterializationUnavailable(
                 "native Audit did not return an actual AuditResult"

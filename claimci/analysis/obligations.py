@@ -8,6 +8,11 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
 
+from claimci.measurement import (
+    MeasurementComponentKind,
+    UpstreamAggregationProcedure,
+)
+
 from .claim_types import (
     AbsoluteMetricClaim,
     CanonicalScientificClaim,
@@ -35,6 +40,7 @@ from .contracts import (
     ProvenanceKind,
     RepoMapping,
 )
+from .measurement import recover_upstream_procedure_requirement
 
 
 class EvidenceObligationState(str, Enum):
@@ -53,6 +59,9 @@ class EvidenceObligationReason(str, Enum):
     REQUIRED_THRESHOLD_NOT_RECOVERED = "required_threshold_not_recovered"
     REQUIRED_ROLE_NOT_RECOVERED = "required_role_not_recovered"
     REQUIRED_SPLIT_NOT_RECOVERED = "required_split_not_recovered"
+    REQUIRED_MEASUREMENT_PROCEDURE_NOT_RECOVERED = (
+        "required_measurement_procedure_not_recovered"
+    )
     DEPENDENCY_MISSING = "dependency_missing"
     MULTIPLE_VALIDATED_CANDIDATES = "multiple_validated_candidates"
     CONFLICTING_VALIDATED_MAPPINGS = "conflicting_validated_mappings"
@@ -65,6 +74,7 @@ class EvidenceObligationReason(str, Enum):
     ADAPTER_NOT_AVAILABLE = "adapter_not_available"
     SELECTOR_NOT_RECOVERABLE = "selector_not_recoverable"
     NATIVE_REPRESENTATION_NOT_SUPPORTED = "native_representation_not_supported"
+    MEASUREMENT_PROCEDURE_NOT_SUPPORTED = "measurement_procedure_not_supported"
     DEPENDENCY_UNSUPPORTED = "dependency_unsupported"
 
 
@@ -145,7 +155,27 @@ class ArtifactEvidenceSlot:
             )
 
 
-ObligationTarget: TypeAlias = ClaimFieldTarget | ArtifactEvidenceSlot
+@dataclass(frozen=True, slots=True)
+class MeasurementComponentTarget:
+    component_kind: MeasurementComponentKind
+    required_procedure: UpstreamAggregationProcedure
+
+    def __post_init__(self) -> None:
+        if type(self.component_kind) is not MeasurementComponentKind:
+            raise TypeError("measurement target kind must use MeasurementComponentKind")
+        if self.component_kind is not MeasurementComponentKind.RETRY_AGGREGATION:
+            raise AnalysisContractError(
+                "v1 measurement obligation target must be retry/aggregation"
+            )
+        if type(self.required_procedure) is not UpstreamAggregationProcedure:
+            raise TypeError(
+                "measurement target procedure must use UpstreamAggregationProcedure"
+            )
+
+
+ObligationTarget: TypeAlias = (
+    ClaimFieldTarget | ArtifactEvidenceSlot | MeasurementComponentTarget
+)
 
 
 def _digest(prefix: str, value: object) -> str:
@@ -400,7 +430,179 @@ def validated_artifact_support(
     return instance
 
 
-ObligationSupportReference: TypeAlias = ClaimFieldSupport | ArtifactEvidenceSupport
+_PROCEDURE_CONFIG_KEYS = frozenset(
+    {
+        "evaluation.aggregation",
+        "evaluation.aggregation_procedure",
+        "evaluation.retry_aggregation",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class MeasurementProcedureSupport:
+    support_id: str
+    procedure: UpstreamAggregationProcedure
+    evidence_ids: tuple[str, ...]
+    binding_ids: tuple[str, ...]
+
+    def __init__(self) -> None:
+        raise TypeError("MeasurementProcedureSupport must be created through its factory")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("MeasurementProcedureSupport is final")
+
+
+def _procedure_values(
+    evidence: NormalizedEvidence,
+) -> tuple[object, ...]:
+    return tuple(
+        config.value
+        for observation in evidence.observations
+        for config in observation.config_values
+        if config.key in _PROCEDURE_CONFIG_KEYS
+    )
+
+
+def _procedure_bindings(
+    mapping: MappingCandidate | RepoMapping,
+    evidence_by_key: dict[tuple[object, ArtifactKind], NormalizedEvidence],
+) -> tuple[tuple[NormalizedEvidence, ArtifactBinding], ...]:
+    values: list[tuple[NormalizedEvidence, ArtifactBinding]] = []
+    for binding in mapping.bindings:
+        if (
+            binding.kind is not ArtifactKind.CONFIG
+            or binding.role not in {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}
+        ):
+            continue
+        evidence = evidence_by_key.get((binding.path, binding.kind))
+        if evidence is not None and _evidence_matches_binding(evidence, binding):
+            values.append((evidence, binding))
+    return tuple(values)
+
+
+def _mapping_procedure_status(
+    mapping: MappingCandidate | RepoMapping,
+    evidence_by_key: dict[tuple[object, ArtifactKind], NormalizedEvidence],
+    procedure: UpstreamAggregationProcedure,
+) -> str:
+    by_role: dict[ExperimentRole, list[object]] = {
+        ExperimentRole.BASELINE: [],
+        ExperimentRole.CANDIDATE: [],
+    }
+    for evidence, binding in _procedure_bindings(mapping, evidence_by_key):
+        by_role[binding.role].extend(_procedure_values(evidence))
+    if any(not values for values in by_role.values()):
+        return "missing"
+    flattened = tuple(value for values in by_role.values() for value in values)
+    if any(not isinstance(value, str) for value in flattened):
+        return "unsupported"
+    if any(len(values) != 1 for values in by_role.values()):
+        return "ambiguous"
+    expected = procedure.value
+    return "satisfied" if all(value == expected for value in flattened) else "unsupported"
+
+
+def validated_measurement_procedure_support(
+    *,
+    claim: CanonicalScientificClaim,
+    procedure: UpstreamAggregationProcedure,
+    normalized_evidence: tuple[NormalizedEvidence, ...],
+    selected_mapping: MappingCandidate | RepoMapping,
+) -> MeasurementProcedureSupport:
+    """Create procedure support only from source recovery and trusted bindings."""
+
+    if type(claim) is not CanonicalScientificClaim:
+        raise TypeError("measurement procedure support requires CanonicalScientificClaim")
+    if type(claim.primary) is not MetricImprovementClaim:
+        raise AnalysisContractError(
+            "measurement procedure support requires metric improvement semantics"
+        )
+    if type(procedure) is not UpstreamAggregationProcedure:
+        raise TypeError("measurement procedure support requires its canonical enum")
+    requirement = recover_upstream_procedure_requirement(claim.reference)
+    if requirement is None or requirement.procedure is not procedure:
+        raise AnalysisContractError(
+            "measurement procedure does not match exact source recovery"
+        )
+    if not requirement.deterministically_supported:
+        raise AnalysisContractError("measurement procedure is not natively supported")
+    if type(selected_mapping) not in {MappingCandidate, RepoMapping}:
+        raise TypeError("measurement procedure support requires a selected mapping")
+    if not _mapping_is_trusted_for_support(selected_mapping):
+        raise AnalysisContractError(
+            "provider measurement mapping requires explicit approval"
+        )
+    if not isinstance(normalized_evidence, tuple) or not all(
+        type(item) is NormalizedEvidence for item in normalized_evidence
+    ):
+        raise TypeError("measurement procedure support requires normalized evidence")
+    evidence_by_key = {
+        (item.artifact.path, item.artifact.kind): item for item in normalized_evidence
+    }
+    if (
+        _mapping_procedure_status(selected_mapping, evidence_by_key, procedure)
+        != "satisfied"
+    ):
+        raise AnalysisContractError(
+            "required measurement procedure is not independently recoverable"
+        )
+    artifact_supports: list[ArtifactEvidenceSupport] = []
+    for evidence, binding in _procedure_bindings(selected_mapping, evidence_by_key):
+        if any(
+            provenance.kind is not ProvenanceKind.ADAPTER_EXTRACTION
+            for observation in evidence.observations
+            for provenance in (
+                observation.provenance,
+                *(item.provenance for item in observation.config_values),
+            )
+        ):
+            raise AnalysisContractError(
+                "provider values cannot create measurement procedure support"
+            )
+        if _procedure_values(evidence):
+            artifact_supports.append(
+                validated_artifact_support(
+                    evidence,
+                    binding,
+                    selected_mapping,
+                    metric=claim.primary.metric,
+                )
+            )
+    if len(artifact_supports) != 2:
+        raise AnalysisContractError(
+            "measurement procedure needs one exact config support per role"
+        )
+    ordered = tuple(sorted(artifact_supports, key=lambda item: item.binding_id))
+    material = {
+        "claim_id": claim.reference.claim_id,
+        "claim_source_sha256": requirement.source_text_sha256,
+        "procedure": procedure.value,
+        "supports": [item.support_id for item in ordered],
+    }
+    instance = object.__new__(MeasurementProcedureSupport)
+    object.__setattr__(
+        instance,
+        "support_id",
+        _digest("support-measurement", material),
+    )
+    object.__setattr__(instance, "procedure", procedure)
+    object.__setattr__(
+        instance,
+        "evidence_ids",
+        tuple(item.evidence_id for item in ordered),
+    )
+    object.__setattr__(
+        instance,
+        "binding_ids",
+        tuple(item.binding_id for item in ordered),
+    )
+    return instance
+
+
+ObligationSupportReference: TypeAlias = (
+    ClaimFieldSupport | ArtifactEvidenceSupport | MeasurementProcedureSupport
+)
 
 
 _MISSING_REASONS = frozenset(
@@ -411,6 +613,7 @@ _MISSING_REASONS = frozenset(
         EvidenceObligationReason.REQUIRED_THRESHOLD_NOT_RECOVERED,
         EvidenceObligationReason.REQUIRED_ROLE_NOT_RECOVERED,
         EvidenceObligationReason.REQUIRED_SPLIT_NOT_RECOVERED,
+        EvidenceObligationReason.REQUIRED_MEASUREMENT_PROCEDURE_NOT_RECOVERED,
         EvidenceObligationReason.DEPENDENCY_MISSING,
     }
 )
@@ -431,6 +634,7 @@ _UNSUPPORTED_REASONS = frozenset(
         EvidenceObligationReason.ADAPTER_NOT_AVAILABLE,
         EvidenceObligationReason.SELECTOR_NOT_RECOVERABLE,
         EvidenceObligationReason.NATIVE_REPRESENTATION_NOT_SUPPORTED,
+        EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
         EvidenceObligationReason.DEPENDENCY_UNSUPPORTED,
     }
 )
@@ -463,6 +667,7 @@ class EvidenceObligation:
         if self.target is not None and type(self.target) not in {
             ClaimFieldTarget,
             ArtifactEvidenceSlot,
+            MeasurementComponentTarget,
         }:
             raise TypeError("obligation target is invalid")
         if type(self.state) is not EvidenceObligationState:
@@ -475,7 +680,12 @@ class EvidenceObligation:
             not isinstance(self.support_references, tuple)
             or len(self.support_references) > 8
             or not all(
-                type(item) in {ClaimFieldSupport, ArtifactEvidenceSupport}
+                type(item)
+                in {
+                    ClaimFieldSupport,
+                    ArtifactEvidenceSupport,
+                    MeasurementProcedureSupport,
+                }
                 for item in self.support_references
             )
         ):
@@ -503,6 +713,14 @@ class EvidenceObligation:
         ):
             raise AnalysisContractError(
                 "artifact target requires artifact evidence support"
+            )
+        if type(self.target) is MeasurementComponentTarget and any(
+            type(item) is not MeasurementProcedureSupport
+            or item.procedure is not self.target.required_procedure
+            for item in self.support_references
+        ):
+            raise AnalysisContractError(
+                "measurement target requires exact procedure support"
             )
         if (
             not isinstance(self.dependency_ids, tuple)
@@ -1151,6 +1369,134 @@ def _unselected_artifact_obligation(
     )
 
 
+def _measurement_procedure_obligation(
+    *,
+    claim: CanonicalScientificClaim,
+    normalized_evidence: tuple[NormalizedEvidence, ...],
+    mapping_candidates: tuple[MappingCandidate, ...],
+    selected_mapping: MappingCandidate | RepoMapping | None,
+    mapping_question: MappingQuestion | None,
+    ambiguity_reason: EvidenceObligationReason | None,
+) -> EvidenceObligation:
+    requirement = recover_upstream_procedure_requirement(claim.reference)
+    if requirement is None:
+        raise AnalysisContractError(
+            "measurement obligation has no source-recovered requirement"
+        )
+    target = MeasurementComponentTarget(
+        MeasurementComponentKind.RETRY_AGGREGATION,
+        requirement.procedure,
+    )
+    if not requirement.deterministically_supported:
+        return EvidenceObligation(
+            obligation_id="measurement.retry_aggregation",
+            target=target,
+            state=EvidenceObligationState.UNSUPPORTED,
+            reason=EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
+            effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+        )
+    evidence_by_key = {
+        (item.artifact.path, item.artifact.kind): item
+        for item in normalized_evidence
+    }
+    if selected_mapping is not None:
+        status = _mapping_procedure_status(
+            selected_mapping,
+            evidence_by_key,
+            requirement.procedure,
+        )
+        if status == "satisfied":
+            try:
+                support = validated_measurement_procedure_support(
+                    claim=claim,
+                    procedure=requirement.procedure,
+                    normalized_evidence=normalized_evidence,
+                    selected_mapping=selected_mapping,
+                )
+            except AnalysisContractError:
+                return EvidenceObligation(
+                    obligation_id="measurement.retry_aggregation",
+                    target=target,
+                    state=EvidenceObligationState.UNSUPPORTED,
+                    reason=EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
+                    effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+                )
+            return EvidenceObligation(
+                obligation_id="measurement.retry_aggregation",
+                target=target,
+                state=EvidenceObligationState.SATISFIED,
+                reason=EvidenceObligationReason.VALIDATED_SUPPORT_BOUND,
+                effect=EvidenceObligationEffect.NONE,
+                support_references=(support,),
+            )
+        if status == "missing":
+            return EvidenceObligation(
+                obligation_id="measurement.retry_aggregation",
+                target=target,
+                state=EvidenceObligationState.MISSING,
+                reason=(
+                    EvidenceObligationReason.REQUIRED_MEASUREMENT_PROCEDURE_NOT_RECOVERED
+                ),
+                effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+            )
+        if status == "ambiguous":
+            return EvidenceObligation(
+                obligation_id="measurement.retry_aggregation",
+                target=target,
+                state=EvidenceObligationState.AMBIGUOUS,
+                reason=EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED,
+                effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+            )
+        return EvidenceObligation(
+            obligation_id="measurement.retry_aggregation",
+            target=target,
+            state=EvidenceObligationState.UNSUPPORTED,
+            reason=EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
+            effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+        )
+
+    statuses = tuple(
+        _mapping_procedure_status(candidate, evidence_by_key, requirement.procedure)
+        for candidate in mapping_candidates
+    )
+    if "satisfied" in statuses:
+        if mapping_question is not None:
+            reason = (
+                ambiguity_reason
+                if ambiguity_reason in _AMBIGUOUS_REASONS
+                else EvidenceObligationReason.MULTIPLE_VALIDATED_CANDIDATES
+            )
+            return EvidenceObligation(
+                obligation_id="measurement.retry_aggregation",
+                target=target,
+                state=EvidenceObligationState.AMBIGUOUS,
+                reason=reason,
+                effect=EvidenceObligationEffect.REQUIRES_MAPPING,
+            )
+        return EvidenceObligation(
+            obligation_id="measurement.retry_aggregation",
+            target=target,
+            state=EvidenceObligationState.AMBIGUOUS,
+            reason=EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED,
+            effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+        )
+    if "unsupported" in statuses or "ambiguous" in statuses:
+        return EvidenceObligation(
+            obligation_id="measurement.retry_aggregation",
+            target=target,
+            state=EvidenceObligationState.UNSUPPORTED,
+            reason=EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
+            effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+        )
+    return EvidenceObligation(
+        obligation_id="measurement.retry_aggregation",
+        target=target,
+        state=EvidenceObligationState.MISSING,
+        reason=EvidenceObligationReason.REQUIRED_MEASUREMENT_PROCEDURE_NOT_RECOVERED,
+        effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+    )
+
+
 def assess_evidence_obligations(
     *,
     claim: CanonicalScientificClaim,
@@ -1214,11 +1560,14 @@ def assess_evidence_obligations(
     compiler_supported = audit_claim is not None
     obligations: list[EvidenceObligation] = []
     artifact_templates: list[str] = []
+    measurement_template = False
     for template_id in policy.obligation_template_ids:
         if template_id.startswith("claim."):
             obligations.append(_claim_obligation(template_id, claim))
         elif template_id.startswith("artifact."):
             artifact_templates.append(template_id)
+        elif template_id == "measurement.retry_aggregation":
+            measurement_template = True
         elif template_id != "comparison.readiness":
             raise AnalysisContractError("claim policy contains an unknown template")
 
@@ -1270,6 +1619,18 @@ def assess_evidence_obligations(
                         ),
                     )
             obligations.append(obligation)
+
+    if measurement_template:
+        obligations.append(
+            _measurement_procedure_obligation(
+                claim=claim,
+                normalized_evidence=normalized_evidence,
+                mapping_candidates=mapping_candidates,
+                selected_mapping=selected_mapping,
+                mapping_question=mapping_question,
+                ambiguity_reason=ambiguity_reason,
+            )
+        )
 
     if "comparison.readiness" in policy.obligation_template_ids:
         dependencies = tuple(
@@ -1397,6 +1758,8 @@ __all__ = [
     "ClaimFieldKind",
     "ClaimFieldSupport",
     "ClaimFieldTarget",
+    "MeasurementComponentTarget",
+    "MeasurementProcedureSupport",
     "EvidenceObligationDecision",
     "EvidenceObligationEffect",
     "EvidenceObligation",
@@ -1410,4 +1773,5 @@ __all__ = [
     "evidence_obligations_json_bytes",
     "legacy_missing_evidence",
     "validated_artifact_support",
+    "validated_measurement_procedure_support",
 ]

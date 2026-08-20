@@ -19,8 +19,10 @@ from claimci.analysis import (
     EvidenceObligationDecision,
     EvidenceObligationReason,
     EvidenceObligationState,
+    EvidenceSelector,
     EvidenceTraceBundle,
     ExperimentRole,
+    FieldMapping,
     GitCommitSha,
     MappingCandidate,
     PassiveArtifact,
@@ -28,11 +30,13 @@ from claimci.analysis import (
     ProvenanceKind,
     RepositoryPath,
     RepositoryIdentity,
+    SelectorKind,
     Sha256Digest,
     TraceCompleteness,
     UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
     UnifiedAnalysisResult,
     claim_evidence_policy,
+    compile_audit_claim,
     plan_ephemeral_audit,
     recover_scientific_claim,
     run_unified_analysis,
@@ -190,6 +194,71 @@ def _provider_mapping(request: PlanningRequest) -> PlanningRequest:
         provenance=provider_provenance,
     )
     return dataclasses.replace(request, mapping_candidates=(hostile,))
+
+
+def _with_explicit_aggregation(
+    request: PlanningRequest,
+    *,
+    procedure: str,
+) -> PlanningRequest:
+    changed_evidence = []
+    mappings_by_path: dict[RepositoryPath, tuple[object, ...]] = {}
+    for evidence in request.normalized_evidence:
+        if evidence.artifact.kind is not ArtifactKind.CONFIG:
+            changed_evidence.append(evidence)
+            continue
+        provenance = evidence.adapter_match.match_evidence[0]
+        field_mapping = FieldMapping(
+            "config.evaluation.aggregation",
+            EvidenceSelector(
+                SelectorKind.DOTTED_PATH,
+                "evaluation.aggregation",
+                provenance,
+            ),
+            provenance,
+        )
+        mappings = (*evidence.adapter_match.mappings, field_mapping)
+        changed = dataclasses.replace(
+            evidence,
+            adapter_match=dataclasses.replace(
+                evidence.adapter_match,
+                mappings=mappings,
+            ),
+            observations=tuple(
+                dataclasses.replace(
+                    observation,
+                    config_values=(
+                        *observation.config_values,
+                        ConfigValue(
+                            "evaluation.aggregation",
+                            procedure,
+                            provenance,
+                        ),
+                    ),
+                )
+                for observation in evidence.observations
+            ),
+        )
+        mappings_by_path[evidence.artifact.path] = mappings
+        changed_evidence.append(changed)
+    mapping = request.mapping_candidates[0]
+    changed_mapping = dataclasses.replace(
+        mapping,
+        bindings=tuple(
+            dataclasses.replace(
+                binding,
+                mappings=mappings_by_path[binding.path],  # type: ignore[arg-type]
+            )
+            if binding.path in mappings_by_path
+            else binding
+            for binding in mapping.bindings
+        ),
+    )
+    return dataclasses.replace(
+        request,
+        normalized_evidence=tuple(changed_evidence),
+        mapping_candidates=(changed_mapping,),
+    )
 
 
 def _update_artifact_bytes(
@@ -574,6 +643,98 @@ def test_each_unsupported_primary_is_exact_partial_and_never_reaches_audit(
         result.evidence_obligations.compiler_state
         is EvidenceObligationState.UNSUPPORTED
     )
+
+
+def test_unsupported_upstream_procedure_never_reaches_audit_or_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    reference = dataclasses.replace(
+        request.claim,
+        text=(
+            "Using median across supplied runs, accuracy improved from 0.60 "
+            "to 0.90 by at least 0.05."
+        ),
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    blocked = dataclasses.replace(
+        request,
+        claim=reference,
+        audit_claim=compile_audit_claim(scientific_claim),
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+    provider = IntegrationProvider()
+
+    def fail_if_executed(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsupported upstream procedure reached Audit")
+
+    monkeypatch.setattr(
+        "claimci.analysis.integration.execute_ephemeral_audit_with_trace",
+        fail_if_executed,
+    )
+
+    result = run_unified_analysis(
+        blocked,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=provider,
+    )
+
+    assert result.state is AnalysisState.PARTIAL
+    assert result.unavailable_reason == "measurement_procedure_not_supported"
+    assert result.authoritative_verdict is None
+    assert result.mapping_question is None
+    assert provider.calls == []
+
+
+def test_supported_upstream_reduction_reaches_real_audit_with_one_review_call(
+    tmp_path: Path,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    request = _with_explicit_aggregation(
+        request,
+        procedure="arithmetic_mean_v1",
+    )
+    reference = dataclasses.replace(
+        request.claim,
+        text=(
+            "Using the arithmetic mean across supplied runs, accuracy improved "
+            "from 0.60 to 0.90 by at least 0.05."
+        ),
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    request = dataclasses.replace(
+        request,
+        claim=reference,
+        audit_claim=compile_audit_claim(scientific_claim),
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+    provider = IntegrationProvider()
+
+    result = run_unified_analysis(
+        request,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=provider,
+    )
+
+    assert result.state is AnalysisState.COMPLETE
+    assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
+    assert result.deterministic is not None
+    measurement = result.deterministic.payload["measurement_drift"]
+    assert measurement["claimci_verification_reduction"] == "arithmetic_mean_v1"
+    retry = next(
+        item
+        for item in measurement["findings"]
+        if item["component_kind"] == "retry_aggregation"
+    )
+    assert retry["state"] == "verified"
+    assert len(provider.calls) == 1
 
 
 def test_scenario_e_advisory_disagreement_cannot_override_audit(
