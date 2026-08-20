@@ -65,6 +65,50 @@ class MaterializationError(RuntimeError):
 class MaterializationPartial(MaterializationError):
     """Known evidence or representation limitation before native Audit."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: ArtifactKind | None = None,
+        role: ExperimentRole | None = None,
+        dataset_split: DatasetSplit | None = None,
+    ) -> None:
+        super().__init__(message)
+        if kind is not None and type(kind) is not ArtifactKind:
+            raise TypeError("materialization partial kind must use ArtifactKind")
+        if role is not None and type(role) is not ExperimentRole:
+            raise TypeError("materialization partial role must use ExperimentRole")
+        if dataset_split is not None and type(dataset_split) is not DatasetSplit:
+            raise TypeError(
+                "materialization partial dataset_split must use DatasetSplit"
+            )
+        if (kind is None) != (role is None):
+            raise AnalysisContractError(
+                "materialization partial artifact kind and role must appear together"
+            )
+        if dataset_split is not None and kind is not ArtifactKind.DATASET:
+            raise AnalysisContractError(
+                "only a dataset materialization partial may carry a split"
+            )
+        self.kind = kind
+        self.role = role
+        self.dataset_split = dataset_split
+
+    def for_slot(
+        self,
+        kind: ArtifactKind,
+        role: ExperimentRole,
+        dataset_split: DatasetSplit | None = None,
+    ) -> MaterializationPartial:
+        if self.kind is not None:
+            return self
+        return MaterializationPartial(
+            str(self),
+            kind=kind,
+            role=role,
+            dataset_split=dataset_split,
+        )
+
 
 class MaterializationUnavailable(MaterializationError):
     """Fail-closed runtime integrity or internal execution failure."""
@@ -484,7 +528,10 @@ def _revalidate_dataset_identity(
 ) -> None:
     if not str(evidence.artifact.path).casefold().endswith(".jsonl"):
         raise MaterializationPartial(
-            "dataset evidence is not a losslessly supported JSONL artifact"
+            "dataset evidence is not a losslessly supported JSONL artifact",
+            kind=ArtifactKind.DATASET,
+            role=binding.role,
+            dataset_split=binding.dataset_split,
         )
     if binding.adapter_id != "claimci-jsonl-dataset-v1":
         raise MaterializationUnavailable(
@@ -602,7 +649,10 @@ def _dataset_artifacts(
     for item, binding in selected:
         if not str(item.artifact.path).casefold().endswith(".jsonl"):
             raise MaterializationPartial(
-                "dataset evidence is not a losslessly supported JSONL artifact"
+                "dataset evidence is not a losslessly supported JSONL artifact",
+                kind=ArtifactKind.DATASET,
+                role=role,
+                dataset_split=binding.dataset_split,
             )
         references = tuple(
             reference
@@ -611,7 +661,10 @@ def _dataset_artifacts(
         )
         if len(references) != 1 or references[0].path != item.artifact.path:
             raise MaterializationPartial(
-                "dataset evidence does not identify one selected passive artifact"
+                "dataset evidence does not identify one selected passive artifact",
+                kind=ArtifactKind.DATASET,
+                role=role,
+                dataset_split=binding.dataset_split,
             )
         split = binding.dataset_split
         if split not in {DatasetSplit.TRAIN, DatasetSplit.EVAL}:
@@ -665,12 +718,25 @@ def _write_native_tree(
         dataset_evidence = tuple(
             item for item in evidence if item.artifact.kind is ArtifactKind.DATASET
         )
-        if not result_evidence or not config_evidence or not dataset_evidence:
-            raise MaterializationPartial(
-                f"{role_name} has an entirely missing native artifact category"
-            )
-        results = _results_payload(result_evidence, plan.audit_claim.metric)
-        config = _config_payload(config_evidence)
+        for kind, values in (
+            (ArtifactKind.RESULTS, result_evidence),
+            (ArtifactKind.CONFIG, config_evidence),
+            (ArtifactKind.DATASET, dataset_evidence),
+        ):
+            if not values:
+                raise MaterializationPartial(
+                    f"{role_name} has an entirely missing native artifact category",
+                    kind=kind,
+                    role=role,
+                )
+        try:
+            results = _results_payload(result_evidence, plan.audit_claim.metric)
+        except MaterializationPartial as error:
+            raise error.for_slot(ArtifactKind.RESULTS, role) from error
+        try:
+            config = _config_payload(config_evidence)
+        except MaterializationPartial as error:
+            raise error.for_slot(ArtifactKind.CONFIG, role) from error
         datasets = _dataset_artifacts(bound, role, captured)
         _exclusive_text(
             plan_root / role_name / "results.json",

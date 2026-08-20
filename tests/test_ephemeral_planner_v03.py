@@ -16,11 +16,16 @@ from claimci.analysis import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactEvidenceSlot,
     Confidence,
     ConfigValue,
     DatasetSplit,
     DatasetReference,
     EvidenceSelector,
+    EvidenceObligationDecision,
+    EvidenceObligationReason,
+    EvidenceObligationState,
+    ClaimFieldTarget,
     ExperimentRole,
     FieldMapping,
     FieldProvenance,
@@ -301,6 +306,16 @@ def test_recognized_unsupported_claim_is_partial_before_evidence_or_mapping() ->
     assert outcome.missing_evidence == ()
     assert outcome.mapping_question is None
     assert outcome.plan is None
+    assert outcome.evidence_obligations is not None
+    assert (
+        outcome.evidence_obligations.compiler_state
+        is EvidenceObligationState.UNSUPPORTED
+    )
+    assert outcome.evidence_obligations.obligations
+    assert not any(
+        isinstance(item.target, ArtifactEvidenceSlot)
+        for item in outcome.evidence_obligations.obligations
+    )
 
 
 def test_unrepresentable_metric_threshold_is_exact_compiler_partial() -> None:
@@ -356,6 +371,35 @@ def test_held_out_constraint_does_not_change_audit_claim_or_plan_identity() -> N
     assert plain_outcome.plan is not None
     assert held_out_outcome.plan is not None
     assert plain_outcome.plan.plan_id == held_out_outcome.plan.plan_id
+    assert held_out_outcome.plan.evidence_obligations is not None
+    assert any(
+        item.obligation_id == "claim.constraint.held_out"
+        and item.state is EvidenceObligationState.SATISFIED
+        for item in held_out_outcome.plan.evidence_obligations.obligations
+    )
+    artifact_obligations = tuple(
+        item
+        for item in held_out_outcome.plan.evidence_obligations.obligations
+        if isinstance(item.target, ArtifactEvidenceSlot)
+    )
+    assert len(artifact_obligations) == 8
+    assert all(
+        support.kind is item.target.kind
+        and support.role is item.target.role
+        and support.dataset_split is item.target.dataset_split
+        for item in artifact_obligations
+        for support in item.support_references
+    )
+    assert {
+        (item.target.role, item.target.dataset_split)
+        for item in artifact_obligations
+        if item.target.kind is ArtifactKind.DATASET
+    } == {
+        (ExperimentRole.BASELINE, DatasetSplit.TRAIN),
+        (ExperimentRole.BASELINE, DatasetSplit.EVAL),
+        (ExperimentRole.CANDIDATE, DatasetSplit.TRAIN),
+        (ExperimentRole.CANDIDATE, DatasetSplit.EVAL),
+    }
 
 
 def test_discovery_boundary_does_not_turn_from_to_values_into_threshold() -> None:
@@ -860,7 +904,20 @@ def test_threshold_free_claim_is_partial_before_mapping_resolution() -> None:
     assert outcome.state is PlanningState.PARTIAL
     assert outcome.plan is None
     assert outcome.mapping_question is None
-    assert any("threshold" in item.description for item in outcome.missing_evidence)
+    assert outcome.missing_evidence == ()
+    assert outcome.reason == "required_threshold_not_recovered"
+    assert outcome.evidence_obligations is not None
+    threshold = next(
+        item
+        for item in outcome.evidence_obligations.obligations
+        if item.obligation_id == "claim.threshold"
+    )
+    assert isinstance(threshold.target, ClaimFieldTarget)
+    assert threshold.state is EvidenceObligationState.MISSING
+    assert (
+        threshold.reason
+        is EvidenceObligationReason.REQUIRED_THRESHOLD_NOT_RECOVERED
+    )
 
 
 def test_missing_dataset_is_partial_without_a_mapping_question() -> None:
@@ -880,6 +937,25 @@ def test_missing_dataset_is_partial_without_a_mapping_question() -> None:
         (ArtifactKind.DATASET, ExperimentRole.BASELINE),
         (ArtifactKind.DATASET, ExperimentRole.CANDIDATE),
     }
+    assert outcome.evidence_obligations is not None
+    assert outcome.evidence_obligations.decision is EvidenceObligationDecision.PARTIAL
+    assert {
+        item.obligation_id
+        for item in outcome.evidence_obligations.obligations
+        if item.state is EvidenceObligationState.MISSING
+        and isinstance(item.target, ArtifactEvidenceSlot)
+    } == {
+        "artifact.baseline.dataset.train",
+        "artifact.baseline.dataset.eval",
+        "artifact.candidate.dataset.train",
+        "artifact.candidate.dataset.eval",
+    }
+    comparison = next(
+        item
+        for item in outcome.evidence_obligations.obligations
+        if item.obligation_id == "comparison.readiness"
+    )
+    assert comparison.state is EvidenceObligationState.MISSING
 
 
 def test_missing_one_roles_identity_only_datasets_is_typed_partial_not_question() -> None:
@@ -1032,10 +1108,13 @@ def test_incomplete_mapping_candidates_cannot_union_into_fake_dataset_coverage()
 
     assert outcome.state is PlanningState.PARTIAL
     assert outcome.mapping_question is None
-    assert {
-        (item.kind, item.role)
-        for item in outcome.missing_evidence
-    } == {(ArtifactKind.DATASET, ExperimentRole.UNSPECIFIED)}
+    assert outcome.missing_evidence == ()
+    assert outcome.evidence_obligations is not None
+    assert any(
+        item.state is EvidenceObligationState.AMBIGUOUS
+        and item.reason is EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED
+        for item in outcome.evidence_obligations.obligations
+    )
 
 
 @pytest.mark.parametrize("missing_split", [DatasetSplit.TRAIN, DatasetSplit.EVAL])
@@ -1147,6 +1226,9 @@ def test_applicable_explicit_repo_mapping_is_selected() -> None:
     assert outcome.state is PlanningState.READY
     assert outcome.plan is not None
     assert outcome.plan.selected_mapping is approved
+    assert outcome.evidence_obligations is not None
+    assert outcome.evidence_obligations.decision is EvidenceObligationDecision.READY
+    assert not hasattr(outcome.evidence_obligations, "verdict")
 
 
 def test_ambiguous_strong_mappings_return_bounded_question_without_verdict() -> None:
@@ -1177,6 +1259,13 @@ def test_ambiguous_strong_mappings_return_bounded_question_without_verdict() -> 
     assert outcome.plan is None
     assert outcome.mapping_question is not None
     assert 2 <= len(outcome.mapping_question.choices) <= 8
+    assert outcome.evidence_obligations is not None
+    assert outcome.evidence_obligations.blocking_obligation_ids == (
+        "artifact.candidate.results.metric",
+    )
+    assert outcome.mapping_question.blocking_obligation_ids == (
+        "artifact.candidate.results.metric",
+    )
 
 
 def test_provider_mapping_at_full_confidence_never_auto_executes() -> None:
@@ -1195,6 +1284,12 @@ def test_provider_mapping_at_full_confidence_never_auto_executes() -> None:
     assert outcome.state is PlanningState.MAPPING_NEEDED
     assert outcome.plan is None
     assert outcome.mapping_question is not None
+    assert outcome.evidence_obligations is not None
+    assert all(
+        item.state is EvidenceObligationState.AMBIGUOUS
+        for item in outcome.evidence_obligations.obligations
+        if isinstance(item.target, ArtifactEvidenceSlot)
+    )
 
 
 def test_low_confidence_inferred_mapping_requires_clarification() -> None:
@@ -1211,6 +1306,37 @@ def test_low_confidence_inferred_mapping_requires_clarification() -> None:
 
     assert outcome.state is PlanningState.MAPPING_NEEDED
     assert outcome.mapping_question is not None
+    assert outcome.evidence_obligations is not None
+    assert (
+        outcome.evidence_obligations.decision
+        is EvidenceObligationDecision.MAPPING_NEEDED
+    )
+    assert outcome.mapping_question.blocking_obligation_ids
+    assert outcome.mapping_question.blocking_obligation_ids == (
+        outcome.evidence_obligations.blocking_obligation_ids
+    )
+
+
+def test_unissued_selector_is_partial_and_cannot_be_made_executable_by_approval() -> None:
+    evidence = _complete_evidence()
+    valid = _mapping("mapping-primary", evidence)
+    invalid = dataclasses.replace(
+        valid,
+        bindings=(
+            dataclasses.replace(valid.bindings[0], adapter_id="different.adapter"),
+            *valid.bindings[1:],
+        ),
+    )
+
+    outcome = plan_ephemeral_audit(_request(evidence=evidence, mappings=(invalid,)))
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.mapping_question is None
+    assert outcome.evidence_obligations is not None
+    assert any(
+        item.reason is EvidenceObligationReason.SELECTOR_NOT_RECOVERABLE
+        for item in outcome.evidence_obligations.obligations
+    )
 
 
 def test_manifest_hint_conflicting_with_strong_candidate_requires_question() -> None:
@@ -1311,6 +1437,49 @@ def test_invalid_approved_mapping_blocks_automatic_fallback() -> None:
     assert outcome.mapping_question is not None
 
 
+def test_approved_mapping_with_unissued_exact_head_path_is_unavailable() -> None:
+    evidence = _complete_evidence()
+    valid = _mapping("valid-inferred", evidence)
+    stale_source = dataclasses.replace(
+        valid,
+        mapping_id="stale-head-source",
+        bindings=(
+            dataclasses.replace(
+                valid.bindings[0],
+                path=RepositoryPath("results/removed-at-head.json"),
+            ),
+            *valid.bindings[1:],
+        ),
+    )
+    approved = RepoMapping.approve(
+        REPOSITORY,
+        stale_source,
+        approved_by="owner:amebaleon",
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=evidence, mappings=(valid,), approved=approved)
+    )
+
+    assert outcome.state is PlanningState.UNAVAILABLE
+    assert outcome.plan is None
+    assert outcome.mapping_question is None
+    assert outcome.evidence_obligations is None
+    assert outcome.reason == "approved mapping is stale for the exact-head snapshot"
+
+
+def test_planning_request_rejects_provider_modified_obligation_policy() -> None:
+    request = _request()
+    assert request.claim_policy is not None
+    hostile_policy = dataclasses.replace(
+        request.claim_policy,
+        obligation_template_ids=("claim.metric",),
+    )
+
+    with pytest.raises(ValueError, match="policy|scientific claim"):
+        dataclasses.replace(request, claim_policy=hostile_policy)
+
+
 def test_generic_unspecified_evidence_uses_only_explicit_mapping_roles() -> None:
     role_by_path = {
         item.artifact.path: (
@@ -1355,7 +1524,7 @@ def test_generic_unspecified_evidence_uses_only_explicit_mapping_roles() -> None
     } == {ExperimentRole.UNSPECIFIED}
 
 
-def test_mapping_with_unissued_selector_or_binding_cannot_auto_execute() -> None:
+def test_mapping_with_unissued_selector_or_binding_cannot_reach_approval_or_audit() -> None:
     evidence = _complete_evidence()
     valid = _mapping("mapping-primary", evidence)
     invalid_binding = dataclasses.replace(
@@ -1369,9 +1538,9 @@ def test_mapping_with_unissued_selector_or_binding_cannot_auto_execute() -> None
 
     outcome = plan_ephemeral_audit(_request(evidence=evidence, mappings=(invalid,)))
 
-    assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.state is PlanningState.PARTIAL
     assert outcome.plan is None
-    assert outcome.mapping_question is not None
+    assert outcome.mapping_question is None
 
 
 def test_planning_outcome_enforces_exactly_one_state_payload() -> None:

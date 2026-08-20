@@ -231,7 +231,7 @@ def test_forged_provider_metric_fields_cannot_override_source_recovery() -> None
         compile_audit_claim(forged)
 
 
-def test_policy_seam_identifies_compiler_without_implementing_obligations() -> None:
+def test_policy_seam_identifies_compiler_and_owned_obligation_templates() -> None:
     executable = recover_scientific_claim(
         _reference("Accuracy improved by at least 0.05 on held-out data.")
     )
@@ -252,6 +252,16 @@ def test_policy_seam_identifies_compiler_without_implementing_obligations() -> N
     assert executable_policy.deterministic_compiler_id == "metric-improvement-v0"
     assert unsupported_policy.primary_kind is PrimaryClaimKind.ABSOLUTE_METRIC
     assert unsupported_policy.deterministic_compiler_id is None
+    assert executable_policy.obligation_template_ids[0:3] == (
+        "claim.metric",
+        "claim.direction",
+        "claim.threshold",
+    )
+    assert executable_policy.obligation_template_ids[-1] == "comparison.readiness"
+    assert unsupported_policy.obligation_template_ids == (
+        "claim.metric",
+        "claim.quantitative_bound",
+    )
     assert not hasattr(executable_policy, "obligations")
 
 
