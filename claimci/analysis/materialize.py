@@ -14,7 +14,7 @@ from typing import Mapping
 
 import yaml
 
-from claimci.audit import audit_research
+from claimci.audit import audit_profiled, audit_research
 from claimci.models import AuditResult
 
 from .claim_types import claim_semantic_projection
@@ -28,6 +28,7 @@ from .contracts import (
     DatasetSplit,
     EphemeralAuditPlan,
     ExperimentRole,
+    FieldMapping,
     GitCommitSha,
     MappingCandidate,
     MappingTrust,
@@ -36,6 +37,7 @@ from .contracts import (
     ProvenanceKind,
     RepoMapping,
     RepositoryIdentity,
+    SelectorKind,
     TableSelector,
     field_mapping_identity,
 )
@@ -43,6 +45,13 @@ from .evidence_identity import (
     evidence_for_binding,
 )
 from .planner import derive_ephemeral_plan_id
+from .profiles import (
+    _BENCHMARK_PROFILE_FIELDS,
+    EvidenceProfileId,
+    ProfileSelectionState,
+    profiled_evidence_policy,
+    select_evidence_profile,
+)
 from .trace import (
     BoundedValueRepresentation,
     DeterministicAuditTrace,
@@ -418,7 +427,25 @@ def _evidence_by_binding(
     else:
         raise MaterializationUnavailable("selected mapping type is not trusted")
 
-    evidence = (*plan.baseline_evidence, *plan.candidate_evidence)
+    evidence = (
+        *plan.baseline_evidence,
+        *plan.candidate_evidence,
+        *plan.reference_evidence,
+    )
+    roles_by_evidence_id = {
+        **{
+            item.evidence_id: ExperimentRole.BASELINE
+            for item in plan.baseline_evidence
+        },
+        **{
+            item.evidence_id: ExperimentRole.CANDIDATE
+            for item in plan.candidate_evidence
+        },
+        **{
+            item.evidence_id: ExperimentRole.REFERENCE
+            for item in plan.reference_evidence
+        },
+    }
     bound: list[tuple[NormalizedEvidence, ArtifactBinding]] = []
     for binding in selected.bindings:
         item = evidence_for_binding(binding, evidence)
@@ -431,17 +458,26 @@ def _evidence_by_binding(
         if binding.mappings != item.adapter_match.mappings:
             raise MaterializationUnavailable("selected field selectors changed")
         _validate_normalized_provenance(item)
-        expected = (
-            ExperimentRole.BASELINE
-            if item in plan.baseline_evidence
-            else ExperimentRole.CANDIDATE
-        )
+        expected = roles_by_evidence_id.get(item.evidence_id)
+        if expected is None:
+            raise MaterializationUnavailable(
+                "selected evidence has no planned experiment role"
+            )
         if binding.role is not expected:
             raise MaterializationUnavailable("selected experiment role changed")
-        if binding.kind is ArtifactKind.DATASET and binding.dataset_split not in {
-            DatasetSplit.TRAIN,
-            DatasetSplit.EVAL,
-        }:
+        training_profile = (
+            plan.profiled_policy is None
+            or plan.profiled_policy.profile_id
+            is EvidenceProfileId.TRAINING_EXPERIMENT_V0
+        )
+        if (
+            training_profile
+            and binding.kind is ArtifactKind.DATASET
+            and binding.dataset_split not in {
+                DatasetSplit.TRAIN,
+                DatasetSplit.EVAL,
+            }
+        ):
             raise MaterializationUnavailable(
                 "selected dataset binding has no validated train/eval split"
             )
@@ -479,14 +515,56 @@ def _validate_normalized_provenance(evidence: NormalizedEvidence) -> None:
             )
 
 
+def _revalidate_profile_selection(
+    plan: EphemeralAuditPlan,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+) -> None:
+    if plan.profiled_policy is None:
+        return
+    if plan.scientific_claim is None:
+        raise MaterializationUnavailable(
+            "profiled execution has no canonical scientific claim"
+        )
+    selected = plan.selected_mapping
+    assert selected is not None
+    evidence = tuple(item for item, _binding in bound)
+    try:
+        outcome = select_evidence_profile(
+            plan.scientific_claim,
+            normalized_evidence=evidence,
+            mapping_candidates=(selected,) if type(selected) is MappingCandidate else (),
+            approved_mapping=selected if type(selected) is RepoMapping else None,
+        )
+    except Exception as error:
+        raise MaterializationUnavailable(
+            "profile selection could not be independently revalidated"
+        ) from error
+    if (
+        outcome.state is not ProfileSelectionState.SELECTED
+        or outcome.selection is None
+        or outcome.selection != plan.profiled_policy.profile_selection
+        or not outcome.selection.complete
+    ):
+        raise MaterializationUnavailable(
+            "profile selection no longer matches the exact bound evidence"
+        )
+    if profiled_evidence_policy(plan.scientific_claim, outcome.selection) != plan.profiled_policy:
+        raise MaterializationUnavailable(
+            "profile obligation policy no longer matches the exact bound evidence"
+        )
+
+
 def _capture_plan_artifacts(
     runtime: RuntimeExecutionContext,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    *,
+    revalidate_fixed_adapters: bool = False,
 ) -> Mapping[str, PassiveArtifact]:
     captured: dict[str, PassiveArtifact] = {}
     captured_kinds: dict[str, ArtifactKind] = {}
     revalidated_datasets: set[str] = set()
     revalidated_tables: set[str] = set()
+    revalidated_evidence: set[str] = set()
     total = 0
     for evidence, binding in sorted(
         bound,
@@ -531,7 +609,40 @@ def _capture_plan_artifacts(
                 )
             _revalidate_table_selection(evidence, binding, passive)
             revalidated_tables.add(evidence.evidence_id)
+        elif (
+            revalidate_fixed_adapters
+            and evidence.artifact.kind is not ArtifactKind.DATASET
+            and evidence.evidence_id not in revalidated_evidence
+        ):
+            _revalidate_fixed_adapter(evidence, binding, passive)
+            revalidated_evidence.add(evidence.evidence_id)
     return captured
+
+
+def _revalidate_fixed_adapter(
+    evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
+    passive: PassiveArtifact,
+) -> None:
+    if binding.adapter_id is None:
+        raise MaterializationUnavailable(
+            "profile evidence has no fixed adapter identity"
+        )
+    try:
+        from .adapters import get_adapter
+
+        adapter = get_adapter(binding.adapter_id)
+        fresh = adapter.extract(passive, evidence.adapter_match)
+    except MaterializationUnavailable:
+        raise
+    except Exception as error:
+        raise MaterializationUnavailable(
+            f"fresh passive profile adapter revalidation failed: {error}"
+        ) from error
+    if type(fresh) is not NormalizedEvidence or fresh != evidence:
+        raise MaterializationUnavailable(
+            "planned profile evidence no longer matches fixed adapter extraction"
+        )
 
 
 def _revalidate_table_selection(
@@ -859,12 +970,35 @@ def _trace_adapter_version(adapter_id: str) -> str | None:
     return None if matched is None else matched.group(1)
 
 
-def _trace_selectors(binding: ArtifactBinding) -> tuple[TraceSelector, ...]:
+def _benchmark_profile_selector_field(binding_mapping: FieldMapping) -> str | None:
+    selector = binding_mapping.selector
+    if selector.kind is SelectorKind.DOTTED_PATH:
+        return selector.expression
+    if selector.kind is SelectorKind.JSON_POINTER:
+        return ".".join(
+            token.replace("~1", "/").replace("~0", "~")
+            for token in selector.expression.split("/")[1:]
+        )
+    return None
+
+
+def _trace_selectors(
+    binding: ArtifactBinding,
+    *,
+    benchmark_profile: bool = False,
+) -> tuple[TraceSelector, ...]:
     selectors: list[TraceSelector] = []
     for mapping in sorted(
         binding.mappings,
         key=field_mapping_identity,
     ):
+        if benchmark_profile and (
+            mapping.target_field not in {"metric_value", "run_id", "seed"}
+            and mapping.target_field not in _BENCHMARK_PROFILE_FIELDS
+            and _benchmark_profile_selector_field(mapping)
+            not in _BENCHMARK_PROFILE_FIELDS
+        ):
+            continue
         if type(mapping.selector) is TableSelector:
             selectors.append(
                 TraceSelector(
@@ -898,31 +1032,83 @@ def _trace_artifact_values(
     binding: ArtifactBinding,
     passive: PassiveArtifact,
     metric: str,
+    *,
+    benchmark_profile: bool = False,
 ) -> tuple[BoundedValueRepresentation, BoundedValueRepresentation, str]:
-    if evidence.artifact.kind is ArtifactKind.RESULTS:
+    if evidence.artifact.kind in {ArtifactKind.RESULTS, ArtifactKind.BENCHMARK}:
+        profiled_result = (
+            benchmark_profile
+            or evidence.artifact.kind is ArtifactKind.BENCHMARK
+        )
         records: list[dict[str, object]] = []
         for observation in evidence.observations:
-            if observation.metric_name != metric:
+            if (
+                evidence.artifact.kind is ArtifactKind.RESULTS
+                and not benchmark_profile
+                and observation.metric_name != metric
+            ):
+                continue
+            if observation.metric_name is None:
                 continue
             record: dict[str, object] = {"metric_value": observation.metric_value}
+            if profiled_result:
+                record["metric_name"] = observation.metric_name
             if observation.seed is not None:
                 record["seed"] = observation.seed
             records.append(record)
+        config_values: dict[str, object] = {}
+        if profiled_result:
+            selected_keys = {
+                value
+                for item in binding.mappings
+                for value in (item.target_field, item.selector.expression)
+            }
+            for observation in evidence.observations:
+                for config in observation.config_values:
+                    if config.key not in _BENCHMARK_PROFILE_FIELDS:
+                        continue
+                    if config.key not in selected_keys:
+                        raise TraceContractError(
+                            "benchmark trace contains an unselected profile value"
+                        )
+                    if (
+                        config.key in config_values
+                        and config_values[config.key] != config.value
+                    ):
+                        raise TraceContractError(
+                            "benchmark trace contains conflicting selected values"
+                        )
+                    config_values[config.key] = config.value
         if not records:
             raise TraceContractError("result trace has no consumed metric values")
-        representation = BoundedValueRepresentation.from_value(records)
-        return representation, representation, "results.metric_values"
-    if evidence.artifact.kind is ArtifactKind.CONFIG:
+        value: object = records
+        detail = "results.metric_values"
+        if profiled_result:
+            value = {
+                "metric_values": records,
+                "profile_components": dict(sorted(config_values.items())),
+            }
+            detail = "benchmark.selected_measurement_values"
+        representation = BoundedValueRepresentation.from_value(value)
+        return representation, representation, detail
+    if evidence.artifact.kind in {ArtifactKind.CONFIG, ArtifactKind.DOCUMENT}:
         values: dict[str, object] = {}
         for observation in evidence.observations:
             for config in observation.config_values:
+                if benchmark_profile and config.key not in _BENCHMARK_PROFILE_FIELDS:
+                    continue
                 if config.key in values:
                     raise TraceContractError("config trace contains duplicate selected keys")
                 values[config.key] = config.value
         if not values:
             raise TraceContractError("config trace has no consumed scalar values")
         representation = BoundedValueRepresentation.from_value(values)
-        return representation, representation, "config.selected_scalars"
+        detail = (
+            "config.selected_scalars"
+            if evidence.artifact.kind is ArtifactKind.CONFIG
+            else "document.selected_profile_scalars"
+        )
+        return representation, representation, detail
     if evidence.artifact.kind is ArtifactKind.DATASET:
         source = BoundedValueRepresentation.from_bytes(passive.content)
         normalized = BoundedValueRepresentation.from_value(
@@ -945,6 +1131,11 @@ def _passive_trace_entries(
 ) -> tuple[EvidenceTraceEntry, ...]:
     if plan.audit_claim is None:
         raise TraceContractError("trace requires an executable audit claim")
+    benchmark_profile = (
+        plan.profiled_policy is not None
+        and plan.profiled_policy.profile_id
+        is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0
+    )
     entries: list[EvidenceTraceEntry] = []
     for evidence, binding in sorted(
         bound,
@@ -961,12 +1152,17 @@ def _passive_trace_entries(
             binding,
             captured[str(evidence.artifact.path)],
             plan.audit_claim.metric,
+            benchmark_profile=benchmark_profile,
         )
         categories = {
             ArtifactKind.RESULTS: ("RESULT", "SEED"),
             ArtifactKind.CONFIG: ("CONFIG",),
             ArtifactKind.DATASET: ("DATASET",),
+            ArtifactKind.BENCHMARK: ("BENCHMARK", "RESULT", "SEED"),
+            ArtifactKind.DOCUMENT: ("BENCHMARK",),
         }[evidence.artifact.kind]
+        if benchmark_profile and "BENCHMARK" not in categories:
+            categories = (*categories, "BENCHMARK")
         rule_ids = _trace_rule_ids(result, *categories)
         material = {
             "path": str(evidence.artifact.path),
@@ -994,7 +1190,10 @@ def _passive_trace_entries(
                 artifact_kind=evidence.artifact.kind,
                 adapter_id=binding.adapter_id,
                 adapter_version=_trace_adapter_version(binding.adapter_id),
-                selectors=_trace_selectors(binding),
+                selectors=_trace_selectors(
+                    binding,
+                    benchmark_profile=benchmark_profile,
+                ),
                 role=binding.role,
                 dataset_split=binding.dataset_split,
                 source_value=source,
@@ -1012,9 +1211,16 @@ def _derived_trace_entries(
 ) -> tuple[EvidenceTraceEntry, ...]:
     artifact_categories = {
         "CONFIG": {ArtifactKind.CONFIG},
-        "RESULT": {ArtifactKind.RESULTS},
-        "SEED": {ArtifactKind.RESULTS},
+        "RESULT": {ArtifactKind.RESULTS, ArtifactKind.BENCHMARK},
+        "SEED": {ArtifactKind.RESULTS, ArtifactKind.BENCHMARK},
         "DATASET": {ArtifactKind.DATASET},
+        "BENCHMARK": {
+            ArtifactKind.BENCHMARK,
+            ArtifactKind.CONFIG,
+            ArtifactKind.RESULTS,
+            ArtifactKind.DATASET,
+            ArtifactKind.DOCUMENT,
+        },
     }
     entries: list[EvidenceTraceEntry] = []
     stable_findings = stable_audit_projection(result).get("findings")
@@ -1259,8 +1465,18 @@ def execute_ephemeral_audit_with_trace(
     created = False
     created_identity: tuple[int, int] | None = None
     try:
+        benchmark_profile = (
+            plan.profiled_policy is not None
+            and plan.profiled_policy.profile_id
+            is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0
+        )
         bound = _evidence_by_binding(plan)
-        captured = _capture_plan_artifacts(runtime, bound)
+        captured = _capture_plan_artifacts(
+            runtime,
+            bound,
+            revalidate_fixed_adapters=benchmark_profile,
+        )
+        _revalidate_profile_selection(plan, bound)
         try:
             plan_root.mkdir(exist_ok=False)
         except FileExistsError as error:
@@ -1270,7 +1486,11 @@ def execute_ephemeral_audit_with_trace(
         created = True
         root_stat = os.lstat(plan_root)
         created_identity = (root_stat.st_dev, root_stat.st_ino)
-        manifest = _write_native_tree(plan_root, plan, captured, bound)
+        manifest = (
+            None
+            if benchmark_profile
+            else _write_native_tree(plan_root, plan, captured, bound)
+        )
         measurement_context = (
             None
             if plan.scientific_claim is None
@@ -1280,15 +1500,40 @@ def execute_ephemeral_audit_with_trace(
                 captured,
             )
         )
-        result = (
-            audit_research(manifest, artifact_root=plan_root)
-            if measurement_context is None
-            else audit_research(
-                manifest,
+        if plan.profiled_policy is None:
+            assert manifest is not None
+            result = (
+                audit_research(manifest, artifact_root=plan_root)
+                if measurement_context is None
+                else audit_research(
+                    manifest,
+                    artifact_root=plan_root,
+                    measurement_context=measurement_context,
+                )
+            )
+        else:
+            by_role = {
+                role: tuple(
+                    evidence
+                    for evidence, binding in bound
+                    if binding.role is role
+                )
+                for role in (
+                    ExperimentRole.BASELINE,
+                    ExperimentRole.CANDIDATE,
+                    ExperimentRole.REFERENCE,
+                )
+            }
+            result = audit_profiled(
+                plan.profiled_policy,
+                training_manifest=manifest,
                 artifact_root=plan_root,
+                audit_claim=plan.audit_claim,
+                baseline_evidence=by_role[ExperimentRole.BASELINE],
+                candidate_evidence=by_role[ExperimentRole.CANDIDATE],
+                reference_evidence=by_role[ExperimentRole.REFERENCE],
                 measurement_context=measurement_context,
             )
-        )
         if type(result) is not AuditResult:
             raise MaterializationUnavailable(
                 "native Audit did not return an actual AuditResult"

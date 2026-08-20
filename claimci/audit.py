@@ -332,3 +332,52 @@ def audit_research(
         direction=spec.direction,
         measurement_drift=measurement_drift,
     )
+
+
+def audit_profiled(
+    profiled_policy: object,
+    *,
+    training_manifest: Path | None,
+    artifact_root: Path | None,
+    audit_claim: object,
+    baseline_evidence: object,
+    candidate_evidence: object,
+    reference_evidence: object = (),
+    measurement_context: MeasurementAuditContext | None = None,
+) -> AuditResult:
+    """Dispatch one evidence profile into the single native Audit authority."""
+
+    from .analysis.contracts import AuditClaimSpec, NormalizedEvidence
+    from .analysis.profiles import EvidenceProfileId, ProfiledEvidencePolicy
+
+    if type(profiled_policy) is not ProfiledEvidencePolicy:
+        raise TypeError("profiled Audit requires ProfiledEvidencePolicy")
+    if profiled_policy.profile_id is EvidenceProfileId.TRAINING_EXPERIMENT_V0:
+        if training_manifest is None:
+            raise ClaimCIError("Training profile requires the confined native manifest")
+        return audit_research(
+            training_manifest,
+            artifact_root=artifact_root,
+            measurement_context=measurement_context,
+        )
+    if type(audit_claim) is not AuditClaimSpec:
+        raise TypeError("Benchmark profile requires AuditClaimSpec")
+    for label, values in (
+        ("baseline", baseline_evidence),
+        ("candidate", candidate_evidence),
+        ("reference", reference_evidence),
+    ):
+        if not isinstance(values, tuple) or not all(
+            type(item) is NormalizedEvidence for item in values
+        ):
+            raise TypeError(f"profiled Audit {label} evidence is invalid")
+    from .benchmark_audit import audit_benchmark
+
+    return audit_benchmark(
+        audit_claim=audit_claim,
+        selection=profiled_policy.profile_selection,
+        baseline_evidence=baseline_evidence,
+        candidate_evidence=candidate_evidence,
+        reference_evidence=reference_evidence,
+        measurement_context=measurement_context,
+    )

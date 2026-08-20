@@ -1175,6 +1175,8 @@ class EphemeralAuditPlan:
     scientific_claim: "CanonicalScientificClaim | None" = None
     claim_policy: "ClaimEvidencePolicy | None" = None
     evidence_obligations: "EvidenceObligationBundle | None" = None
+    profiled_policy: "ProfiledEvidencePolicy | None" = None
+    reference_evidence: tuple[NormalizedEvidence, ...] = ()
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1203,9 +1205,24 @@ class EphemeralAuditPlan:
                 raise AnalysisContractError(
                     f"plan {label} evidence has a conflicting experiment role"
                 )
+        if not isinstance(self.reference_evidence, tuple) or not all(
+            isinstance(item, NormalizedEvidence) for item in self.reference_evidence
+        ):
+            raise TypeError("plan reference_evidence must be a tuple")
+        if not all(
+            _evidence_role_matches(item, ExperimentRole.REFERENCE)
+            for item in self.reference_evidence
+        ):
+            raise AnalysisContractError(
+                "plan reference evidence has a conflicting experiment role"
+            )
         evidence_ids = tuple(
             item.evidence_id
-            for item in (*self.baseline_evidence, *self.candidate_evidence)
+            for item in (
+                *self.baseline_evidence,
+                *self.candidate_evidence,
+                *self.reference_evidence,
+            )
         )
         if len(set(evidence_ids)) != len(evidence_ids):
             raise AnalysisContractError("plan evidence IDs must be unique")
@@ -1309,12 +1326,39 @@ class EphemeralAuditPlan:
                 raise AnalysisContractError(
                     "plan evidence obligations must match the selected claim"
                 )
+            expected_policy_id = (
+                self.claim_policy.policy_id
+                if self.profiled_policy is None
+                else self.profiled_policy.policy_id
+            )
             if self.claim_policy is not None and (
-                self.evidence_obligations.policy_id != self.claim_policy.policy_id
+                self.evidence_obligations.policy_id != expected_policy_id
             ):
                 raise AnalysisContractError(
                     "plan evidence obligations must match the claim policy"
                 )
+        if self.profiled_policy is not None:
+            from .profiles import (
+                EvidenceProfileId,
+                ProfiledEvidencePolicy,
+                profiled_evidence_policy,
+            )
+
+            if type(self.profiled_policy) is not ProfiledEvidencePolicy:
+                raise TypeError("plan profiled_policy must be ProfiledEvidencePolicy or null")
+            if self.scientific_claim is None:
+                raise AnalysisContractError("profiled plan requires canonical claim semantics")
+            if self.profiled_policy != profiled_evidence_policy(
+                self.scientific_claim,
+                self.profiled_policy.profile_selection,
+            ):
+                raise AnalysisContractError("plan profiled policy is not canonical")
+            if (
+                self.profiled_policy.profile_id
+                is EvidenceProfileId.TRAINING_EXPERIMENT_V0
+                and self.reference_evidence
+            ):
+                raise AnalysisContractError("Training profile cannot carry reference evidence")
 
 
 def _deep_freeze(value: object) -> object:
@@ -1611,7 +1655,11 @@ def to_jsonable(value: object) -> object:
     """Return a detached JSON-compatible view of approved analysis values."""
 
     if type(value).__module__ == "claimci.analysis.obligations":
-        from .obligations import ArtifactEvidenceSupport, MeasurementProcedureSupport
+        from .obligations import (
+            ArtifactEvidenceSupport,
+            MeasurementProcedureSupport,
+            ProfileEvidenceSupport,
+        )
 
         if type(value) is ArtifactEvidenceSupport:
             return {
@@ -1625,6 +1673,15 @@ def to_jsonable(value: object) -> object:
                 "procedure": value.procedure.value,
                 "evidence_ids": list(value.evidence_ids),
                 "binding_ids": list(value.binding_ids),
+            }
+        if type(value) is ProfileEvidenceSupport:
+            return {
+                "support_id": value.support_id,
+                "profile_id": value.profile_id.value,
+                "slot_id": value.slot_id,
+                "role_mode": value.role_mode.value,
+                "support_kind": value.support_kind.value,
+                "source_binding_ids": list(value.source_binding_ids),
             }
     if type(value).__module__ == "claimci.analysis.trace":
         from .trace import trace_to_jsonable
