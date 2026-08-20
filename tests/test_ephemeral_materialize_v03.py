@@ -20,6 +20,10 @@ from claimci.analysis import (
     Confidence,
     ConfigValue,
     DatasetSplit,
+    EvidenceTraceBundle,
+    TraceAuthorityClass,
+    TraceCompleteness,
+    TraceRecordKind,
     EphemeralAuditPlan,
     EvidenceSelector,
     ExperimentRole,
@@ -35,16 +39,20 @@ from claimci.analysis import (
     NormalizedObservation,
     PassiveArtifact,
     ProvenanceKind,
+    RepoMapping,
     RepositoryIdentity,
     RepositoryPath,
     RuntimeExecutionContext,
     SelectorKind,
     Sha256Digest,
     execute_ephemeral_audit,
+    execute_ephemeral_audit_with_trace,
     derive_ephemeral_plan_id,
+    to_jsonable,
 )
 from claimci.analysis.adapters import extract_registered_artifact
 from claimci.models import AuditResult, Direction, Verdict
+from claimci.report import render_json
 
 
 REPOSITORY = RepositoryIdentity("amebaleon", "ClaimCI-Demo")
@@ -387,6 +395,202 @@ def _plan_fixture(
         ),
     )
     return plan, runtime, checkout, scratch
+
+
+def test_traced_execution_preserves_the_exact_audit_result_and_rendering(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+
+    traced = execute_ephemeral_audit_with_trace(plan, runtime)
+    compatibility = execute_ephemeral_audit(plan, runtime)
+
+    assert type(traced.audit_result) is AuditResult
+    assert traced.audit_result == compatibility
+    assert render_json(traced.audit_result) == render_json(compatibility)
+    assert traced.trace.completeness is TraceCompleteness.COMPLETE
+    assert traced.trace.head_sha == plan.head_sha
+    assert traced.trace.deterministic_authority.verdict is compatibility.verdict
+    assert not tuple(scratch.iterdir())
+
+
+def test_trace_identity_does_not_depend_on_ephemeral_scratch_paths(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "one"
+    second_root = tmp_path / "two"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_plan, first_runtime, _checkout, _scratch = _plan_fixture(first_root)
+    second_plan, second_runtime, _checkout, _scratch = _plan_fixture(second_root)
+
+    first = execute_ephemeral_audit_with_trace(first_plan, first_runtime)
+    second = execute_ephemeral_audit_with_trace(second_plan, second_runtime)
+
+    assert first.audit_result.verdict is second.audit_result.verdict
+    assert first.trace == second.trace
+
+
+def test_complete_trace_links_exact_passive_sources_to_actual_audit_rules(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+
+    execution = execute_ephemeral_audit_with_trace(plan, runtime)
+    trace = execution.trace
+    passive = tuple(
+        item
+        for item in trace.entries
+        if item.record_kind is TraceRecordKind.PASSIVE_SOURCE_EVIDENCE
+    )
+
+    assert len(passive) == 8
+    baseline = next(
+        item
+        for item in passive
+        if item.artifact_path == RepositoryPath("results/baseline.csv")
+    )
+    planned = next(
+        item
+        for item in plan.baseline_evidence
+        if item.artifact.path == baseline.artifact_path
+    )
+    assert baseline.artifact_sha256 == planned.artifact.sha256
+    assert baseline.artifact_size == planned.artifact.size
+    assert baseline.adapter_id == "fixture.results"
+    assert baseline.adapter_version is None
+    assert baseline.role is ExperimentRole.BASELINE
+    assert tuple(item.expression for item in baseline.selectors) == ("accuracy",)
+    assert baseline.source_value is not None
+    assert baseline.source_value.direct_values == (0.5, 1, 0.6, 2, 0.7, 3)
+    assert baseline.normalized_value == baseline.source_value
+    assert "RESULT.RECOMPUTED" in baseline.consumer_rule_ids
+    assert "SEED.IMBALANCE" in baseline.consumer_rule_ids
+
+    dataset = next(
+        item
+        for item in passive
+        if item.artifact_path == RepositoryPath("data/candidate-train.jsonl")
+    )
+    assert dataset.adapter_id == "claimci-jsonl-dataset-v1"
+    assert dataset.adapter_version == "v1"
+    assert dataset.dataset_split is DatasetSplit.TRAIN
+    assert dataset.source_value is not None
+    assert dataset.source_value.direct_values == ()
+
+    consumed = {
+        rule_id
+        for item in trace.entries
+        for rule_id in item.consumer_rule_ids
+    }
+    actual = {item.rule_id for item in execution.audit_result.findings}
+    assert consumed == actual
+
+
+def test_trace_does_not_persist_repository_prose_or_string_config_values(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+
+    execution = execute_ephemeral_audit_with_trace(plan, runtime)
+    payload = json.dumps(to_jsonable(execution.trace), sort_keys=True)
+
+    assert plan.claim.text not in payload
+    assert '"demo"' not in payload
+    assert '"model.name": "demo"' not in payload
+    assert '"v1"' in payload  # adapter version metadata is safe identity.
+    assert "0.9" in payload
+
+
+def test_trace_failure_never_changes_or_discards_the_audit_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    expected = execute_ephemeral_audit(plan, runtime)
+
+    def fail_trace(*_args: object, **_kwargs: object) -> EvidenceTraceBundle:
+        raise RuntimeError("trace-only failure")
+
+    monkeypatch.setattr(
+        "claimci.analysis.materialize._build_evidence_trace",
+        fail_trace,
+    )
+    execution = execute_ephemeral_audit_with_trace(plan, runtime)
+
+    assert execution.audit_result == expected
+    assert execution.trace.completeness is TraceCompleteness.UNAVAILABLE
+    assert execution.trace.deterministic_authority.verdict is expected.verdict
+
+
+def test_provider_claim_hint_remains_non_authoritative_in_complete_trace(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    provider = FieldProvenance(
+        ProvenanceKind.PROVIDER_PROPOSAL,
+        "validated semantic proposal",
+        RepositoryPath("CLAIM.md"),
+        "semantic-call-1",
+    )
+    assert plan.audit_claim is not None
+    changed = dataclasses.replace(
+        plan,
+        claim=dataclasses.replace(plan.claim, provenance=provider),
+        audit_claim=dataclasses.replace(
+            plan.audit_claim,
+            metric_provenance=provider,
+            direction_provenance=provider,
+            threshold_provenance=provider,
+        ),
+    )
+    changed = dataclasses.replace(changed, plan_id=derive_ephemeral_plan_id(changed))
+
+    trace = execute_ephemeral_audit_with_trace(changed, runtime).trace
+    proposals = tuple(
+        item
+        for item in trace.entries
+        if item.record_kind is TraceRecordKind.LLM_SEMANTIC_PROPOSAL
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0].authority is TraceAuthorityClass.NON_AUTHORITATIVE_INPUT
+    assert all(
+        item.provenance_kind is ProvenanceKind.ADAPTER_EXTRACTION
+        for item in trace.entries
+        if item.record_kind is TraceRecordKind.PASSIVE_SOURCE_EVIDENCE
+    )
+    assert trace.deterministic_authority.authority.value == "deterministic"
+
+
+def test_repo_mapping_approval_is_binding_trust_not_verdict_authority(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    assert type(plan.selected_mapping) is MappingCandidate
+    approved = RepoMapping.approve(
+        plan.repository,
+        plan.selected_mapping,
+        approved_by="pilot-user-1",
+    )
+    changed = dataclasses.replace(
+        plan,
+        selected_mapping=approved,
+        mapping_provenance=(approved.approval_provenance,),
+    )
+    changed = dataclasses.replace(changed, plan_id=derive_ephemeral_plan_id(changed))
+
+    trace = execute_ephemeral_audit_with_trace(changed, runtime).trace
+    approvals = tuple(
+        item
+        for item in trace.entries
+        if item.record_kind is TraceRecordKind.APPROVED_MAPPING
+    )
+
+    assert len(approvals) == 1
+    assert approvals[0].authority is TraceAuthorityClass.EXPLICIT_MAPPING_APPROVAL
+    assert approvals[0].consumer_rule_ids == ()
+    assert trace.deterministic_authority.authority.value == "deterministic"
 
 
 def test_runtime_context_rejects_overlapping_or_symlinked_roots(

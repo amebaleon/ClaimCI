@@ -14,6 +14,7 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactKind,
     Confidence,
+    EvidenceTraceBundle,
     ExperimentRole,
     GitCommitSha,
     MappingCandidate,
@@ -23,6 +24,7 @@ from claimci.analysis import (
     RepositoryPath,
     RepositoryIdentity,
     Sha256Digest,
+    TraceCompleteness,
     UnifiedAnalysisResult,
     plan_ephemeral_audit,
     run_unified_analysis,
@@ -229,6 +231,9 @@ def test_state_successful_audit_with_disabled_review_is_partial_with_authority(
     assert result.state is AnalysisState.PARTIAL
     assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
     assert result.research_interpretation is None
+    assert result.evidence_trace is not None
+    assert result.evidence_trace.completeness is TraceCompleteness.COMPLETE
+    assert result.evidence_trace.advisory_interpretation is None
 
 
 def test_state_review_failure_is_partial_without_provider_error_leak(
@@ -275,7 +280,7 @@ def test_state_unexpected_executor_failure_is_fail_closed_unavailable(
     request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
     monkeypatch.setattr(
         integration,
-        "execute_ephemeral_audit",
+        "execute_ephemeral_audit_with_trace",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("private executor failure detail")
         ),
@@ -309,7 +314,39 @@ def test_scenario_a_zero_manifest_normalized_evidence_runs_full_analysis(
     assert result.state is AnalysisState.COMPLETE
     assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
     assert result.research_interpretation is not None
+    assert result.evidence_trace is not None
+    assert result.evidence_trace.completeness is TraceCompleteness.COMPLETE
+    assert result.evidence_trace.advisory_interpretation is not None
+    assert not hasattr(result.evidence_trace.advisory_interpretation, "verdict")
     assert len(provider.calls) == 1
+
+
+def test_advisory_trace_failure_preserves_the_real_verdict_and_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+
+    def fail_advisory_trace(
+        self: EvidenceTraceBundle,
+        _interpretation: object,
+    ) -> EvidenceTraceBundle:
+        raise RuntimeError("trace-only advisory failure")
+
+    monkeypatch.setattr(EvidenceTraceBundle, "with_advisory", fail_advisory_trace)
+    result = run_unified_analysis(
+        request,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=IntegrationProvider(),
+    )
+
+    assert result.state is AnalysisState.COMPLETE
+    assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
+    assert result.research_interpretation is not None
+    assert result.evidence_trace is not None
+    assert result.evidence_trace.completeness is TraceCompleteness.UNAVAILABLE
+    assert result.evidence_trace.advisory_interpretation is not None
 
 
 def test_scenario_b_native_manifest_preserves_audit_bytes(study_factory) -> None:
@@ -336,6 +373,7 @@ def test_scenario_c_ambiguous_candidate_mapping_asks_without_verdict(
     assert result.state is AnalysisState.MAPPING_NEEDED
     assert result.mapping_question is not None
     assert result.authoritative_verdict is None
+    assert result.evidence_trace is None
 
 
 def test_scenario_d_missing_dataset_is_pre_audit_partial(tmp_path: Path) -> None:

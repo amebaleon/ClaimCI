@@ -1176,6 +1176,7 @@ class UnifiedAnalysisResult:
     mapping_question: MappingQuestion | None = None
     unavailable_reason: str | None = None
     missing_evidence: tuple[MissingEvidence, ...] = ()
+    evidence_trace: "EvidenceTraceBundle | None" = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("UnifiedAnalysisResult is final to preserve authority")
@@ -1212,6 +1213,28 @@ class UnifiedAnalysisResult:
             raise TypeError(
                 "unified missing_evidence must be a tuple of MissingEvidence values"
             )
+        if self.evidence_trace is not None:
+            from .trace import EvidenceTraceBundle
+
+            if type(self.evidence_trace) is not EvidenceTraceBundle:
+                raise TypeError("unified evidence_trace must be EvidenceTraceBundle")
+            if self.deterministic is None:
+                raise AnalysisContractError(
+                    "evidence trace requires a deterministic outcome"
+                )
+            if (
+                self.evidence_trace.deterministic_authority.verdict
+                is not self.deterministic.verdict
+            ):
+                raise AnalysisContractError(
+                    "evidence trace verdict does not match deterministic authority"
+                )
+            if (
+                self.evidence_trace.advisory_interpretation is None
+            ) != (self.research_interpretation is None):
+                raise AnalysisContractError(
+                    "evidence trace advisory state does not match Research Review"
+                )
 
         if self.state is AnalysisState.COMPLETE:
             if self.deterministic is None:
@@ -1239,6 +1262,10 @@ class UnifiedAnalysisResult:
                 raise AnalysisContractError(
                     "mapping-needed analysis cannot carry an unavailable reason"
                 )
+            if self.evidence_trace is not None:
+                raise AnalysisContractError(
+                    "mapping-needed analysis cannot carry deterministic evidence trace"
+                )
         elif self.state is AnalysisState.UNAVAILABLE:
             if self.unavailable_reason is None:
                 raise AnalysisContractError(
@@ -1254,6 +1281,10 @@ class UnifiedAnalysisResult:
             ):
                 raise AnalysisContractError(
                     "unavailable analysis cannot carry an available result"
+                )
+            if self.evidence_trace is not None:
+                raise AnalysisContractError(
+                    "unavailable analysis cannot carry deterministic evidence trace"
                 )
         elif not any(
             value is not None
@@ -1278,6 +1309,10 @@ class UnifiedAnalysisResult:
 def to_jsonable(value: object) -> object:
     """Return a detached JSON-compatible view of approved analysis values."""
 
+    if type(value).__module__ == "claimci.analysis.trace":
+        from .trace import trace_to_jsonable
+
+        return trace_to_jsonable(value)
     if isinstance(value, Confidence):
         return value.value
     if isinstance(value, Enum):

@@ -9,6 +9,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Mapping
 
 from claimci.models import AuditResult, Verdict
@@ -116,10 +117,10 @@ def _canonical_value(value: object, *, state: list[int]) -> object:
     if isinstance(value, str):
         return {"type": "string", "value": value}
     if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TraceContractError("trace source mapping keys must be text")
         pairs: list[list[object]] = []
         for key in sorted(value):
-            if not isinstance(key, str):
-                raise TraceContractError("trace source mapping keys must be text")
             pairs.append([key, _canonical_value(value[key], state=state)])
         return {"type": "mapping", "value": pairs}
     if isinstance(value, (tuple, list)):
@@ -435,8 +436,6 @@ class EvidenceTraceEntry:
             if self.consumer_rule_ids:
                 raise TraceContractError("mapping approval is not deterministic rule authority")
         elif self.record_kind is TraceRecordKind.NATURAL_LANGUAGE_CLAIM:
-            if self.consumer_rule_ids:
-                raise TraceContractError("natural-language claim is not deterministic evidence")
             if self.source_value is None:
                 raise TraceContractError("natural-language claim requires a source commitment")
 
@@ -484,8 +483,14 @@ class DeterministicAuditTrace:
             raise TypeError("deterministic trace authority requires an actual AuditResult")
         if type(result.verdict) is not Verdict:
             raise TypeError("deterministic trace authority requires an actual Verdict")
-        rendered = render_json(result).encode("utf-8")
-        rules = tuple(item.rule_id for item in result.findings)
+        rendered = json.dumps(
+            stable_audit_projection(result),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        rules = tuple(sorted({item.rule_id for item in result.findings}))
         _validate_text_tuple(
             rules,
             "deterministic rule_ids",
@@ -502,6 +507,44 @@ class DeterministicAuditTrace:
         object.__setattr__(instance, "rule_ids", rules)
         object.__setattr__(instance, "authority", AnalysisAuthority.DETERMINISTIC)
         return instance
+
+
+def _replace_ephemeral_paths(value: object, root: Path | None) -> object:
+    if root is None:
+        return value
+    if isinstance(value, str):
+        try:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                return value
+            relative = candidate.relative_to(root)
+        except (OSError, ValueError):
+            return value
+        return "<ephemeral>/" + relative.as_posix()
+    if isinstance(value, list):
+        return [_replace_ephemeral_paths(item, root) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_ephemeral_paths(item, root)
+            for key, item in value.items()
+        }
+    return value
+
+
+def stable_audit_projection(result: AuditResult) -> dict[str, object]:
+    """Project one actual Audit result without invocation-private scratch paths."""
+
+    if type(result) is not AuditResult:
+        raise TypeError("stable Audit projection requires an actual AuditResult")
+    rendered = json.loads(render_json(result))
+    if not isinstance(rendered, dict):
+        raise TraceContractError("Audit rendering must be a JSON object")
+    manifest = result.manifest_path
+    root = manifest.parent if manifest.is_absolute() else None
+    projected = _replace_ephemeral_paths(rendered, root)
+    if not isinstance(projected, dict):
+        raise TraceContractError("stable Audit projection must be a mapping")
+    return projected
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -565,6 +608,28 @@ def _canonical_json_bytes(value: object) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+def trace_to_jsonable(value: object) -> object:
+    """Return the compact strict trace wire projection without null padding."""
+
+    if type(value).__module__ != "claimci.analysis.trace":
+        return to_jsonable(value)
+    if isinstance(value, Enum):
+        return value.value
+    if dataclasses.is_dataclass(value):
+        projection: dict[str, object] = {}
+        for item in dataclasses.fields(value):
+            raw = getattr(value, item.name)
+            if raw is None or raw == ():
+                continue
+            if item.name == "omitted_entry_count" and raw == 0:
+                continue
+            if item.name == "role" and raw is ExperimentRole.UNSPECIFIED:
+                continue
+            projection[item.name] = trace_to_jsonable(raw)
+        return projection
+    raise TypeError("value is not a supported trace projection")
 
 
 @dataclass(frozen=True, slots=True)
@@ -678,11 +743,38 @@ class EvidenceTraceBundle:
         )
 
     @classmethod
+    def bounded_entries(
+        cls,
+        *,
+        head_sha: GitCommitSha,
+        result: AuditResult,
+        entries: tuple[EvidenceTraceEntry, ...],
+        advisory_interpretation: AdvisoryResearchTrace | None = None,
+        reason_code: str = "trace_size_limit",
+    ) -> "EvidenceTraceBundle":
+        if not isinstance(entries, tuple) or not all(
+            type(item) is EvidenceTraceEntry for item in entries
+        ):
+            raise TypeError("bounded trace entries must be EvidenceTraceEntry values")
+        digest = hashlib.sha256(_canonical_json_bytes(entries)).hexdigest()
+        return cls(
+            head_sha=head_sha,
+            completeness=TraceCompleteness.BOUNDED,
+            entries=(),
+            deterministic_authority=DeterministicAuditTrace.from_audit_result(result),
+            advisory_interpretation=advisory_interpretation,
+            omitted_entry_count=len(entries),
+            omitted_entries_sha256=Sha256Digest(digest),
+            reason_code=reason_code,
+        )
+
+    @classmethod
     def unavailable(
         cls,
         *,
         head_sha: GitCommitSha,
         result: AuditResult,
+        interpretation: AdvisoryResearchInterpretation | None = None,
         reason_code: str = "trace_construction_unavailable",
     ) -> "EvidenceTraceBundle":
         return cls(
@@ -690,6 +782,11 @@ class EvidenceTraceBundle:
             completeness=TraceCompleteness.UNAVAILABLE,
             entries=(),
             deterministic_authority=DeterministicAuditTrace.from_audit_result(result),
+            advisory_interpretation=(
+                None
+                if interpretation is None
+                else AdvisoryResearchTrace.from_interpretation(interpretation)
+            ),
             reason_code=reason_code,
         )
 
@@ -737,4 +834,6 @@ __all__ = [
     "TraceSelector",
     "TraceValueType",
     "trace_json_bytes",
+    "trace_to_jsonable",
+    "stable_audit_projection",
 ]

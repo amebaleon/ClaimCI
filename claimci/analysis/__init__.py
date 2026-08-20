@@ -65,6 +65,7 @@ from .materialize import (
     MaterializationUnavailable,
     RuntimeExecutionContext,
     execute_ephemeral_audit,
+    execute_ephemeral_audit_with_trace,
 )
 from .trace import (
     AdvisoryResearchTrace,
@@ -176,6 +177,7 @@ __all__ = [
     "audit_relevant_claim_projection",
     "derive_ephemeral_plan_id",
     "execute_ephemeral_audit",
+    "execute_ephemeral_audit_with_trace",
     "plan_ephemeral_audit",
     "planning_request_from_discovery",
     "run_unified_analysis",

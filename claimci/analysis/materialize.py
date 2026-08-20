@@ -36,10 +36,25 @@ from .contracts import (
     RepositoryIdentity,
 )
 from .planner import derive_ephemeral_plan_id
+from .trace import (
+    BoundedValueRepresentation,
+    DeterministicAuditTrace,
+    EphemeralAuditExecution,
+    EvidenceTraceBundle,
+    EvidenceTraceEntry,
+    TraceAuthorityClass,
+    TraceCompleteness,
+    TraceContractError,
+    TraceLimitError,
+    TraceRecordKind,
+    TraceSelector,
+    stable_audit_projection,
+)
 
 
 _PLAN_ID = re.compile(r"plan-[0-9a-f]{24}\Z")
 _CONFIG_SEGMENT = re.compile(r"[A-Za-z0-9_-]+\Z")
+_ADAPTER_VERSION = re.compile(r"(?:^|[-_.])(v[0-9]+)\Z")
 
 
 class MaterializationError(RuntimeError):
@@ -700,6 +715,339 @@ def _write_native_tree(
     return manifest_path
 
 
+def _trace_id(label: str, material: object) -> str:
+    canonical = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"trace-{label}-" + hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _trace_rule_ids(result: AuditResult, *categories: str) -> tuple[str, ...]:
+    prefixes = tuple(f"{category}." for category in categories)
+    return tuple(
+        sorted(
+            {
+                finding.rule_id
+                for finding in result.findings
+                if finding.rule_id.startswith(prefixes)
+            }
+        )
+    )
+
+
+def _trace_adapter_version(adapter_id: str) -> str | None:
+    matched = _ADAPTER_VERSION.search(adapter_id)
+    return None if matched is None else matched.group(1)
+
+
+def _trace_selectors(binding: ArtifactBinding) -> tuple[TraceSelector, ...]:
+    return tuple(
+        TraceSelector(
+            mapping.target_field,
+            mapping.selector.kind,
+            mapping.selector.expression,
+        )
+        for mapping in sorted(
+            binding.mappings,
+            key=lambda item: (
+                item.target_field,
+                item.selector.kind.value,
+                item.selector.expression,
+            ),
+        )
+    )
+
+
+def _trace_artifact_values(
+    evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
+    passive: PassiveArtifact,
+    metric: str,
+) -> tuple[BoundedValueRepresentation, BoundedValueRepresentation, str]:
+    if evidence.artifact.kind is ArtifactKind.RESULTS:
+        records: list[dict[str, object]] = []
+        for observation in evidence.observations:
+            if observation.metric_name != metric:
+                continue
+            record: dict[str, object] = {"metric_value": observation.metric_value}
+            if observation.seed is not None:
+                record["seed"] = observation.seed
+            records.append(record)
+        if not records:
+            raise TraceContractError("result trace has no consumed metric values")
+        representation = BoundedValueRepresentation.from_value(records)
+        return representation, representation, "results.metric_values"
+    if evidence.artifact.kind is ArtifactKind.CONFIG:
+        values: dict[str, object] = {}
+        for observation in evidence.observations:
+            for config in observation.config_values:
+                if config.key in values:
+                    raise TraceContractError("config trace contains duplicate selected keys")
+                values[config.key] = config.value
+        if not values:
+            raise TraceContractError("config trace has no consumed scalar values")
+        representation = BoundedValueRepresentation.from_value(values)
+        return representation, representation, "config.selected_scalars"
+    if evidence.artifact.kind is ArtifactKind.DATASET:
+        source = BoundedValueRepresentation.from_bytes(passive.content)
+        normalized = BoundedValueRepresentation.from_value(
+            {
+                "path": str(evidence.artifact.path),
+                "split": binding.dataset_split.value
+                if binding.dataset_split is not None
+                else None,
+            }
+        )
+        return source, normalized, "dataset.passive_identity"
+    raise TraceContractError("executable trace contains an unsupported artifact kind")
+
+
+def _passive_trace_entries(
+    plan: EphemeralAuditPlan,
+    result: AuditResult,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, PassiveArtifact],
+) -> tuple[EvidenceTraceEntry, ...]:
+    if plan.audit_claim is None:
+        raise TraceContractError("trace requires an executable audit claim")
+    entries: list[EvidenceTraceEntry] = []
+    for evidence, binding in sorted(
+        bound,
+        key=lambda item: (
+            str(item[0].artifact.path),
+            item[1].role.value,
+            item[1].dataset_split.value if item[1].dataset_split else "",
+        ),
+    ):
+        if binding.adapter_id is None:
+            raise TraceContractError("trace requires a fixed adapter identity")
+        source, normalized, detail = _trace_artifact_values(
+            evidence,
+            binding,
+            captured[str(evidence.artifact.path)],
+            plan.audit_claim.metric,
+        )
+        categories = {
+            ArtifactKind.RESULTS: ("RESULT", "SEED"),
+            ArtifactKind.CONFIG: ("CONFIG",),
+            ArtifactKind.DATASET: ("DATASET",),
+        }[evidence.artifact.kind]
+        rule_ids = _trace_rule_ids(result, *categories)
+        material = {
+            "path": str(evidence.artifact.path),
+            "kind": evidence.artifact.kind.value,
+            "role": binding.role.value,
+            "split": binding.dataset_split.value if binding.dataset_split else None,
+            "adapter": binding.adapter_id,
+            "selectors": [
+                (item.target_field, item.selector.kind.value, item.selector.expression)
+                for item in binding.mappings
+            ],
+        }
+        entries.append(
+            EvidenceTraceEntry(
+                trace_id=_trace_id("evidence", material),
+                record_kind=TraceRecordKind.PASSIVE_SOURCE_EVIDENCE,
+                authority=TraceAuthorityClass.PASSIVE_SOURCE,
+                head_sha=plan.head_sha,
+                provenance_kind=ProvenanceKind.ADAPTER_EXTRACTION,
+                detail_code=detail,
+                source_id=evidence.evidence_id,
+                artifact_path=evidence.artifact.path,
+                artifact_sha256=evidence.artifact.sha256,
+                artifact_size=evidence.artifact.size,
+                artifact_kind=evidence.artifact.kind,
+                adapter_id=binding.adapter_id,
+                adapter_version=_trace_adapter_version(binding.adapter_id),
+                selectors=_trace_selectors(binding),
+                role=binding.role,
+                dataset_split=binding.dataset_split,
+                source_value=source,
+                normalized_value=normalized,
+                consumer_rule_ids=rule_ids,
+            )
+        )
+    return tuple(entries)
+
+
+def _derived_trace_entries(
+    plan: EphemeralAuditPlan,
+    result: AuditResult,
+    passive: tuple[EvidenceTraceEntry, ...],
+) -> tuple[EvidenceTraceEntry, ...]:
+    artifact_categories = {
+        "CONFIG": {ArtifactKind.CONFIG},
+        "RESULT": {ArtifactKind.RESULTS},
+        "SEED": {ArtifactKind.RESULTS},
+        "DATASET": {ArtifactKind.DATASET},
+    }
+    entries: list[EvidenceTraceEntry] = []
+    stable_findings = stable_audit_projection(result).get("findings")
+    if not isinstance(stable_findings, list):
+        raise TraceContractError("stable Audit trace findings are unavailable")
+    for category, kinds in artifact_categories.items():
+        findings = tuple(
+            item for item in result.findings if item.rule_id.startswith(f"{category}.")
+        )
+        if not findings:
+            continue
+        sources = tuple(
+            item.trace_id for item in passive if item.artifact_kind in kinds
+        )
+        if not sources:
+            raise TraceContractError("deterministic trace category has no passive source")
+        rule_ids = tuple(sorted({item.rule_id for item in findings}))
+        evidence_projection = tuple(
+            {
+                "rule_id": item["rule_id"],
+                "evidence": item["evidence"],
+            }
+            for item in stable_findings
+            if isinstance(item, dict)
+            and isinstance(item.get("rule_id"), str)
+            and item["rule_id"].startswith(f"{category}.")
+        )
+        entries.append(
+            EvidenceTraceEntry(
+                trace_id=_trace_id("derived", {"category": category, "rules": rule_ids}),
+                record_kind=TraceRecordKind.DERIVED_DETERMINISTIC_EVIDENCE,
+                authority=TraceAuthorityClass.DETERMINISTIC_DERIVATION,
+                head_sha=plan.head_sha,
+                provenance_kind=None,
+                detail_code=f"derived.{category.casefold()}",
+                normalized_value=BoundedValueRepresentation.from_value(
+                    evidence_projection
+                ),
+                consumer_rule_ids=rule_ids,
+                source_trace_ids=sources,
+            )
+        )
+    classified = {
+        rule_id for entry in entries for rule_id in entry.consumer_rule_ids
+    }
+    actual = {item.rule_id for item in result.findings}
+    if classified != actual:
+        raise TraceContractError("Audit emitted an unclassified deterministic rule ID")
+    return tuple(entries)
+
+
+def _claim_trace_entries(
+    plan: EphemeralAuditPlan,
+    result: AuditResult,
+) -> tuple[EvidenceTraceEntry, ...]:
+    claim_id = _trace_id("claim", {"claim_id": plan.claim.claim_id})
+    result_rules = _trace_rule_ids(result, "RESULT")
+    claim = EvidenceTraceEntry(
+        trace_id=claim_id,
+        record_kind=TraceRecordKind.NATURAL_LANGUAGE_CLAIM,
+        authority=TraceAuthorityClass.NON_AUTHORITATIVE_INPUT,
+        head_sha=plan.head_sha,
+        provenance_kind=plan.claim.provenance.kind,
+        detail_code="claim.natural_language_input",
+        source_path=plan.claim.source_path,
+        source_id=plan.claim.provenance.source_id,
+        source_value=BoundedValueRepresentation.from_value(plan.claim.text),
+        consumer_rule_ids=result_rules,
+    )
+    if plan.claim.provenance.kind is not ProvenanceKind.PROVIDER_PROPOSAL:
+        return (claim,)
+    if plan.audit_claim is None:
+        raise TraceContractError("provider claim trace requires an audit claim")
+    proposal = EvidenceTraceEntry(
+        trace_id=_trace_id("proposal", {"claim_id": plan.claim.claim_id}),
+        record_kind=TraceRecordKind.LLM_SEMANTIC_PROPOSAL,
+        authority=TraceAuthorityClass.NON_AUTHORITATIVE_INPUT,
+        head_sha=plan.head_sha,
+        provenance_kind=ProvenanceKind.PROVIDER_PROPOSAL,
+        detail_code="claim.semantic_proposal",
+        source_path=plan.claim.source_path,
+        source_id=plan.claim.provenance.source_id,
+        source_value=BoundedValueRepresentation.from_value(
+            {
+                "metric": plan.audit_claim.metric,
+                "direction": plan.audit_claim.direction.value,
+                "minimum_improvement": plan.audit_claim.minimum_absolute_improvement,
+            }
+        ),
+        source_trace_ids=(claim_id,),
+    )
+    return (claim, proposal)
+
+
+def _approval_trace_entry(
+    plan: EphemeralAuditPlan,
+    passive: tuple[EvidenceTraceEntry, ...],
+) -> EvidenceTraceEntry | None:
+    selected = plan.selected_mapping
+    if type(selected) is not RepoMapping:
+        return None
+    binding_projection = tuple(
+        {
+            "path": str(binding.path),
+            "kind": binding.kind.value,
+            "role": binding.role.value,
+            "adapter": binding.adapter_id,
+            "split": binding.dataset_split.value if binding.dataset_split else None,
+            "selectors": tuple(
+                (
+                    mapping.target_field,
+                    mapping.selector.kind.value,
+                    mapping.selector.expression,
+                )
+                for mapping in binding.mappings
+            ),
+        }
+        for binding in selected.bindings
+    )
+    return EvidenceTraceEntry(
+        trace_id=_trace_id(
+            "approval",
+            {"mapping": selected.source_mapping_id, "bindings": binding_projection},
+        ),
+        record_kind=TraceRecordKind.APPROVED_MAPPING,
+        authority=TraceAuthorityClass.EXPLICIT_MAPPING_APPROVAL,
+        head_sha=plan.head_sha,
+        provenance_kind=ProvenanceKind.USER_APPROVED,
+        detail_code="mapping.explicit_approval",
+        source_id=selected.approval_provenance.source_id,
+        source_value=BoundedValueRepresentation.from_value(binding_projection),
+        source_trace_ids=tuple(item.trace_id for item in passive),
+    )
+
+
+def _build_evidence_trace(
+    plan: EphemeralAuditPlan,
+    result: AuditResult,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, PassiveArtifact],
+) -> EvidenceTraceBundle:
+    passive = _passive_trace_entries(plan, result, bound, captured)
+    entries = [*_claim_trace_entries(plan, result), *passive]
+    approval = _approval_trace_entry(plan, passive)
+    if approval is not None:
+        entries.append(approval)
+    entries.extend(_derived_trace_entries(plan, result, passive))
+    complete_entries = tuple(entries)
+    authority = DeterministicAuditTrace.from_audit_result(result)
+    try:
+        return EvidenceTraceBundle(
+            head_sha=plan.head_sha,
+            completeness=TraceCompleteness.COMPLETE,
+            entries=complete_entries,
+            deterministic_authority=authority,
+        )
+    except TraceLimitError:
+        return EvidenceTraceBundle.bounded_entries(
+            head_sha=plan.head_sha,
+            result=result,
+            entries=complete_entries,
+        )
+
+
 def _cleanup_plan_tree(plan_root: Path, created_identity: tuple[int, int]) -> None:
     try:
         current = os.lstat(plan_root)
@@ -721,11 +1069,11 @@ def _cleanup_plan_tree(plan_root: Path, created_identity: tuple[int, int]) -> No
         ) from error
 
 
-def execute_ephemeral_audit(
+def execute_ephemeral_audit_with_trace(
     plan: EphemeralAuditPlan,
     runtime: RuntimeExecutionContext,
-) -> AuditResult:
-    """Capture, materialize, and run exactly one existing deterministic Audit."""
+) -> EphemeralAuditExecution:
+    """Run one unchanged Audit and derive its bounded exact-head trace."""
 
     if type(plan) is not EphemeralAuditPlan:
         raise TypeError("ephemeral execution requires EphemeralAuditPlan")
@@ -789,7 +1137,14 @@ def execute_ephemeral_audit(
             raise MaterializationUnavailable(
                 "native Audit did not return an actual AuditResult"
             )
-        return result
+        try:
+            trace = _build_evidence_trace(plan, result, bound, captured)
+        except Exception:
+            trace = EvidenceTraceBundle.unavailable(
+                head_sha=plan.head_sha,
+                result=result,
+            )
+        return EphemeralAuditExecution(result, trace)
     except (MaterializationPartial, MaterializationUnavailable):
         raise
     except Exception as error:
@@ -801,6 +1156,15 @@ def execute_ephemeral_audit(
             _cleanup_plan_tree(plan_root, created_identity)
 
 
+def execute_ephemeral_audit(
+    plan: EphemeralAuditPlan,
+    runtime: RuntimeExecutionContext,
+) -> AuditResult:
+    """Compatibility API returning the unchanged deterministic Audit result."""
+
+    return execute_ephemeral_audit_with_trace(plan, runtime).audit_result
+
+
 __all__ = [
     "MaterializationError",
     "MaterializationLimits",
@@ -808,4 +1172,5 @@ __all__ = [
     "MaterializationUnavailable",
     "RuntimeExecutionContext",
     "execute_ephemeral_audit",
+    "execute_ephemeral_audit_with_trace",
 ]

@@ -20,7 +20,7 @@ from .materialize import (
     MaterializationPartial,
     MaterializationUnavailable,
     RuntimeExecutionContext,
-    execute_ephemeral_audit,
+    execute_ephemeral_audit_with_trace,
 )
 from .planner import PlanningRequest, PlanningState, plan_ephemeral_audit
 
@@ -104,7 +104,9 @@ def run_unified_analysis(
     plan = planning.plan
 
     try:
-        audit_result = execute_ephemeral_audit(plan, runtime)
+        execution = execute_ephemeral_audit_with_trace(plan, runtime)
+        audit_result = execution.audit_result
+        evidence_trace = execution.trace
         deterministic = DeterministicAuditOutcome.from_audit_result(audit_result)
     except MaterializationPartial:
         return UnifiedAnalysisResult(
@@ -129,6 +131,7 @@ def run_unified_analysis(
                 state=AnalysisState.PARTIAL,
                 deterministic=deterministic,
                 unavailable_reason=_REVIEW_PARTIAL,
+                evidence_trace=evidence_trace,
             )
         review_context = AnalysisReviewContext(
             claim=plan.claim,
@@ -148,6 +151,18 @@ def run_unified_analysis(
             deterministic=deterministic,
             unavailable_reason=_REVIEW_PARTIAL,
             missing_evidence=plan.missing_evidence,
+            evidence_trace=evidence_trace,
+        )
+
+    try:
+        evidence_trace = evidence_trace.with_advisory(interpretation)
+    except Exception:
+        from .trace import EvidenceTraceBundle
+
+        evidence_trace = EvidenceTraceBundle.unavailable(
+            head_sha=plan.head_sha,
+            result=audit_result,
+            interpretation=interpretation,
         )
 
     return UnifiedAnalysisResult(
@@ -155,6 +170,7 @@ def run_unified_analysis(
         deterministic=deterministic,
         research_interpretation=interpretation,
         missing_evidence=plan.missing_evidence,
+        evidence_trace=evidence_trace,
     )
 
 
