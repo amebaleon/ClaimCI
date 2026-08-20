@@ -714,6 +714,15 @@ class EvidenceTraceBundle:
         if self.completeness is TraceCompleteness.COMPLETE:
             if not self.entries or self.omitted_entry_count or self.omitted_entries_sha256 is not None or self.reason_code is not None:
                 raise TraceContractError("complete trace cannot carry omissions or a reason")
+            consumed_rule_ids = {
+                rule_id
+                for entry in self.entries
+                for rule_id in entry.consumer_rule_ids
+            }
+            if consumed_rule_ids != set(self.deterministic_authority.rule_ids):
+                raise TraceContractError(
+                    "complete trace rule consumption does not match Audit authority"
+                )
         elif self.completeness is TraceCompleteness.BOUNDED:
             if self.omitted_entry_count < 1 or self.omitted_entries_sha256 is None or self.reason_code is None:
                 raise TraceContractError("bounded trace requires committed omissions and a reason")

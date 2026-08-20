@@ -31,14 +31,26 @@ from claimci.analysis import (
     TraceValueType,
     to_jsonable,
 )
-from claimci.models import AuditResult, Verdict
+from claimci.models import AuditResult, Finding, Impact, Severity, Verdict
 
 
 HEAD_SHA = GitCommitSha("a" * 40)
 
 
 def _audit_result() -> AuditResult:
-    return AuditResult(verdict=Verdict.SUPPORTED, findings=())
+    return AuditResult(
+        verdict=Verdict.SUPPORTED,
+        findings=(
+            Finding(
+                rule_id="RESULT.RECOMPUTED",
+                severity=Severity.VERIFIED,
+                title="Result recomputed",
+                explanation="The result was recomputed from passive evidence.",
+                evidence={"value": 0.3},
+                impact=Impact.NONE,
+            ),
+        ),
+    )
 
 
 def _passive_entry(*, provenance: ProvenanceKind) -> EvidenceTraceEntry:
@@ -213,6 +225,20 @@ def test_complete_bundle_rejects_unknown_dependencies_and_over_bound_json() -> N
             head_sha=HEAD_SHA,
             completeness=TraceCompleteness.COMPLETE,
             entries=(entry,),
+            deterministic_authority=DeterministicAuditTrace.from_audit_result(
+                _audit_result()
+            ),
+        )
+
+    mismatched = dataclasses.replace(
+        _passive_entry(provenance=ProvenanceKind.ADAPTER_EXTRACTION),
+        consumer_rule_ids=("CONFIG.MATCH",),
+    )
+    with pytest.raises(TraceContractError, match="rule consumption"):
+        EvidenceTraceBundle(
+            head_sha=HEAD_SHA,
+            completeness=TraceCompleteness.COMPLETE,
+            entries=(mismatched,),
             deterministic_authority=DeterministicAuditTrace.from_audit_result(
                 _audit_result()
             ),
