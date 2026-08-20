@@ -57,6 +57,7 @@ from claimci.analysis import (
 )
 from claimci.analysis.adapters import extract_registered_artifact
 from claimci.models import AuditResult, Direction, Verdict
+from claimci.measurement import MeasurementDriftState
 from claimci.report import render_json
 
 
@@ -458,6 +459,118 @@ def test_trace_retains_held_out_semantics_without_changing_audit_or_plan_identit
     assert claim_entries[0].normalized_value == BoundedValueRepresentation.from_value(
         claim_semantic_projection(scientific_claim)
     )
+    assert trace.deterministic_authority.verdict is Verdict.NOT_SUPPORTED
+
+
+def _with_scientific_claim(plan: EphemeralAuditPlan) -> EphemeralAuditPlan:
+    reference = dataclasses.replace(
+        plan.claim,
+        text="Accuracy improved from 0.60 to 0.90 by at least 0.05.",
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    changed = dataclasses.replace(
+        plan,
+        claim=reference,
+        audit_claim=compile_audit_claim(scientific_claim),
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+    return dataclasses.replace(changed, plan_id=derive_ephemeral_plan_id(changed))
+
+
+def test_scientific_exact_head_execution_attaches_bounded_measurement_report(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    plan = _with_scientific_claim(plan)
+
+    execution = execute_ephemeral_audit_with_trace(plan, runtime)
+
+    report = execution.audit_result.measurement_drift
+    assert report is not None
+    assert report.state in {
+        MeasurementDriftState.VERIFIED,
+        MeasurementDriftState.INVALIDATES,
+    }
+    assert report.baseline_semantic_protocol_id.startswith("measurement-semantic-")
+    assert report.baseline_source_snapshot_id.startswith("measurement-source-")
+    assert execution.trace.completeness is TraceCompleteness.COMPLETE
+    assert not any(
+        finding.rule_id.startswith("MEASUREMENT.")
+        for finding in execution.audit_result.findings
+    )
+
+
+def test_measurement_trace_failure_never_changes_native_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    plan = _with_scientific_claim(plan)
+
+    def fail_trace(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private trace construction failure")
+
+    monkeypatch.setattr(materialize, "_build_evidence_trace", fail_trace)
+
+    execution = execute_ephemeral_audit_with_trace(plan, runtime)
+
+    assert execution.audit_result.verdict is Verdict.NOT_SUPPORTED
+    assert execution.audit_result.measurement_drift is not None
+    assert execution.trace.completeness is TraceCompleteness.UNAVAILABLE
+    assert execution.trace.deterministic_authority.verdict is Verdict.NOT_SUPPORTED
+
+
+def test_comment_only_config_change_changes_source_not_semantic_identity(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_plan, first_runtime, _checkout, _scratch = _plan_fixture(first_root)
+    second_plan, second_runtime, second_checkout, _scratch = _plan_fixture(second_root)
+    first_plan = _with_scientific_claim(first_plan)
+    second_plan = _with_scientific_claim(second_plan)
+    changed_path = second_checkout / "configs" / "baseline.yaml"
+    changed_content = changed_path.read_bytes() + b"# comment-only change\n"
+    changed_path.write_bytes(changed_content)
+    changed_baseline = tuple(
+        dataclasses.replace(
+            evidence,
+            artifact=dataclasses.replace(
+                evidence.artifact,
+                sha256=Sha256Digest(hashlib.sha256(changed_content).hexdigest()),
+                size=len(changed_content),
+            ),
+        )
+        if evidence.artifact.path == RepositoryPath("configs/baseline.yaml")
+        else evidence
+        for evidence in second_plan.baseline_evidence
+    )
+    second_plan = dataclasses.replace(second_plan, baseline_evidence=changed_baseline)
+    second_plan = dataclasses.replace(
+        second_plan,
+        plan_id=derive_ephemeral_plan_id(second_plan),
+    )
+
+    first = execute_ephemeral_audit(first_plan, first_runtime)
+    second = execute_ephemeral_audit(second_plan, second_runtime)
+
+    assert first.measurement_drift is not None
+    assert second.measurement_drift is not None
+    assert (
+        first.measurement_drift.baseline_semantic_protocol_id
+        == second.measurement_drift.baseline_semantic_protocol_id
+    )
+    assert (
+        first.measurement_drift.baseline_source_snapshot_id
+        != second.measurement_drift.baseline_source_snapshot_id
+    )
+    assert first.verdict is second.verdict
 
 
 def test_trace_identity_does_not_depend_on_ephemeral_scratch_paths(

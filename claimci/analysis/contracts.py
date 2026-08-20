@@ -1443,13 +1443,20 @@ def to_jsonable(value: object) -> object:
     """Return a detached JSON-compatible view of approved analysis values."""
 
     if type(value).__module__ == "claimci.analysis.obligations":
-        from .obligations import ArtifactEvidenceSupport
+        from .obligations import ArtifactEvidenceSupport, MeasurementProcedureSupport
 
         if type(value) is ArtifactEvidenceSupport:
             return {
                 "support_id": value.support_id,
                 "evidence_id": value.evidence_id,
                 "binding_id": value.binding_id,
+            }
+        if type(value) is MeasurementProcedureSupport:
+            return {
+                "support_id": value.support_id,
+                "procedure": value.procedure.value,
+                "evidence_ids": list(value.evidence_ids),
+                "binding_ids": list(value.binding_ids),
             }
     if type(value).__module__ == "claimci.analysis.trace":
         from .trace import trace_to_jsonable

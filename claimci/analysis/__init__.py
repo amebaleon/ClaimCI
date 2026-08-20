@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from claimci.measurement import (
+    MeasurementComponentKind,
+    UpstreamAggregationProcedure,
+)
+
 from .confidence import Confidence
 from .claims import (
     audit_claim_spec_from_research_spec,
@@ -84,6 +89,8 @@ from .obligations import (
     EvidenceObligationBundle,
     EvidenceObligationReason,
     EvidenceObligationState,
+    MeasurementComponentTarget,
+    MeasurementProcedureSupport,
     ObligationSupportReference,
     ObligationTarget,
     assess_evidence_obligations,
@@ -91,6 +98,11 @@ from .obligations import (
     evidence_obligations_json_bytes,
     legacy_missing_evidence,
     validated_artifact_support,
+    validated_measurement_procedure_support,
+)
+from .measurement import (
+    UpstreamProcedureRequirement,
+    recover_upstream_procedure_requirement,
 )
 from .planner import (
     PlanningOutcome,
@@ -214,6 +226,9 @@ __all__ = [
     "MaterializationLimits",
     "MaterializationPartial",
     "MaterializationUnavailable",
+    "MeasurementComponentKind",
+    "MeasurementComponentTarget",
+    "MeasurementProcedureSupport",
     "MetricImprovementClaim",
     "MissingEvidence",
     "NormalizedEvidence",
@@ -243,6 +258,8 @@ __all__ = [
     "TraceValueType",
     "UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER",
     "UnifiedAnalysisResult",
+    "UpstreamAggregationProcedure",
+    "UpstreamProcedureRequirement",
     "UnsupportedDeterministicClaimCompiler",
     "to_jsonable",
     "audit_claim_spec_from_research_spec",
@@ -259,7 +276,9 @@ __all__ = [
     "plan_ephemeral_audit",
     "planning_request_from_discovery",
     "recover_scientific_claim",
+    "recover_upstream_procedure_requirement",
     "run_unified_analysis",
     "trace_json_bytes",
     "validated_artifact_support",
+    "validated_measurement_procedure_support",
 ]

@@ -513,6 +513,9 @@ def claim_evidence_policy(claim: CanonicalScientificClaim) -> ClaimEvidencePolic
         or claim.primary.minimum_improvement.unit is None
     ):
         compiler = "metric-improvement-v0"
+    from .measurement import recover_upstream_procedure_requirement
+
+    procedure_requirement = recover_upstream_procedure_requirement(claim.reference)
     templates: list[str] = []
     if type(claim.primary) is MetricImprovementClaim:
         templates.extend(("claim.metric", "claim.direction", "claim.threshold"))
@@ -536,11 +539,16 @@ def claim_evidence_policy(claim: CanonicalScientificClaim) -> ClaimEvidencePolic
                 "artifact.baseline.dataset.eval",
                 "artifact.candidate.dataset.train",
                 "artifact.candidate.dataset.eval",
-                "comparison.readiness",
             )
         )
+        if procedure_requirement is not None:
+            templates.append("measurement.retry_aggregation")
+        templates.append("comparison.readiness")
+    policy_id = f"claimci.claim-policy.{kind.value}.v0"
+    if procedure_requirement is not None:
+        policy_id += "+measurement-procedure-v1"
     return ClaimEvidencePolicy(
-        policy_id=f"claimci.claim-policy.{kind.value}.v0",
+        policy_id=policy_id,
         primary_kind=kind,
         constraint_kinds=tuple(item.kind for item in claim.constraints),
         deterministic_compiler_id=compiler,
@@ -653,10 +661,21 @@ def claim_semantic_projection(claim: CanonicalScientificClaim) -> dict[str, obje
                 ],
             }
         )
-    return {
+    result: dict[str, object] = {
         "primary": projection,
         "constraints": [item.kind.value for item in claim.constraints],
     }
+    from .measurement import recover_upstream_procedure_requirement
+
+    procedure = recover_upstream_procedure_requirement(claim.reference)
+    if procedure is not None:
+        result["measurement_requirements"] = [
+            {
+                "component_kind": "retry_aggregation",
+                "procedure": procedure.procedure.value,
+            }
+        ]
+    return result
 
 
 __all__ = [

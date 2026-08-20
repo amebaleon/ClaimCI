@@ -18,6 +18,7 @@ from claimci.analysis import (
     ClaimFieldSupport,
     ClaimFieldTarget,
     Confidence,
+    ConfigValue,
     DatasetSplit,
     EvidenceObligationEffect,
     EvidenceObligation,
@@ -32,6 +33,9 @@ from claimci.analysis import (
     FieldProvenance,
     MappingCandidate,
     MappingTrust,
+    MeasurementComponentKind,
+    MeasurementComponentTarget,
+    MeasurementProcedureSupport,
     NormalizedEvidence,
     NormalizedObservation,
     ProvenanceKind,
@@ -40,14 +44,17 @@ from claimci.analysis import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    UpstreamAggregationProcedure,
     assess_evidence_obligations,
     claim_field_support,
     claim_evidence_policy,
     compile_audit_claim,
+    claim_semantic_projection,
     evidence_obligations_json_bytes,
     recover_scientific_claim,
     to_jsonable,
     validated_artifact_support,
+    validated_measurement_procedure_support,
 )
 from claimci.analysis.obligations import _build_obligation_bundle
 from claimci.analysis.contracts import ClaimReference
@@ -161,6 +168,70 @@ def _result_evidence(
         ),
     )
     return evidence, binding, mapping
+
+
+def _config_evidence(
+    role: ExperimentRole,
+    *,
+    procedure: str = "arithmetic_mean_v1",
+    provenance_kind: ProvenanceKind = ProvenanceKind.ADAPTER_EXTRACTION,
+) -> tuple[NormalizedEvidence, ArtifactBinding]:
+    path = RepositoryPath(f"configs/{role.value}.yaml")
+    provenance = _provenance(
+        provenance_kind,
+        path=str(path),
+        source_id=f"adapter:{path}",
+    )
+    selector = EvidenceSelector(
+        SelectorKind.DOTTED_PATH,
+        "evaluation.aggregation",
+        provenance,
+    )
+    field_mapping = FieldMapping(
+        "config.evaluation.aggregation",
+        selector,
+        provenance,
+    )
+    content = f"evaluation:\n  aggregation: {procedure}\n".encode()
+    artifact = ArtifactCandidate(
+        path=path,
+        kind=ArtifactKind.CONFIG,
+        sha256=Sha256Digest(hashlib.sha256(content).hexdigest()),
+        size=len(content),
+        confidence=Confidence(0.95),
+        discovery_reason="validated aggregation config",
+        relevant_claim_ids=("claim-1",),
+        provenance=provenance,
+    )
+    evidence = NormalizedEvidence(
+        evidence_id=f"evidence-{role.value}-config",
+        artifact=artifact,
+        adapter_match=AdapterMatch(
+            "claimci-yaml-config-v1",
+            path,
+            Confidence(0.95),
+            (field_mapping,),
+            (provenance,),
+        ),
+        observations=(
+            NormalizedObservation(
+                provenance=provenance,
+                experiment_role=role,
+                config_values=(
+                    ConfigValue("evaluation.aggregation", procedure, provenance),
+                ),
+            ),
+        ),
+    )
+    binding = ArtifactBinding(
+        path,
+        ArtifactKind.CONFIG,
+        role,
+        evidence.adapter_match.adapter_id,
+        evidence.adapter_match.mappings,
+        provenance,
+    )
+    return evidence, binding
 
 
 def test_canonical_enums_and_targets_are_typed_and_immutable() -> None:
@@ -379,6 +450,148 @@ def test_metric_policy_owns_stable_templates_without_fake_manifest_fields() -> N
         "comparison.readiness",
     )
     assert all("manifest" not in item for item in policy.obligation_template_ids)
+
+
+def test_explicit_arithmetic_mean_adds_one_source_bound_measurement_template() -> None:
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.70 to 0.80 by at least 0.05."
+    )
+    policy = claim_evidence_policy(claim)
+
+    assert policy.obligation_template_ids[-2:] == (
+        "measurement.retry_aggregation",
+        "comparison.readiness",
+    )
+    assert "measurement-procedure" in policy.policy_id
+    assert claim_semantic_projection(claim)["measurement_requirements"] == [
+        {
+            "component_kind": "retry_aggregation",
+            "procedure": "arithmetic_mean_v1",
+        }
+    ]
+
+
+def test_measurement_procedure_support_requires_exact_trusted_config_bindings() -> None:
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.70 to 0.80 by at least 0.05."
+    )
+    baseline, baseline_binding = _config_evidence(ExperimentRole.BASELINE)
+    candidate, candidate_binding = _config_evidence(ExperimentRole.CANDIDATE)
+    mapping = MappingCandidate(
+        "mapping-procedure",
+        (baseline_binding, candidate_binding),
+        Confidence(0.95),
+        MappingTrust.INFERRED,
+        _provenance(source_id="mapping-procedure"),
+    )
+
+    support = validated_measurement_procedure_support(
+        claim=claim,
+        procedure=UpstreamAggregationProcedure.ARITHMETIC_MEAN_V1,
+        normalized_evidence=(baseline, candidate),
+        selected_mapping=mapping,
+    )
+
+    assert type(support) is MeasurementProcedureSupport
+    assert support.procedure is UpstreamAggregationProcedure.ARITHMETIC_MEAN_V1
+    assert len(support.evidence_ids) == len(support.binding_ids) == 2
+    serialized = to_jsonable(support)
+    assert set(serialized) == {
+        "support_id",
+        "procedure",
+        "evidence_ids",
+        "binding_ids",
+    }
+    assert "arithmetic_mean_v1" in str(serialized)
+    with pytest.raises(TypeError, match="factory"):
+        MeasurementProcedureSupport()  # type: ignore[call-arg]
+
+
+def test_provider_measurement_support_requires_explicit_mapping_approval() -> None:
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.70 to 0.80 by at least 0.05."
+    )
+    baseline, baseline_binding = _config_evidence(ExperimentRole.BASELINE)
+    candidate, candidate_binding = _config_evidence(ExperimentRole.CANDIDATE)
+    provider = MappingCandidate(
+        "mapping-provider-procedure",
+        (baseline_binding, candidate_binding),
+        Confidence(0.99),
+        MappingTrust.INFERRED,
+        _provenance(
+            ProvenanceKind.PROVIDER_PROPOSAL,
+            source_id="provider-call-1",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="provider|approval|trust"):
+        validated_measurement_procedure_support(
+            claim=claim,
+            procedure=UpstreamAggregationProcedure.ARITHMETIC_MEAN_V1,
+            normalized_evidence=(baseline, candidate),
+            selected_mapping=provider,
+        )
+
+    approved = RepoMapping.approve(REPOSITORY, provider, approved_by="pilot-owner")
+    assert type(
+        validated_measurement_procedure_support(
+            claim=claim,
+            procedure=UpstreamAggregationProcedure.ARITHMETIC_MEAN_V1,
+            normalized_evidence=(baseline, candidate),
+            selected_mapping=approved,
+        )
+    ) is MeasurementProcedureSupport
+
+
+def test_approval_cannot_launder_provider_invented_procedure_values() -> None:
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.70 to 0.80 by at least 0.05."
+    )
+    baseline, baseline_binding = _config_evidence(
+        ExperimentRole.BASELINE,
+        provenance_kind=ProvenanceKind.PROVIDER_PROPOSAL,
+    )
+    candidate, candidate_binding = _config_evidence(
+        ExperimentRole.CANDIDATE,
+        provenance_kind=ProvenanceKind.PROVIDER_PROPOSAL,
+    )
+    proposed = MappingCandidate(
+        "mapping-provider-values",
+        (baseline_binding, candidate_binding),
+        Confidence(0.99),
+        MappingTrust.INFERRED,
+        _provenance(
+            ProvenanceKind.PROVIDER_PROPOSAL,
+            source_id="provider-call-values",
+        ),
+    )
+    approved = RepoMapping.approve(REPOSITORY, proposed, approved_by="pilot-owner")
+
+    with pytest.raises(ValueError, match="provider|adapter|value|support"):
+        validated_measurement_procedure_support(
+            claim=claim,
+            procedure=UpstreamAggregationProcedure.ARITHMETIC_MEAN_V1,
+            normalized_evidence=(baseline, candidate),
+            selected_mapping=approved,
+        )
+
+
+def test_measurement_targets_and_support_cannot_carry_verdict_authority() -> None:
+    target = MeasurementComponentTarget(
+        MeasurementComponentKind.RETRY_AGGREGATION,
+        UpstreamAggregationProcedure.ARITHMETIC_MEAN_V1,
+    )
+    assert target.component_kind is MeasurementComponentKind.RETRY_AGGREGATION
+    forbidden = {"verdict", "authority", "impact", "severity", "drift_state"}
+    assert forbidden.isdisjoint(
+        item.name
+        for contract in (MeasurementComponentTarget, MeasurementProcedureSupport)
+        for item in dataclasses.fields(contract)
+    )
 
 
 @pytest.mark.parametrize(

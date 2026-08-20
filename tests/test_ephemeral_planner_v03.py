@@ -759,6 +759,50 @@ def _identity_only_dataset_evidence(
     return tuple(values)
 
 
+def _with_aggregation(
+    evidence: tuple[NormalizedEvidence, ...],
+    *,
+    procedure: str = "arithmetic_mean_v1",
+) -> tuple[NormalizedEvidence, ...]:
+    values: list[NormalizedEvidence] = []
+    for item in evidence:
+        if item.artifact.kind is not ArtifactKind.CONFIG:
+            values.append(item)
+            continue
+        provenance = item.adapter_match.match_evidence[0]
+        mapping = FieldMapping(
+            "config.evaluation.aggregation",
+            EvidenceSelector(
+                SelectorKind.DOTTED_PATH,
+                "evaluation.aggregation",
+                provenance,
+            ),
+            provenance,
+        )
+        match = dataclasses.replace(
+            item.adapter_match,
+            mappings=(*item.adapter_match.mappings, mapping),
+        )
+        observations = tuple(
+            dataclasses.replace(
+                observation,
+                config_values=(
+                    *observation.config_values,
+                    ConfigValue(
+                        "evaluation.aggregation",
+                        procedure,
+                        provenance,
+                    ),
+                ),
+            )
+            for observation in item.observations
+        )
+        values.append(
+            dataclasses.replace(item, adapter_match=match, observations=observations)
+        )
+    return tuple(values)
+
+
 def test_split_bearing_mapping_makes_identity_only_dataset_evidence_ready() -> None:
     evidence_with_splits = _complete_evidence()
     mapping = _mapping("mapping-split-identity", evidence_with_splits)
@@ -775,6 +819,171 @@ def test_split_bearing_mapping_makes_identity_only_dataset_evidence_ready() -> N
         for binding in outcome.plan.selected_mapping.bindings
         if binding.kind is ArtifactKind.DATASET
     } == {DatasetSplit.TRAIN, DatasetSplit.EVAL}
+
+
+def test_explicit_arithmetic_mean_is_ready_only_with_both_recovered_procedures() -> None:
+    evidence = _with_aggregation(_complete_evidence())
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=evidence,
+            mappings=(_mapping("mapping-mean", evidence),),
+        )
+    )
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.evidence_obligations is not None
+    procedure = next(
+        item
+        for item in outcome.evidence_obligations.obligations
+        if item.obligation_id == "measurement.retry_aggregation"
+    )
+    assert procedure.state is EvidenceObligationState.SATISFIED
+
+
+def test_missing_required_upstream_procedure_is_partial_not_mean_fallback() -> None:
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(_request(claim=claim))
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.plan is None
+    assert outcome.mapping_question is None
+    assert outcome.reason == "required_measurement_procedure_not_recovered"
+
+
+@pytest.mark.parametrize(
+    "procedure",
+    [
+        "median",
+        "weighted mean",
+        "best-of-N",
+        "retry filtering",
+        "adjudication",
+        "geometric mean",
+    ],
+)
+def test_explicit_unsupported_upstream_procedure_is_pre_audit_partial(
+    procedure: str,
+) -> None:
+    claim = _claim(
+        f"Using {procedure} across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(_request(claim=claim))
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.plan is None
+    assert outcome.mapping_question is None
+    assert outcome.reason == "measurement_procedure_not_supported"
+
+
+def test_required_procedure_ambiguity_uses_one_bounded_mapping_question() -> None:
+    evidence = _with_aggregation(_complete_evidence())
+    original_candidate = next(
+        item
+        for item in evidence
+        if item.artifact.kind is ArtifactKind.CONFIG
+        and item.observations[0].experiment_role is ExperimentRole.CANDIDATE
+    )
+    alternative = _with_aggregation(
+        (
+            _evidence(
+                "configs/candidate-alternative.yaml",
+                ArtifactKind.CONFIG,
+                ExperimentRole.CANDIDATE,
+            ),
+        )
+    )[0]
+    second_evidence = tuple(
+        alternative if item is original_candidate else item for item in evidence
+    )
+    all_evidence = (*evidence, alternative)
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+    first_mapping = _mapping("mapping-mean-first", evidence)
+    second_mapping = _mapping("mapping-mean-second", second_evidence)
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=all_evidence,
+            mappings=(first_mapping, second_mapping),
+        )
+    )
+
+    assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.plan is None
+    assert outcome.mapping_question is not None
+    assert len(outcome.mapping_question.choices) == 2
+    assert "measurement.retry_aggregation" in (
+        outcome.mapping_question.blocking_obligation_ids
+    )
+
+    approved = RepoMapping.approve(
+        REPOSITORY,
+        first_mapping,
+        approved_by="pilot-owner",
+    )
+    resumed = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=all_evidence,
+            mappings=(first_mapping, second_mapping),
+            approved=approved,
+        )
+    )
+    assert resumed.state is PlanningState.READY
+    assert resumed.plan is not None
+    assert type(resumed.plan.selected_mapping) is RepoMapping
+
+
+def test_missing_required_procedure_dominates_otherwise_resolvable_mapping() -> None:
+    evidence = _complete_evidence()
+    alternative = _evidence(
+        "configs/candidate-alternative.yaml",
+        ArtifactKind.CONFIG,
+        ExperimentRole.CANDIDATE,
+    )
+    original_candidate = next(
+        item
+        for item in evidence
+        if item.artifact.kind is ArtifactKind.CONFIG
+        and item.observations[0].experiment_role is ExperimentRole.CANDIDATE
+    )
+    second_evidence = tuple(
+        alternative if item is original_candidate else item for item in evidence
+    )
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=(*evidence, alternative),
+            mappings=(
+                _mapping("mapping-missing-procedure-first", evidence),
+                _mapping("mapping-missing-procedure-second", second_evidence),
+            ),
+        )
+    )
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.mapping_question is None
+    assert outcome.reason == "required_measurement_procedure_not_recovered"
 
 
 def test_non_authoritative_semantic_proposal_is_carried_to_the_plan_only() -> None:
