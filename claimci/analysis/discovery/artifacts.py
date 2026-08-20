@@ -155,6 +155,8 @@ def _classify_path(path: RepositoryPath) -> ArtifactKind | None:
         return ArtifactKind.BENCHMARK
     if tokens & {"data", "dataset", "datasets", "train", "eval", "evaluation"} or suffix == ".jsonl":
         return ArtifactKind.DATASET
+    if suffix in {".csv", ".tsv"}:
+        return ArtifactKind.BENCHMARK
     if suffix in {".md", ".markdown", ".tex", ".txt"}:
         return ArtifactKind.DOCUMENT
     return None

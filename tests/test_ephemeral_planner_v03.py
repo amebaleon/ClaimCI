@@ -36,6 +36,7 @@ from claimci.analysis import (
     MappingTrust,
     NormalizedEvidence,
     NormalizedObservation,
+    PassiveArtifact,
     PlanningRequest,
     PlanningState,
     ProvenanceKind,
@@ -44,12 +45,16 @@ from claimci.analysis import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    TablePredicate,
+    TableScalarType,
+    TableSelector,
     UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
     audit_relevant_claim_projection,
     plan_ephemeral_audit,
     planning_request_from_discovery,
     to_jsonable,
 )
+from claimci.analysis.adapters import CsvAdapter
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 from claimci.analysis.discovery import ClaimedValue, DiscoveredClaim, DiscoveryResult
 
@@ -734,6 +739,137 @@ def _request(
         claim_id=CLAIM_ID,
         normalized_evidence=chosen_evidence,
     )
+
+
+def test_shared_benchmark_table_selectors_bind_baseline_and_candidate_independently() -> None:
+    content = b"commit,accuracy\nbaseline,0.70\ncandidate,0.80\n"
+    artifact = _artifact(
+        "benchmarks/shared.csv",
+        ArtifactKind.RESULTS,
+        content,
+    )
+    passive = PassiveArtifact(artifact, content)
+    adapter = CsvAdapter()
+
+    def selected(role: ExperimentRole, key: str) -> tuple[NormalizedEvidence, ArtifactBinding]:
+        provenance = FieldProvenance(
+            ProvenanceKind.ADAPTER_EXTRACTION,
+            f"exact table selector; sha256={artifact.sha256}",
+            artifact.path,
+            f"selector:{key}",
+        )
+        mapping = FieldMapping(
+            "metric_value",
+            TableSelector(
+                "accuracy",
+                (TablePredicate("commit", TableScalarType.STRING, key),),
+                1,
+                provenance,
+            ),
+            provenance,
+        )
+        evidence = adapter.extract(
+            passive,
+            AdapterMatch(
+                adapter.adapter_id,
+                artifact.path,
+                Confidence(0.95),
+                (mapping,),
+                (provenance,),
+            ),
+        )
+        return evidence, ArtifactBinding(
+            artifact.path,
+            artifact.kind,
+            role,
+            adapter.adapter_id,
+            evidence.adapter_match.mappings,
+            evidence.adapter_match.match_evidence[0],
+        )
+
+    baseline_result, baseline_binding = selected(
+        ExperimentRole.BASELINE,
+        "baseline",
+    )
+    candidate_result, candidate_binding = selected(
+        ExperimentRole.CANDIDATE,
+        "candidate",
+    )
+    ordinary = tuple(
+        item
+        for item in _complete_evidence()
+        if item.artifact.kind is not ArtifactKind.RESULTS
+    )
+    evidence = (baseline_result, candidate_result, *ordinary)
+    mapping_provenance = _provenance(
+        ProvenanceKind.DETERMINISTIC_DISCOVERY,
+        source_path=str(artifact.path),
+        source_id="shared-table-mapping",
+    )
+    mapping = MappingCandidate(
+        "mapping-shared-table",
+        (
+            baseline_binding,
+            candidate_binding,
+            *(
+                _binding(item, role)
+                for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE)
+                for item in ordinary
+                if any(
+                    observation.experiment_role is role
+                    for observation in item.observations
+                )
+            ),
+        ),
+        Confidence(0.95),
+        MappingTrust.INFERRED,
+        mapping_provenance,
+    )
+    base = _request()
+    request = dataclasses.replace(
+        base,
+        artifacts=(artifact, *(item.artifact for item in ordinary)),
+        normalized_evidence=evidence,
+        mapping_candidates=(mapping,),
+    )
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert tuple(item.evidence_id for item in outcome.plan.baseline_evidence).count(
+        baseline_result.evidence_id
+    ) == 1
+    assert tuple(item.evidence_id for item in outcome.plan.candidate_evidence).count(
+        candidate_result.evidence_id
+    ) == 1
+
+    alternative = dataclasses.replace(
+        mapping,
+        mapping_id="mapping-shared-table-swapped",
+        bindings=(
+            dataclasses.replace(
+                baseline_binding,
+                mappings=candidate_binding.mappings,
+            ),
+            dataclasses.replace(
+                candidate_binding,
+                mappings=baseline_binding.mappings,
+            ),
+            *mapping.bindings[2:],
+        ),
+    )
+    ambiguous = plan_ephemeral_audit(
+        dataclasses.replace(
+            request,
+            mapping_candidates=(mapping, alternative),
+        )
+    )
+
+    assert ambiguous.state is PlanningState.MAPPING_NEEDED
+    assert ambiguous.mapping_question is not None
+    assert len(ambiguous.mapping_question.choices) == 2
+    assert ambiguous.plan is None
 
 
 def _identity_only_dataset_evidence(

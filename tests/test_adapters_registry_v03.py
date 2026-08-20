@@ -28,6 +28,7 @@ from claimci.analysis.adapters import (
     NativeResultsAdapter,
     PassiveJsonLinesDatasetAdapter,
     TomlConfigAdapter,
+    TsvAdapter,
     YamlConfigAdapter,
     get_adapter,
 )
@@ -41,6 +42,7 @@ EXPECTED_IDS = (
     "claimci-json-v1",
     "claimci-jsonl-v1",
     "claimci-csv-v1",
+    "claimci-tsv-v1",
     "claimci-yaml-config-v1",
     "claimci-toml-config-v1",
 )
@@ -57,6 +59,7 @@ def test_registry_order_ids_instances_and_limits_are_exact() -> None:
         JsonAdapter,
         JsonLinesAdapter,
         CsvAdapter,
+        TsvAdapter,
         YamlConfigAdapter,
         TomlConfigAdapter,
     )

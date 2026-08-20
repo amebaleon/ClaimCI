@@ -46,6 +46,9 @@ from claimci.analysis import (
     RuntimeExecutionContext,
     SelectorKind,
     Sha256Digest,
+    TablePredicate,
+    TableScalarType,
+    TableSelector,
     execute_ephemeral_audit,
     execute_ephemeral_audit_with_trace,
     claim_evidence_policy,
@@ -53,9 +56,10 @@ from claimci.analysis import (
     compile_audit_claim,
     derive_ephemeral_plan_id,
     recover_scientific_claim,
+    trace_json_bytes,
     to_jsonable,
 )
-from claimci.analysis.adapters import extract_registered_artifact
+from claimci.analysis.adapters import CsvAdapter, extract_registered_artifact
 from claimci.models import AuditResult, Direction, Verdict
 from claimci.report import render_json
 
@@ -417,6 +421,141 @@ def test_traced_execution_preserves_the_exact_audit_result_and_rendering(
     assert traced.trace.head_sha == plan.head_sha
     assert traced.trace.deterministic_authority.verdict is compatibility.verdict
     assert not tuple(scratch.iterdir())
+
+
+def test_shared_benchmark_table_is_recaptured_once_and_each_selector_is_revalidated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, checkout, scratch = _plan_fixture(tmp_path)
+    content = (
+        b"commit,accuracy,memory,status\n"
+        b"baseline,0.55,80,row-only-baseline\n"
+        b"candidate,0.90,81,row-only-candidate\n"
+    )
+    artifact = _write_artifact(
+        checkout,
+        "benchmarks/shared.csv",
+        ArtifactKind.RESULTS,
+        content,
+    )
+    passive = PassiveArtifact(artifact, content)
+    adapter = CsvAdapter()
+
+    def selected(key: str) -> NormalizedEvidence:
+        provenance = FieldProvenance(
+            ProvenanceKind.ADAPTER_EXTRACTION,
+            f"exact table selector; sha256={artifact.sha256}",
+            artifact.path,
+            f"selector:{key}",
+        )
+        mapping = FieldMapping(
+            "metric_value",
+            TableSelector(
+                "accuracy",
+                (TablePredicate("commit", TableScalarType.STRING, key),),
+                1,
+                provenance,
+            ),
+            provenance,
+        )
+        return adapter.extract(
+            passive,
+            AdapterMatch(
+                adapter.adapter_id,
+                artifact.path,
+                Confidence(0.99),
+                (mapping,),
+                (provenance,),
+            ),
+        )
+
+    baseline_result = selected("baseline")
+    candidate_result = selected("candidate")
+    baseline = tuple(
+        baseline_result if item.artifact.kind is ArtifactKind.RESULTS else item
+        for item in plan.baseline_evidence
+    )
+    candidate = tuple(
+        candidate_result if item.artifact.kind is ArtifactKind.RESULTS else item
+        for item in plan.candidate_evidence
+    )
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    bindings = tuple(
+        item
+        for item in plan.selected_mapping.bindings
+        if item.kind is not ArtifactKind.RESULTS
+    ) + (
+        _binding(baseline_result, ExperimentRole.BASELINE),
+        _binding(candidate_result, ExperimentRole.CANDIDATE),
+    )
+    mapping = dataclasses.replace(plan.selected_mapping, bindings=bindings)
+    changed = dataclasses.replace(
+        plan,
+        baseline_evidence=baseline,
+        candidate_evidence=candidate,
+        selected_mapping=mapping,
+        mapping_provenance=(mapping.provenance,),
+    )
+    changed = dataclasses.replace(changed, plan_id=derive_ephemeral_plan_id(changed))
+    original_capture = materialize._capture_artifact
+    captures: list[RepositoryPath] = []
+
+    def count_capture(*args: object, **kwargs: object) -> PassiveArtifact:
+        candidate_artifact = args[0]
+        assert isinstance(candidate_artifact, ArtifactCandidate)
+        captures.append(candidate_artifact.path)
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(materialize, "_capture_artifact", count_capture)
+
+    execution = execute_ephemeral_audit_with_trace(changed, runtime)
+
+    assert execution.audit_result.verdict is Verdict.NOT_SUPPORTED
+    assert captures.count(artifact.path) == 1
+    entries = tuple(
+        item
+        for item in execution.trace.entries
+        if item.artifact_path == artifact.path
+    )
+    assert len(entries) == 2
+    assert {item.adapter_version for item in entries} == {"v1"}
+    assert {
+        selector.table_predicates[0].canonical_value
+        for item in entries
+        for selector in item.selectors
+    } == {"baseline", "candidate"}
+    assert {item.normalized_value.count for item in entries} == {1}
+    trace_wire = trace_json_bytes(execution.trace)
+    assert b'"expression":"accuracy"' in trace_wire
+    assert b'"column":"commit"' in trace_wire
+    assert b'"expected_cardinality":1' in trace_wire
+    assert b'"memory"' not in trace_wire
+    assert b'"status"' not in trace_wire
+    assert b"row-only-baseline" not in trace_wire
+    assert b"row-only-candidate" not in trace_wire
+
+    forged_baseline = dataclasses.replace(
+        baseline_result,
+        observations=(
+            dataclasses.replace(
+                baseline_result.observations[0],
+                metric_value=9.99,
+            ),
+        ),
+    )
+    forged = dataclasses.replace(
+        changed,
+        baseline_evidence=tuple(
+            forged_baseline if item is baseline_result else item
+            for item in changed.baseline_evidence
+        ),
+    )
+    with pytest.raises(MaterializationUnavailable, match="table evidence"):
+        execute_ephemeral_audit(forged, runtime)
+    assert not (scratch / changed.plan_id).exists()
 
 
 def test_trace_retains_held_out_semantics_without_changing_audit_or_plan_identity(

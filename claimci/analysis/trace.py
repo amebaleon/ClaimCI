@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,7 @@ from .contracts import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    TableScalarType,
     to_jsonable,
 )
 
@@ -274,16 +276,80 @@ class BoundedValueRepresentation:
 
 
 @dataclass(frozen=True, slots=True)
+class TraceTablePredicate:
+    column: str
+    scalar_type: TableScalarType
+    canonical_value: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.column, "trace table predicate column")
+        if not isinstance(self.scalar_type, TableScalarType):
+            raise TypeError("trace table predicate scalar_type must be TableScalarType")
+        if (
+            not isinstance(self.canonical_value, str)
+            or len(self.canonical_value) > 1_024
+            or any(
+                unicodedata.category(character).startswith("C")
+                for character in self.canonical_value
+            )
+            or (
+                not self.canonical_value
+                and self.scalar_type is not TableScalarType.STRING
+            )
+        ):
+            raise TraceContractError(
+                "trace table predicate canonical_value is invalid"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class TraceSelector:
     target_field: str
     kind: SelectorKind
     expression: str
+    table_predicates: tuple[TraceTablePredicate, ...] = ()
+    expected_cardinality: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.target_field, "trace selector target_field")
         if not isinstance(self.kind, SelectorKind):
             raise TypeError("trace selector kind must be SelectorKind")
         _bounded_text(self.expression, "trace selector expression", maximum=1_024)
+        if self.table_predicates:
+            if (
+                not 1 <= len(self.table_predicates) <= 8
+                or not all(
+                    type(item) is TraceTablePredicate
+                    for item in self.table_predicates
+                )
+            ):
+                raise TraceLimitError(
+                    "trace table selector predicates exceed their bound"
+                )
+            ordered = tuple(
+                sorted(self.table_predicates, key=lambda item: item.column)
+            )
+            if len({item.column for item in ordered}) != len(ordered):
+                raise TraceContractError(
+                    "trace table selector predicate columns must be unique"
+                )
+            object.__setattr__(self, "table_predicates", ordered)
+            if self.kind is not SelectorKind.COLUMN:
+                raise TraceContractError(
+                    "trace table selector must target a table column"
+                )
+            if (
+                isinstance(self.expected_cardinality, bool)
+                or not isinstance(self.expected_cardinality, int)
+                or not 1 <= self.expected_cardinality <= 32
+            ):
+                raise TraceContractError(
+                    "trace table selector cardinality must be between one and 32"
+                )
+        elif self.expected_cardinality is not None:
+            raise TraceContractError(
+                "trace selector cardinality requires exact table predicates"
+            )
 
 
 _AUTHORITY_BY_KIND = {
@@ -382,7 +448,21 @@ class EvidenceTraceEntry:
         ):
             raise TraceLimitError("trace selectors must be a bounded TraceSelector tuple")
         selector_keys = tuple(
-            (item.target_field, item.kind, item.expression) for item in self.selectors
+            (
+                item.target_field,
+                item.kind,
+                item.expression,
+                tuple(
+                    (
+                        predicate.column,
+                        predicate.scalar_type,
+                        predicate.canonical_value,
+                    )
+                    for predicate in item.table_predicates
+                ),
+                item.expected_cardinality,
+            )
+            for item in self.selectors
         )
         if len(set(selector_keys)) != len(selector_keys):
             raise TraceContractError("trace selectors must be unique")
@@ -855,6 +935,7 @@ __all__ = [
     "TraceLimitError",
     "TraceRecordKind",
     "TraceSelector",
+    "TraceTablePredicate",
     "TraceValueType",
     "trace_json_bytes",
     "trace_to_jsonable",

@@ -18,7 +18,7 @@ from .dataset import PassiveJsonLinesDatasetAdapter
 from .native import NativeConfigAdapter, NativeManifestAdapter, NativeResultsAdapter
 from .registry import ADAPTERS, extract_registered_artifact, get_adapter
 from .structured import JsonAdapter, JsonLinesAdapter
-from .tabular import CsvAdapter
+from .tabular import CsvAdapter, TsvAdapter
 
 __all__ = [
     "ADAPTERS",
@@ -41,6 +41,7 @@ __all__ = [
     "NativeResultsAdapter",
     "PassiveJsonLinesDatasetAdapter",
     "TomlConfigAdapter",
+    "TsvAdapter",
     "YamlConfigAdapter",
     "extract_registered_artifact",
     "get_adapter",

@@ -35,6 +35,11 @@ from .contracts import (
     ProvenanceKind,
     RepoMapping,
     RepositoryIdentity,
+    TableSelector,
+    field_mapping_identity,
+)
+from .evidence_identity import (
+    evidence_for_binding,
 )
 from .planner import derive_ephemeral_plan_id
 from .trace import (
@@ -49,6 +54,7 @@ from .trace import (
     TraceLimitError,
     TraceRecordKind,
     TraceSelector,
+    TraceTablePredicate,
     stable_audit_projection,
 )
 
@@ -412,17 +418,12 @@ def _evidence_by_binding(
         raise MaterializationUnavailable("selected mapping type is not trusted")
 
     evidence = (*plan.baseline_evidence, *plan.candidate_evidence)
-    by_key = {
-        (item.artifact.path, item.artifact.kind): item for item in evidence
-    }
-    if len(by_key) != len(evidence):
-        raise MaterializationUnavailable("plan evidence paths are not unique")
     bound: list[tuple[NormalizedEvidence, ArtifactBinding]] = []
     for binding in selected.bindings:
-        item = by_key.get((binding.path, binding.kind))
+        item = evidence_for_binding(binding, evidence)
         if item is None:
             raise MaterializationUnavailable(
-                "selected binding has no issued normalized evidence"
+                "selected binding has no unique issued normalized evidence"
             )
         if binding.adapter_id != item.adapter_match.adapter_id:
             raise MaterializationUnavailable("selected adapter identity changed")
@@ -484,6 +485,7 @@ def _capture_plan_artifacts(
     captured: dict[str, PassiveArtifact] = {}
     captured_kinds: dict[str, ArtifactKind] = {}
     revalidated_datasets: set[str] = set()
+    revalidated_tables: set[str] = set()
     total = 0
     for evidence, binding in sorted(
         bound,
@@ -518,7 +520,52 @@ def _capture_plan_artifacts(
         ):
             _revalidate_dataset_identity(evidence, binding, passive)
             revalidated_datasets.add(path)
+        if any(
+            type(mapping.selector) is TableSelector
+            for mapping in binding.mappings
+        ):
+            if evidence.evidence_id in revalidated_tables:
+                raise MaterializationUnavailable(
+                    "duplicate selector-scoped table evidence was selected"
+                )
+            _revalidate_table_selection(evidence, binding, passive)
+            revalidated_tables.add(evidence.evidence_id)
     return captured
+
+
+def _revalidate_table_selection(
+    evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
+    passive: PassiveArtifact,
+) -> None:
+    if binding.adapter_id not in {"claimci-csv-v1", "claimci-tsv-v1"}:
+        raise MaterializationUnavailable(
+            "selected table adapter is not a fixed passive adapter"
+        )
+    try:
+        from .adapters import get_adapter
+
+        adapter = get_adapter(binding.adapter_id)
+        fresh = adapter.extract(
+            passive,
+            type(evidence.adapter_match)(
+                adapter_id=binding.adapter_id,
+                path=binding.path,
+                confidence=evidence.adapter_match.confidence,
+                mappings=binding.mappings,
+                match_evidence=evidence.adapter_match.match_evidence,
+            ),
+        )
+    except MaterializationUnavailable:
+        raise
+    except Exception as error:
+        raise MaterializationUnavailable(
+            f"fresh passive table adapter revalidation failed: {error}"
+        ) from error
+    if type(fresh) is not NormalizedEvidence or fresh != evidence:
+        raise MaterializationUnavailable(
+            "planned table evidence no longer matches its exact selector identity"
+        )
 
 
 def _revalidate_dataset_identity(
@@ -812,21 +859,37 @@ def _trace_adapter_version(adapter_id: str) -> str | None:
 
 
 def _trace_selectors(binding: ArtifactBinding) -> tuple[TraceSelector, ...]:
-    return tuple(
-        TraceSelector(
-            mapping.target_field,
-            mapping.selector.kind,
-            mapping.selector.expression,
-        )
-        for mapping in sorted(
-            binding.mappings,
-            key=lambda item: (
-                item.target_field,
-                item.selector.kind.value,
-                item.selector.expression,
-            ),
-        )
-    )
+    selectors: list[TraceSelector] = []
+    for mapping in sorted(
+        binding.mappings,
+        key=field_mapping_identity,
+    ):
+        if type(mapping.selector) is TableSelector:
+            selectors.append(
+                TraceSelector(
+                    mapping.target_field,
+                    mapping.selector.kind,
+                    mapping.selector.expression,
+                    tuple(
+                        TraceTablePredicate(
+                            item.column,
+                            item.scalar_type,
+                            item.canonical_value,
+                        )
+                        for item in mapping.selector.predicates
+                    ),
+                    mapping.selector.expected_cardinality,
+                )
+            )
+        else:
+            selectors.append(
+                TraceSelector(
+                    mapping.target_field,
+                    mapping.selector.kind,
+                    mapping.selector.expression,
+                )
+            )
+    return tuple(selectors)
 
 
 def _trace_artifact_values(
@@ -911,7 +974,7 @@ def _passive_trace_entries(
             "split": binding.dataset_split.value if binding.dataset_split else None,
             "adapter": binding.adapter_id,
             "selectors": [
-                (item.target_field, item.selector.kind.value, item.selector.expression)
+                field_mapping_identity(item)
                 for item in binding.mappings
             ],
         }
@@ -1072,11 +1135,7 @@ def _approval_trace_entry(
             "adapter": binding.adapter_id,
             "split": binding.dataset_split.value if binding.dataset_split else None,
             "selectors": tuple(
-                (
-                    mapping.target_field,
-                    mapping.selector.kind.value,
-                    mapping.selector.expression,
-                )
+                field_mapping_identity(mapping)
                 for mapping in binding.mappings
             ),
         }
