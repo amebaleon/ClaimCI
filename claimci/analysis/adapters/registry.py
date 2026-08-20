@@ -11,7 +11,7 @@ from .core import AdapterSelectorError
 from .dataset import PassiveJsonLinesDatasetAdapter
 from .native import NativeConfigAdapter, NativeManifestAdapter, NativeResultsAdapter
 from .structured import JsonAdapter, JsonLinesAdapter
-from .tabular import CsvAdapter
+from .tabular import CsvAdapter, TsvAdapter
 
 
 _REGISTRY_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
@@ -24,6 +24,7 @@ ADAPTERS = (
     JsonAdapter(),
     JsonLinesAdapter(),
     CsvAdapter(),
+    TsvAdapter(),
     YamlConfigAdapter(),
     TomlConfigAdapter(),
 )

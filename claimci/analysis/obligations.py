@@ -40,6 +40,12 @@ from .contracts import (
     ProvenanceKind,
     RepoMapping,
 )
+from .evidence_identity import (
+    evidence_for_binding,
+    evidence_matches_binding as _runtime_evidence_matches_binding,
+    field_mapping_material,
+    field_mapping_projection,
+)
 from .measurement import recover_upstream_procedure_requirement
 
 
@@ -312,14 +318,7 @@ def _binding_material(binding: ArtifactBinding) -> object:
         "dataset_split": (
             binding.dataset_split.value if binding.dataset_split is not None else None
         ),
-        "mappings": [
-            {
-                "target": item.target_field,
-                "kind": item.selector.kind.value,
-                "expression": item.selector.expression,
-            }
-            for item in binding.mappings
-        ],
+        "mappings": [field_mapping_material(item) for item in binding.mappings],
     }
 
 
@@ -1083,12 +1082,7 @@ def _evidence_matches_binding(
     evidence: NormalizedEvidence,
     binding: ArtifactBinding,
 ) -> bool:
-    if (
-        evidence.artifact.path != binding.path
-        or evidence.artifact.kind is not binding.kind
-        or evidence.adapter_match.adapter_id != binding.adapter_id
-        or evidence.adapter_match.mappings != binding.mappings
-    ):
+    if not _runtime_evidence_matches_binding(evidence, binding):
         return False
     roles = {
         item.experiment_role
@@ -1118,16 +1112,7 @@ def _binding_support_signature(binding: ArtifactBinding) -> tuple[object, ...]:
         binding.role.value,
         binding.adapter_id,
         binding.dataset_split.value if binding.dataset_split is not None else "",
-        tuple(
-            sorted(
-                (
-                    item.target_field,
-                    item.selector.kind.value,
-                    item.selector.expression,
-                )
-                for item in binding.mappings
-            )
-        ),
+        field_mapping_projection(binding.mappings),
     )
 
 
@@ -1159,14 +1144,14 @@ def _selected_artifact_obligation(
     slot: ArtifactEvidenceSlot,
     *,
     selected_mapping: MappingCandidate | RepoMapping,
-    evidence_by_key: dict[tuple[object, ArtifactKind], NormalizedEvidence],
+    normalized_evidence: tuple[NormalizedEvidence, ...],
     metric: str,
 ) -> EvidenceObligation:
     bindings = _matching_bindings(slot, selected_mapping)
     supports: list[ArtifactEvidenceSupport] = []
     try:
         for binding in bindings:
-            evidence = evidence_by_key.get((binding.path, binding.kind))
+            evidence = evidence_for_binding(binding, normalized_evidence)
             if evidence is None:
                 continue
             supports.append(
@@ -1236,9 +1221,6 @@ def _unselected_artifact_obligation(
             reason=EvidenceObligationReason.REQUIRED_ARTIFACT_NOT_FOUND,
             effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
         )
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item for item in normalized_evidence
-    }
     relevant_evidence = tuple(
         item for item in normalized_evidence if item.artifact.kind is slot.kind
     )
@@ -1290,7 +1272,7 @@ def _unselected_artifact_obligation(
     valid_bindings = tuple(
         (candidate, binding, evidence)
         for candidate, binding in binding_candidates
-        if (evidence := evidence_by_key.get((binding.path, binding.kind))) is not None
+        if (evidence := evidence_for_binding(binding, normalized_evidence)) is not None
         and _evidence_matches_binding(evidence, binding)
         and (
             slot.kind is not ArtifactKind.RESULTS
@@ -1300,7 +1282,7 @@ def _unselected_artifact_obligation(
     valid_question_bindings = tuple(
         binding
         for binding in question_bindings
-        if (evidence := evidence_by_key.get((binding.path, binding.kind))) is not None
+        if (evidence := evidence_for_binding(binding, normalized_evidence)) is not None
         and _evidence_matches_binding(evidence, binding)
         and (
             slot.kind is not ArtifactKind.RESULTS
@@ -1576,10 +1558,6 @@ def assess_evidence_obligations(
             raise AnalysisContractError(
                 "unsupported compiler policy cannot instantiate artifact obligations"
             )
-        evidence_by_key = {
-            (item.artifact.path, item.artifact.kind): item
-            for item in normalized_evidence
-        }
         for template_id in artifact_templates:
             slot = _artifact_target(template_id)
             if selected_mapping is not None:
@@ -1587,7 +1565,7 @@ def assess_evidence_obligations(
                     template_id,
                     slot,
                     selected_mapping=selected_mapping,
-                    evidence_by_key=evidence_by_key,
+                    normalized_evidence=normalized_evidence,
                     metric=audit_claim.metric,
                 )
             else:

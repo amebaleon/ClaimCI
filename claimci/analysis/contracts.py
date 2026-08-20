@@ -11,8 +11,10 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
@@ -180,6 +182,15 @@ class SelectorKind(str, Enum):
     COLUMN = "column"
 
 
+class TableScalarType(str, Enum):
+    """One explicitly declared scalar grammar for a table predicate cell."""
+
+    STRING = "string"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    NULL = "null"
+
+
 class AnalysisState(str, Enum):
     COMPLETE = "complete"
     MAPPING_NEEDED = "mapping_needed"
@@ -246,10 +257,135 @@ class EvidenceSelector:
             raise TypeError("selector provenance must be FieldProvenance")
 
 
+def _canonical_table_number(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("table number predicate value must be an integer or float")
+    try:
+        if not math.isfinite(float(value)):
+            raise AnalysisContractError("table number predicate must be finite")
+        normalized = Decimal(str(value)).normalize()
+    except (InvalidOperation, OverflowError, ValueError) as error:
+        raise AnalysisContractError("table number predicate must be finite") from error
+    canonical = "0" if normalized == 0 else str(normalized)
+    if len(canonical) > 128:
+        raise AnalysisContractError("table number predicate exceeds its canonical bound")
+    return canonical
+
+
+@dataclass(frozen=True, slots=True)
+class TablePredicate:
+    """One exact typed equality predicate over a table column."""
+
+    column: str
+    scalar_type: TableScalarType
+    value: JsonScalar
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.column, str) or not _COLUMN_NAME.fullmatch(self.column):
+            raise AnalysisContractError("table predicate column is invalid")
+        if not isinstance(self.scalar_type, TableScalarType):
+            raise TypeError("table predicate scalar_type must be TableScalarType")
+        if self.scalar_type is TableScalarType.STRING:
+            if type(self.value) is not str:
+                raise TypeError("table string predicate requires a string value")
+            if len(self.value) > 1_024 or any(
+                unicodedata.category(character).startswith("C")
+                for character in self.value
+            ):
+                raise AnalysisContractError("table string predicate value is invalid")
+        elif self.scalar_type is TableScalarType.NUMBER:
+            _canonical_table_number(self.value)
+        elif self.scalar_type is TableScalarType.BOOLEAN:
+            if type(self.value) is not bool:
+                raise TypeError("table boolean predicate requires a boolean value")
+        elif self.value is not None:
+            raise TypeError("table null predicate requires a null value")
+
+    @property
+    def canonical_value(self) -> str:
+        if self.scalar_type is TableScalarType.STRING:
+            assert isinstance(self.value, str)
+            return self.value
+        if self.scalar_type is TableScalarType.NUMBER:
+            return _canonical_table_number(self.value)
+        if self.scalar_type is TableScalarType.BOOLEAN:
+            return "true" if self.value else "false"
+        return "null"
+
+
+@dataclass(frozen=True, slots=True)
+class TableSelector:
+    """An exact target column plus a bounded canonical row predicate set."""
+
+    column: str
+    predicates: tuple[TablePredicate, ...]
+    expected_cardinality: int
+    provenance: FieldProvenance
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.column, str) or not _COLUMN_NAME.fullmatch(self.column):
+            raise AnalysisContractError("table target column is invalid")
+        if (
+            not isinstance(self.predicates, tuple)
+            or not 1 <= len(self.predicates) <= 8
+            or not all(type(item) is TablePredicate for item in self.predicates)
+        ):
+            raise AnalysisContractError(
+                "table selector requires one through eight exact predicates"
+            )
+        ordered = tuple(sorted(self.predicates, key=lambda item: item.column))
+        columns = tuple(item.column for item in ordered)
+        if len(set(columns)) != len(columns):
+            raise AnalysisContractError("table selector predicate columns must be unique")
+        object.__setattr__(self, "predicates", ordered)
+        if (
+            isinstance(self.expected_cardinality, bool)
+            or not isinstance(self.expected_cardinality, int)
+            or not 1 <= self.expected_cardinality <= 32
+        ):
+            raise AnalysisContractError(
+                "table selector expected_cardinality must be between one and 32"
+            )
+        if not isinstance(self.provenance, FieldProvenance):
+            raise TypeError("table selector provenance must be FieldProvenance")
+
+    @property
+    def kind(self) -> SelectorKind:
+        return SelectorKind.COLUMN
+
+    @property
+    def expression(self) -> str:
+        return self.column
+
+
+def selector_identity(
+    selector: EvidenceSelector | TableSelector,
+) -> tuple[object, ...]:
+    """Return one canonical selector identity without provenance metadata."""
+
+    if type(selector) is EvidenceSelector:
+        return ("field", selector.kind.value, selector.expression)
+    if type(selector) is TableSelector:
+        return (
+            "table",
+            selector.column,
+            selector.expected_cardinality,
+            tuple(
+                (
+                    item.column,
+                    item.scalar_type.value,
+                    item.canonical_value,
+                )
+                for item in selector.predicates
+            ),
+        )
+    raise TypeError("selector identity requires an approved selector contract")
+
+
 @dataclass(frozen=True, slots=True)
 class FieldMapping:
     target_field: str
-    selector: EvidenceSelector
+    selector: EvidenceSelector | TableSelector
     provenance: FieldProvenance
 
     def __post_init__(self) -> None:
@@ -259,10 +395,29 @@ class FieldMapping:
             or not _TARGET_FIELD.fullmatch(self.target_field)
         ):
             raise AnalysisContractError("mapping target_field is invalid")
-        if not isinstance(self.selector, EvidenceSelector):
-            raise TypeError("mapping selector must be EvidenceSelector")
+        if type(self.selector) not in {EvidenceSelector, TableSelector}:
+            raise TypeError("mapping selector must be an approved selector contract")
         if not isinstance(self.provenance, FieldProvenance):
             raise TypeError("mapping provenance must be FieldProvenance")
+
+
+def field_mapping_identity(mapping: FieldMapping) -> tuple[object, ...]:
+    """Return the canonical selector-bearing identity for one field mapping.
+
+    Legacy selectors deliberately retain their historical three-part identity.
+    Table selectors add their exact predicates and cardinality without including
+    untrusted or head-specific provenance text.
+    """
+
+    if type(mapping) is not FieldMapping:
+        raise TypeError("field mapping identity requires FieldMapping")
+    if type(mapping.selector) is EvidenceSelector:
+        return (
+            mapping.target_field,
+            mapping.selector.kind.value,
+            mapping.selector.expression,
+        )
+    return (mapping.target_field, *selector_identity(mapping.selector))
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,32 +739,45 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
     )
     if len(set(keys)) != len(keys):
         raise AnalysisContractError(f"{label} must not contain duplicate bindings")
-    roles_by_path: dict[RepositoryPath, set[ExperimentRole]] = {}
+    bindings_by_path: dict[RepositoryPath, list[ArtifactBinding]] = {}
     for binding in bindings:
-        roles_by_path.setdefault(binding.path, set()).add(binding.role)
-    if any(
-        {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}.issubset(roles)
-        for roles in roles_by_path.values()
-    ):
-        raise AnalysisContractError(
-            f"{label} cannot assign one path to conflicting baseline and candidate roles"
+        bindings_by_path.setdefault(binding.path, []).append(binding)
+    for path_bindings in bindings_by_path.values():
+        roles = {item.role for item in path_bindings}
+        if not {
+            ExperimentRole.BASELINE,
+            ExperimentRole.CANDIDATE,
+        }.issubset(roles):
+            continue
+        role_bindings = tuple(
+            item
+            for item in path_bindings
+            if item.role in {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}
         )
+        exact_table_identities = tuple(
+            tuple(
+                sorted(
+                    field_mapping_identity(mapping)
+                    for mapping in item.mappings
+                    if type(mapping.selector) is TableSelector
+                )
+            )
+            for item in role_bindings
+        )
+        if (
+            any(not identity for identity in exact_table_identities)
+            or len(set(exact_table_identities)) != len(exact_table_identities)
+        ):
+            raise AnalysisContractError(
+                f"{label} cannot assign one path to conflicting baseline and candidate roles"
+            )
     return bindings
 
 
 def _field_mapping_projection(
     mappings: tuple[FieldMapping, ...],
-) -> tuple[tuple[str, str, str], ...]:
-    return tuple(
-        sorted(
-            (
-                item.target_field,
-                item.selector.kind.value,
-                item.selector.expression,
-            )
-            for item in mappings
-        )
-    )
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(sorted(field_mapping_identity(item) for item in mappings))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1536,6 +1704,11 @@ __all__ = [
     "RepositoryPath",
     "SelectorKind",
     "Sha256Digest",
+    "TablePredicate",
+    "TableScalarType",
+    "TableSelector",
     "UnifiedAnalysisResult",
+    "field_mapping_identity",
+    "selector_identity",
     "to_jsonable",
 ]
