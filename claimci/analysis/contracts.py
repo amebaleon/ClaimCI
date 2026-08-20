@@ -983,6 +983,7 @@ class EphemeralAuditPlan:
     confidence: Confidence
     audit_claim: AuditClaimSpec | None = None
     selected_mapping: MappingCandidate | RepoMapping | None = None
+    semantic_proposal_provenance: FieldProvenance | None = None
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1049,6 +1050,18 @@ class EphemeralAuditPlan:
             raise AnalysisContractError(
                 "plan audit claim ID must match its claim reference"
             )
+        if self.semantic_proposal_provenance is not None:
+            if type(self.semantic_proposal_provenance) is not FieldProvenance:
+                raise TypeError(
+                    "plan semantic proposal provenance must be FieldProvenance or null"
+                )
+            if (
+                self.semantic_proposal_provenance.kind
+                is not ProvenanceKind.PROVIDER_PROPOSAL
+            ):
+                raise AnalysisContractError(
+                    "plan semantic proposal must remain provider provenance"
+                )
 
 
 def _deep_freeze(value: object) -> object:

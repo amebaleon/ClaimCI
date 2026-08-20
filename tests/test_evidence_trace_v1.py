@@ -84,6 +84,24 @@ def test_bounded_value_representation_commits_all_values_without_copying_strings
     assert "0.6" in serialized
 
 
+def test_value_preview_omits_integers_that_are_not_exact_in_worker_json() -> None:
+    representation = BoundedValueRepresentation.from_value(10**100)
+
+    assert representation.value_type is TraceValueType.NUMBER
+    assert representation.count == 1
+    assert representation.direct_values == ()
+    assert len(str(representation.canonical_sha256)) == 64
+
+
+def test_deep_value_commitment_fails_as_a_controlled_trace_limit() -> None:
+    value: object = 1
+    for _ in range(2_000):
+        value = [value]
+
+    with pytest.raises(TraceContractError):
+        BoundedValueRepresentation.from_value(value)
+
+
 def test_trace_contracts_are_deeply_immutable_and_json_safe() -> None:
     entry = _passive_entry(provenance=ProvenanceKind.ADAPTER_EXTRACTION)
     authority = DeterministicAuditTrace.from_audit_result(_audit_result())

@@ -563,6 +563,35 @@ def test_provider_claim_hint_remains_non_authoritative_in_complete_trace(
     assert trace.deterministic_authority.authority.value == "deterministic"
 
 
+def test_provider_confirmation_is_traced_without_retyping_the_claim_or_evidence(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    provider = FieldProvenance(
+        ProvenanceKind.PROVIDER_PROPOSAL,
+        "validated semantic preflight confirmation",
+        source_id="semantic-call-1",
+    )
+    changed = dataclasses.replace(plan, semantic_proposal_provenance=provider)
+
+    trace = execute_ephemeral_audit_with_trace(changed, runtime).trace
+    proposals = tuple(
+        item
+        for item in trace.entries
+        if item.record_kind is TraceRecordKind.LLM_SEMANTIC_PROPOSAL
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0].provenance_kind is ProvenanceKind.PROVIDER_PROPOSAL
+    assert proposals[0].authority is TraceAuthorityClass.NON_AUTHORITATIVE_INPUT
+    assert all(
+        item.provenance_kind is ProvenanceKind.ADAPTER_EXTRACTION
+        for item in trace.entries
+        if item.record_kind is TraceRecordKind.PASSIVE_SOURCE_EVIDENCE
+    )
+    assert trace.deterministic_authority.authority.value == "deterministic"
+
+
 def test_repo_mapping_approval_is_binding_trust_not_verdict_authority(
     tmp_path: Path,
 ) -> None:

@@ -82,6 +82,12 @@ It is created only by the trusted materialization path. The deterministic
 authority record is created from the exact `AuditResult`, following the same
 factory-only principle as `DeterministicAuditOutcome`.
 
+`PlanningRequest` and `EphemeralAuditPlan` carry one optional
+`semantic_proposal_provenance` field. It accepts only `PROVIDER_PROPOSAL`
+provenance, changes no selection or plan identity, and exists solely so an
+independently confirmed Hosted semantic preflight is not erased when Core
+deduplicates an equivalent deterministic claim or mapping.
+
 The bundle records:
 
 - repository commit SHA;

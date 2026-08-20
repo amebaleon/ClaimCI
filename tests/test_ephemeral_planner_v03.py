@@ -651,6 +651,33 @@ def test_split_bearing_mapping_makes_identity_only_dataset_evidence_ready() -> N
     } == {DatasetSplit.TRAIN, DatasetSplit.EVAL}
 
 
+def test_non_authoritative_semantic_proposal_is_carried_to_the_plan_only() -> None:
+    request = dataclasses.replace(
+        _request(),
+        semantic_proposal_provenance=_provenance(
+            ProvenanceKind.PROVIDER_PROPOSAL,
+            source_path=None,
+            source_id="semantic-call-1",
+        ),
+    )
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert outcome.plan.semantic_proposal_provenance is request.semantic_proposal_provenance
+    assert outcome.plan.selected_mapping is request.mapping_candidates[0]
+
+    with pytest.raises(AnalysisContractError, match="provider provenance"):
+        dataclasses.replace(
+            request,
+            semantic_proposal_provenance=_provenance(
+                ProvenanceKind.DETERMINISTIC_DISCOVERY,
+                source_id="not-a-provider-call",
+            ),
+        )
+
+
 def test_resolvable_upstream_dataset_question_precedes_splitless_partial() -> None:
     evidence_with_splits = _complete_evidence()
     identity_only = _identity_only_dataset_evidence(evidence_with_splits)

@@ -72,6 +72,7 @@ class PlanningRequest:
     mapping_candidates: tuple[MappingCandidate, ...]
     approved_mapping: RepoMapping | None = None
     upstream_mapping_question: MappingQuestion | None = None
+    semantic_proposal_provenance: FieldProvenance | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryIdentity:
@@ -144,6 +145,18 @@ class PlanningRequest:
             self.upstream_mapping_question
         ) is not MappingQuestion:
             raise TypeError("upstream mapping question must be MappingQuestion")
+        if self.semantic_proposal_provenance is not None:
+            if type(self.semantic_proposal_provenance) is not FieldProvenance:
+                raise TypeError(
+                    "semantic proposal provenance must be FieldProvenance or null"
+                )
+            if (
+                self.semantic_proposal_provenance.kind
+                is not ProvenanceKind.PROVIDER_PROPOSAL
+            ):
+                raise AnalysisContractError(
+                    "semantic proposal trace input must remain provider provenance"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +721,7 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
         confidence=confidence,
         audit_claim=request.audit_claim,
         selected_mapping=selected,
+        semantic_proposal_provenance=request.semantic_proposal_provenance,
     )
     return PlanningOutcome(state=PlanningState.READY, plan=plan)
 

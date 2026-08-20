@@ -40,6 +40,7 @@ EVIDENCE_TRACE_MAX_DIRECT_VALUES = 8
 EVIDENCE_TRACE_MAX_TEXT = 512
 _MAX_COMMITMENT_NODES = 100_000
 _MAX_COMMITMENT_BYTES = 16 * 1024 * 1024
+_MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 
 _ADAPTER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _RULE_ID = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)+")
@@ -134,8 +135,12 @@ def _canonical_value(value: object, *, state: list[int]) -> object:
 def _direct_preview(value: object, output: list[TraceDirectScalar]) -> None:
     if len(output) >= EVIDENCE_TRACE_MAX_DIRECT_VALUES:
         return
-    if value is None or type(value) in {bool, int}:
+    if value is None or type(value) is bool:
         output.append(value)
+        return
+    if type(value) is int:
+        if abs(value) <= _MAX_SAFE_JSON_INTEGER:
+            output.append(value)
         return
     if type(value) is float:
         if not math.isfinite(value):
@@ -212,6 +217,10 @@ class BoundedValueRepresentation:
                 )
             if type(value) is float and not math.isfinite(value):
                 raise TraceContractError("trace direct values must be finite")
+            if type(value) is int and abs(value) > _MAX_SAFE_JSON_INTEGER:
+                raise TraceContractError(
+                    "trace integer previews must be exactly representable in JSON runtimes"
+                )
         if self.byte_count is not None and (
             isinstance(self.byte_count, bool)
             or not isinstance(self.byte_count, int)
@@ -221,8 +230,8 @@ class BoundedValueRepresentation:
 
     @classmethod
     def from_value(cls, value: object) -> "BoundedValueRepresentation":
-        canonical = _canonical_value(value, state=[0])
         try:
+            canonical = _canonical_value(value, state=[0])
             encoded = json.dumps(
                 canonical,
                 sort_keys=True,
@@ -230,15 +239,20 @@ class BoundedValueRepresentation:
                 ensure_ascii=True,
                 allow_nan=False,
             ).encode("utf-8")
+            preview: list[TraceDirectScalar] = []
+            _direct_preview(value, preview)
+            count = _leaf_count(value)
+        except RecursionError as error:
+            raise TraceLimitError(
+                "trace source representation exceeds the nesting bound"
+            ) from error
         except (TypeError, ValueError, OverflowError) as error:
             raise TraceContractError("trace source representation is not canonical JSON") from error
         if len(encoded) > _MAX_COMMITMENT_BYTES:
             raise TraceLimitError("trace source representation exceeds its input byte bound")
-        preview: list[TraceDirectScalar] = []
-        _direct_preview(value, preview)
         return cls(
             value_type=_value_type(value),
-            count=_leaf_count(value),
+            count=count,
             canonical_sha256=Sha256Digest(hashlib.sha256(encoded).hexdigest()),
             direct_values=tuple(preview),
             byte_count=len(encoded),

@@ -953,7 +953,12 @@ def _claim_trace_entries(
         source_value=BoundedValueRepresentation.from_value(plan.claim.text),
         consumer_rule_ids=result_rules,
     )
-    if plan.claim.provenance.kind is not ProvenanceKind.PROVIDER_PROPOSAL:
+    proposal_provenance = plan.semantic_proposal_provenance
+    if proposal_provenance is None and (
+        plan.claim.provenance.kind is ProvenanceKind.PROVIDER_PROPOSAL
+    ):
+        proposal_provenance = plan.claim.provenance
+    if proposal_provenance is None:
         return (claim,)
     if plan.audit_claim is None:
         raise TraceContractError("provider claim trace requires an audit claim")
@@ -964,8 +969,8 @@ def _claim_trace_entries(
         head_sha=plan.head_sha,
         provenance_kind=ProvenanceKind.PROVIDER_PROPOSAL,
         detail_code="claim.semantic_proposal",
-        source_path=plan.claim.source_path,
-        source_id=plan.claim.provenance.source_id,
+        source_path=proposal_provenance.source_path or plan.claim.source_path,
+        source_id=proposal_provenance.source_id,
         source_value=BoundedValueRepresentation.from_value(
             {
                 "metric": plan.audit_claim.metric,
