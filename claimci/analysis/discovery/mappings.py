@@ -28,6 +28,10 @@ from claimci.analysis.contracts import (
     RepositoryIdentity,
     RepositoryPath,
     SelectorKind,
+    TablePredicate,
+    TableScalarType,
+    TableSelector,
+    field_mapping_identity,
 )
 
 from .models import DiscoveredClaim, DiscoveryError, DiscoveryLimits
@@ -125,13 +129,32 @@ def _binding(
 
 
 def _mapping_id(prefix: str, bindings: tuple[ArtifactBinding, ...]) -> str:
+    has_explicit_runtime_identity = any(
+        binding.adapter_id is not None or binding.mappings for binding in bindings
+    )
     material = json.dumps(
         [
             (
-                str(binding.path),
-                binding.kind.value,
-                binding.role.value,
-                binding.dataset_split.value if binding.dataset_split else None,
+                (
+                    str(binding.path),
+                    binding.kind.value,
+                    binding.role.value,
+                    binding.dataset_split.value if binding.dataset_split else None,
+                )
+                if not has_explicit_runtime_identity
+                else (
+                    str(binding.path),
+                    binding.kind.value,
+                    binding.role.value,
+                    binding.dataset_split.value if binding.dataset_split else None,
+                    binding.adapter_id,
+                    tuple(
+                        sorted(
+                            field_mapping_identity(mapping)
+                            for mapping in binding.mappings
+                        )
+                    ),
+                )
             )
             for binding in bindings
         ],
@@ -305,7 +328,10 @@ def _provider_mappings(
                     raise DiscoveryError("provider field mappings exceed their bound")
                 provenance = FieldProvenance(
                     kind=ProvenanceKind.PROVIDER_PROPOSAL,
-                    detail="validated provider mapping proposal",
+                    detail=(
+                        "validated provider mapping proposal; "
+                        f"sha256={artifact.sha256}"
+                    ),
                     source_path=path,
                 )
                 field_mappings: list[FieldMapping] = []
@@ -315,16 +341,58 @@ def _provider_mappings(
                         {"target_field", "selector"},
                         f"mapping {index} binding {binding_index} field {field_index}",
                     )
-                    selector_value = _strict_fields(
-                        field["selector"],
-                        {"kind", "expression"},
-                        "selector",
-                    )
-                    selector = EvidenceSelector(
-                        kind=SelectorKind(selector_value["kind"]),
-                        expression=selector_value["expression"],
-                        provenance=provenance,
-                    )
+                    selector_value = field["selector"]
+                    if not isinstance(selector_value, Mapping):
+                        raise DiscoveryError("provider selector has invalid fields")
+                    if set(selector_value) == {"kind", "expression"}:
+                        selector = EvidenceSelector(
+                            kind=SelectorKind(selector_value["kind"]),
+                            expression=selector_value["expression"],
+                            provenance=provenance,
+                        )
+                    elif set(selector_value) == {
+                        "kind",
+                        "column",
+                        "predicates",
+                        "expected_cardinality",
+                    }:
+                        if selector_value["kind"] != "table":
+                            raise DiscoveryError(
+                                "provider table selector kind is invalid"
+                            )
+                        raw_predicates = selector_value["predicates"]
+                        if (
+                            not isinstance(raw_predicates, list)
+                            or not 1 <= len(raw_predicates) <= 8
+                        ):
+                            raise DiscoveryError(
+                                "provider table selector predicates are invalid"
+                            )
+                        predicates = tuple(
+                            TablePredicate(
+                                column=predicate["column"],
+                                scalar_type=TableScalarType(predicate["scalar_type"]),
+                                value=predicate["value"],
+                            )
+                            for predicate in (
+                                _strict_fields(
+                                    item,
+                                    {"column", "scalar_type", "value"},
+                                    "table predicate",
+                                )
+                                for item in raw_predicates
+                            )
+                        )
+                        selector = TableSelector(
+                            column=selector_value["column"],
+                            predicates=predicates,
+                            expected_cardinality=selector_value[
+                                "expected_cardinality"
+                            ],
+                            provenance=provenance,
+                        )
+                    else:
+                        raise DiscoveryError("provider selector has invalid fields")
                     field_mappings.append(
                         FieldMapping(
                             target_field=field["target_field"],

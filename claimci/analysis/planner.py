@@ -44,6 +44,11 @@ from .contracts import (
     RepositoryPath,
     ProvenanceKind,
 )
+from .evidence_identity import (
+    evidence_for_binding as _evidence_for_binding,
+    field_mapping_material as _field_mapping_material,
+    field_mapping_projection as _runtime_field_mapping_projection,
+)
 from .claims import audit_relevant_claim_projection
 from .obligations import (
     EvidenceObligationBundle,
@@ -330,27 +335,15 @@ def _binding_key(binding: ArtifactBinding) -> tuple[RepositoryPath, ArtifactKind
 
 def _field_mapping_projection(
     mappings: tuple[FieldMapping, ...],
-) -> tuple[tuple[str, str, str], ...]:
-    return tuple(
-        sorted(
-            (
-                item.target_field,
-                item.selector.kind.value,
-                item.selector.expression,
-            )
-            for item in mappings
-        )
-    )
+) -> tuple[tuple[object, ...], ...]:
+    return _runtime_field_mapping_projection(mappings)
 
 
 def _hydrate_binding(
     binding: ArtifactBinding,
-    evidence_by_key: dict[
-        tuple[RepositoryPath, ArtifactKind],
-        NormalizedEvidence,
-    ],
+    evidence_values: tuple[NormalizedEvidence, ...],
 ) -> ArtifactBinding:
-    evidence = evidence_by_key.get(_binding_key(binding))
+    evidence = _evidence_for_binding(binding, evidence_values)
     if evidence is None:
         return binding
     runtime = evidence.adapter_match
@@ -406,16 +399,13 @@ def _scope_mapping_candidates(
     selected_keys = {
         (item.path, item.kind) for item in selected_artifacts
     }
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item for item in selected_evidence
-    }
     scoped: list[MappingCandidate] = []
     seen: set[tuple[object, ...]] = set()
     for candidate in candidates:
         if type(candidate) is not MappingCandidate:
             raise TypeError("discovery mapping candidates must be MappingCandidate values")
         bindings = tuple(
-            _hydrate_binding(binding, evidence_by_key)
+            _hydrate_binding(binding, selected_evidence)
             for binding in candidate.bindings
             if _binding_key(binding) in selected_keys
         )
@@ -454,15 +444,12 @@ def _scope_approved_mapping(
         raise TypeError("discovery approved mapping must be RepoMapping")
     all_keys = {(item.path, item.kind) for item in all_artifacts}
     selected_keys = {(item.path, item.kind) for item in selected_artifacts}
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item for item in selected_evidence
-    }
     selected_bindings: list[ArtifactBinding] = []
     stale = False
     for binding in approved.bindings:
         key = _binding_key(binding)
         if key in selected_keys:
-            selected_bindings.append(_hydrate_binding(binding, evidence_by_key))
+            selected_bindings.append(_hydrate_binding(binding, selected_evidence))
         elif key not in all_keys:
             stale = True
     if stale:
@@ -508,14 +495,11 @@ def _scope_mapping_question(
     if question.relevant_claim_id not in {None, claim_id}:
         return None
     selected_keys = {(item.path, item.kind) for item in selected_artifacts}
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item for item in selected_evidence
-    }
     choices: list[MappingChoice] = []
     seen: set[tuple[tuple[object, ...], ...]] = set()
     for choice in question.choices:
         bindings = tuple(
-            _hydrate_binding(binding, evidence_by_key)
+            _hydrate_binding(binding, selected_evidence)
             for binding in choice.bindings
             if _binding_key(binding) in selected_keys
         )
@@ -819,14 +803,14 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
             reason="satisfied obligations have no selected mapping",
         )
 
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item
-        for item in request.normalized_evidence
-    }
     baseline: list[NormalizedEvidence] = []
     candidate: list[NormalizedEvidence] = []
     for binding in selected.bindings:
-        evidence = evidence_by_key[(binding.path, binding.kind)]
+        evidence = _evidence_for_binding(binding, request.normalized_evidence)
+        if evidence is None:
+            raise AnalysisContractError(
+                "selected binding does not resolve to one exact evidence variant"
+            )
         target = baseline if binding.role is ExperimentRole.BASELINE else candidate
         if evidence not in target:
             target.append(evidence)
@@ -888,14 +872,14 @@ def _plan_legacy_request(request: PlanningRequest) -> PlanningOutcome:
             state=PlanningState.MAPPING_NEEDED,
             mapping_question=question,
         )
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item
-        for item in request.normalized_evidence
-    }
     baseline: list[NormalizedEvidence] = []
     candidate: list[NormalizedEvidence] = []
     for binding in selected.bindings:
-        evidence = evidence_by_key[(binding.path, binding.kind)]
+        evidence = _evidence_for_binding(binding, request.normalized_evidence)
+        if evidence is None:
+            raise AnalysisContractError(
+                "selected binding does not resolve to one exact evidence variant"
+            )
         target = baseline if binding.role is ExperimentRole.BASELINE else candidate
         if evidence not in target:
             target.append(evidence)
@@ -923,15 +907,7 @@ def _binding_supports_native_slot(
     binding: ArtifactBinding,
     request: PlanningRequest,
 ) -> bool:
-    evidence = next(
-        (
-            item
-            for item in request.normalized_evidence
-            if item.artifact.path == binding.path
-            and item.artifact.kind is binding.kind
-        ),
-        None,
-    )
+    evidence = _evidence_for_binding(binding, request.normalized_evidence)
     if evidence is None or not _evidence_supports_role(evidence, binding.role):
         return False
     if (
@@ -1084,10 +1060,6 @@ def _planning_missing_evidence(
 def _potential_dataset_profiles(
     request: PlanningRequest,
 ) -> tuple[dict[tuple[ExperimentRole, DatasetSplit], int], ...]:
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item
-        for item in request.normalized_evidence
-    }
     bases: list[tuple[ArtifactBinding, ...]] = [
         mapping.bindings for mapping in request.mapping_candidates
     ]
@@ -1105,7 +1077,10 @@ def _potential_dataset_profiles(
         for addition in additions:
             counts: dict[tuple[ExperimentRole, DatasetSplit], int] = {}
             for binding in (*base, *addition):
-                evidence = evidence_by_key.get((binding.path, binding.kind))
+                evidence = _evidence_for_binding(
+                    binding,
+                    request.normalized_evidence,
+                )
                 if (
                     binding.kind is not ArtifactKind.DATASET
                     or binding.role not in {
@@ -1155,16 +1130,7 @@ def _binding_signature(binding: ArtifactBinding) -> tuple[object, ...]:
         binding.role.value,
         binding.adapter_id,
         binding.dataset_split.value if binding.dataset_split is not None else None,
-        tuple(
-            sorted(
-                (
-                    item.target_field,
-                    item.selector.kind.value,
-                    item.selector.expression,
-                )
-                for item in binding.mappings
-            )
-        ),
+        _field_mapping_projection(binding.mappings),
     )
 
 
@@ -1178,10 +1144,6 @@ def _mapping_is_runtime_revalidatable(
     mapping: MappingCandidate | RepoMapping,
     request: PlanningRequest,
 ) -> bool:
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item
-        for item in request.normalized_evidence
-    }
     if not mapping.bindings:
         return False
     for binding in mapping.bindings:
@@ -1190,7 +1152,7 @@ def _mapping_is_runtime_revalidatable(
             ExperimentRole.CANDIDATE,
         }:
             return False
-        evidence = evidence_by_key.get((binding.path, binding.kind))
+        evidence = _evidence_for_binding(binding, request.normalized_evidence)
         if evidence is None:
             return False
         if request.claim.claim_id not in evidence.artifact.relevant_claim_ids:
@@ -1214,10 +1176,6 @@ def _mapping_covers_native_inputs(
     mapping: MappingCandidate | RepoMapping,
     request: PlanningRequest,
 ) -> bool:
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item
-        for item in request.normalized_evidence
-    }
     for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE):
         role_bindings = tuple(item for item in mapping.bindings if item.role is role)
         if not all(
@@ -1403,18 +1361,10 @@ def _plan_id_from_components(
                     else None
                 ),
                 "selectors": [
-                    {
-                        "target": item.target_field,
-                        "kind": item.selector.kind.value,
-                        "expression": item.selector.expression,
-                    }
+                    _field_mapping_material(item)
                     for item in sorted(
                         binding.mappings,
-                        key=lambda item: (
-                            item.target_field,
-                            item.selector.kind.value,
-                            item.selector.expression,
-                        ),
+                        key=lambda item: _field_mapping_projection((item,)),
                     )
                 ],
             }
