@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-import re
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from claimci.models import Direction
-from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
+from claimci.review.models import SourceKind, SourceLocation
 
+from .claim_types import (
+    CanonicalScientificClaim,
+    ClaimEvidencePolicy,
+    MetricImprovementClaim,
+    UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
+    UnsupportedDeterministicClaimCompiler,
+    claim_evidence_policy,
+    compile_audit_claim,
+)
 from .confidence import Confidence
 from .contracts import (
     AnalysisContractError,
@@ -22,7 +27,6 @@ from .contracts import (
     ArtifactKind,
     AuditClaimSpec,
     ClaimReference,
-    ClaimedMetricValue,
     DatasetSplit,
     EphemeralAuditPlan,
     ExperimentRole,
@@ -46,13 +50,6 @@ if TYPE_CHECKING:
     from claimci.analysis.discovery import DiscoveryResult
 
 
-_BOUNDED_THRESHOLD = re.compile(
-    r"(?:\bat\s+least\b|\bminimum(?:\s+of)?\b|>=|\bno\s+less\s+than\b)"
-    r"\s*(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))",
-    flags=re.IGNORECASE,
-)
-
-
 class PlanningState(str, Enum):
     READY = "ready"
     MAPPING_NEEDED = "mapping_needed"
@@ -66,13 +63,15 @@ class PlanningRequest:
     pr_number: int | None
     head_sha: GitCommitSha
     claim: ClaimReference
-    audit_claim: AuditClaimSpec
+    audit_claim: AuditClaimSpec | None
     artifacts: tuple[ArtifactCandidate, ...]
     normalized_evidence: tuple[NormalizedEvidence, ...]
     mapping_candidates: tuple[MappingCandidate, ...]
     approved_mapping: RepoMapping | None = None
     upstream_mapping_question: MappingQuestion | None = None
     semantic_proposal_provenance: FieldProvenance | None = None
+    scientific_claim: CanonicalScientificClaim | None = None
+    claim_policy: ClaimEvidencePolicy | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryIdentity:
@@ -89,9 +88,12 @@ class PlanningRequest:
             object.__setattr__(self, "head_sha", GitCommitSha(self.head_sha))
         if type(self.claim) is not ClaimReference:
             raise TypeError("planning claim must be ClaimReference")
-        if type(self.audit_claim) is not AuditClaimSpec:
-            raise TypeError("planning audit_claim must be AuditClaimSpec")
-        if self.claim.claim_id != self.audit_claim.claim_id:
+        if self.audit_claim is not None and type(self.audit_claim) is not AuditClaimSpec:
+            raise TypeError("planning audit_claim must be AuditClaimSpec or null")
+        if (
+            self.audit_claim is not None
+            and self.claim.claim_id != self.audit_claim.claim_id
+        ):
             raise AnalysisContractError("planning claim identifiers must match")
         if not isinstance(self.artifacts, tuple) or not all(
             type(item) is ArtifactCandidate for item in self.artifacts
@@ -157,6 +159,48 @@ class PlanningRequest:
                 raise AnalysisContractError(
                     "semantic proposal trace input must remain provider provenance"
                 )
+        if (self.scientific_claim is None) != (self.claim_policy is None):
+            raise AnalysisContractError(
+                "planning scientific claim and claim policy must appear together"
+            )
+        if self.scientific_claim is not None:
+            if type(self.scientific_claim) is not CanonicalScientificClaim:
+                raise TypeError(
+                    "planning scientific_claim must be CanonicalScientificClaim or null"
+                )
+            if type(self.claim_policy) is not ClaimEvidencePolicy:
+                raise TypeError(
+                    "planning claim_policy must be ClaimEvidencePolicy or null"
+                )
+            if self.scientific_claim.reference != self.claim:
+                raise AnalysisContractError(
+                    "planning scientific claim reference must match its claim"
+                )
+            if self.claim_policy != claim_evidence_policy(self.scientific_claim):
+                raise AnalysisContractError(
+                    "planning claim policy must match canonical claim semantics"
+                )
+            if type(self.scientific_claim.primary) is MetricImprovementClaim:
+                try:
+                    compiled = compile_audit_claim(self.scientific_claim)
+                except UnsupportedDeterministicClaimCompiler:
+                    if self.audit_claim is not None:
+                        raise AnalysisContractError(
+                            "unsupported scientific claim cannot carry an audit claim"
+                        )
+                else:
+                    if self.audit_claim != compiled:
+                        raise AnalysisContractError(
+                            "planning audit claim must match the deterministic compiler"
+                        )
+            elif self.audit_claim is not None:
+                raise AnalysisContractError(
+                    "unsupported scientific claim cannot carry an audit claim"
+                )
+        elif self.audit_claim is None:
+            raise AnalysisContractError(
+                "legacy planning request requires an audit claim"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,71 +269,6 @@ class PlanningOutcome:
             raise AnalysisContractError(
                 "unavailable planning requires only a failure reason"
             )
-
-
-def _claimed_value(
-    value: object,
-    role: ExperimentRole,
-) -> ClaimedMetricValue:
-    from .discovery.models import ClaimedValue
-
-    if type(value) is not ClaimedValue:
-        raise TypeError("discovery claimed value must be ClaimedValue")
-    number = value.value
-    unit = value.unit
-    provenance = value.provenance
-    if isinstance(number, bool) or not isinstance(number, (int, float)):
-        raise TypeError("discovery claimed value must be numeric")
-    if not math.isfinite(float(number)):
-        raise AnalysisContractError("discovery claimed value must be finite")
-    if unit is not None and not isinstance(unit, str):
-        raise TypeError("discovery claimed value unit must be text or null")
-    if not isinstance(provenance, FieldProvenance):
-        raise TypeError("discovery claimed value provenance is invalid")
-    return ClaimedMetricValue(
-        role=role,
-        value=float(number),
-        unit=unit,
-        provenance=provenance,
-    )
-
-
-def _validated_explicit_threshold(
-    source_text: str,
-    minimum: object | None,
-) -> tuple[float | None, FieldProvenance | None]:
-    from .discovery.models import ClaimedValue
-
-    if minimum is None:
-        return None, None
-    if type(minimum) is not ClaimedValue:
-        raise TypeError("discovery threshold must be ClaimedValue")
-    match = _BOUNDED_THRESHOLD.search(source_text)
-    if match is None:
-        return None, None
-    raw_value = minimum.value
-    unit = minimum.unit
-    provenance = minimum.provenance
-    if unit is not None:
-        # Auto Discovery does not yet normalize percentage-point units into
-        # native metric units, so conversion would be lossy.
-        return None, None
-    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
-        raise TypeError("discovery minimum improvement must be numeric")
-    try:
-        source_value = Decimal(match.group("value"))
-        discovered_value = Decimal(str(float(raw_value)))
-    except (InvalidOperation, ValueError, OverflowError) as error:
-        raise AnalysisContractError("discovery threshold is invalid") from error
-    if not source_value.is_finite() or source_value != discovered_value:
-        raise AnalysisContractError(
-            "discovery threshold does not match the bounded source expression"
-        )
-    if source_value < 0:
-        raise AnalysisContractError("discovery threshold must be non-negative")
-    if not isinstance(provenance, FieldProvenance):
-        raise TypeError("discovery threshold provenance is invalid")
-    return float(source_value), provenance
 
 
 def _binding_key(binding: ArtifactBinding) -> tuple[RepositoryPath, ArtifactKind]:
@@ -568,46 +547,16 @@ def planning_request_from_discovery(
         raise AnalysisContractError(
             "discovered claim evidence hints must be issued repository paths"
         )
-    if discovered_claim.claim_type is not ClaimType.METRIC_IMPROVEMENT:
+    scientific_claim = discovered_claim.scientific_claim
+    if type(scientific_claim) is not CanonicalScientificClaim:
         raise AnalysisContractError(
-            "current deterministic planner supports metric improvement claims"
+            "selected claim has no canonical scientific claim representation"
         )
-    metric = discovered_claim.metric
-    if not isinstance(metric, str) or not metric.strip():
-        raise AnalysisContractError("discovered audit metric is unavailable")
-    discovered_direction = discovered_claim.direction
-    direction = {
-        ClaimDirection.HIGHER: Direction.HIGHER,
-        ClaimDirection.LOWER: Direction.LOWER,
-    }.get(discovered_direction)
-    if direction is None:
-        raise AnalysisContractError("discovered audit direction is unavailable")
-    baseline = discovered_claim.baseline_value
-    candidate = discovered_claim.candidate_value
-    claimed_values: tuple[ClaimedMetricValue, ...] = ()
-    if (baseline is None) != (candidate is None):
-        raise AnalysisContractError(
-            "discovered baseline and candidate values must appear together"
-        )
-    if baseline is not None and candidate is not None:
-        claimed_values = (
-            _claimed_value(baseline, ExperimentRole.BASELINE),
-            _claimed_value(candidate, ExperimentRole.CANDIDATE),
-        )
-    threshold, threshold_provenance = _validated_explicit_threshold(
-        reference.text,
-        discovered_claim.minimum_improvement,
-    )
-    audit_claim = AuditClaimSpec(
-        claim_id=reference.claim_id,
-        metric=metric,
-        direction=direction,
-        minimum_absolute_improvement=threshold,
-        metric_provenance=reference.provenance,
-        direction_provenance=reference.provenance,
-        threshold_provenance=threshold_provenance,
-        claimed_values=claimed_values,
-    )
+    policy = claim_evidence_policy(scientific_claim)
+    try:
+        audit_claim: AuditClaimSpec | None = compile_audit_claim(scientific_claim)
+    except UnsupportedDeterministicClaimCompiler:
+        audit_claim = None
     if not isinstance(artifacts, tuple) or not all(
         type(item) is ArtifactCandidate for item in artifacts
     ):
@@ -661,6 +610,8 @@ def planning_request_from_discovery(
         mapping_candidates=scoped_candidates,
         approved_mapping=scoped_approved,
         upstream_mapping_question=scoped_question,
+        scientific_claim=scientific_claim,
+        claim_policy=policy,
     )
 
 
@@ -669,6 +620,12 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
 
     if type(request) is not PlanningRequest:
         raise TypeError("ephemeral planning requires PlanningRequest")
+
+    if request.audit_claim is None:
+        return PlanningOutcome(
+            state=PlanningState.PARTIAL,
+            reason=UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
+        )
 
     missing = _planning_missing_evidence(request)
     if missing:
@@ -722,6 +679,8 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
         audit_claim=request.audit_claim,
         selected_mapping=selected,
         semantic_proposal_provenance=request.semantic_proposal_provenance,
+        scientific_claim=request.scientific_claim,
+        claim_policy=request.claim_policy,
     )
     return PlanningOutcome(state=PlanningState.READY, plan=plan)
 
@@ -1084,6 +1043,10 @@ def _plan_id(
     mapping: MappingCandidate | RepoMapping,
     evidence: tuple[NormalizedEvidence, ...],
 ) -> str:
+    if request.audit_claim is None:
+        raise AnalysisContractError(
+            "plan identity requires a compiled deterministic claim"
+        )
     return _plan_id_from_components(
         repository=request.repository,
         pr_number=request.pr_number,

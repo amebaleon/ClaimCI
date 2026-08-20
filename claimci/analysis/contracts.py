@@ -984,6 +984,8 @@ class EphemeralAuditPlan:
     audit_claim: AuditClaimSpec | None = None
     selected_mapping: MappingCandidate | RepoMapping | None = None
     semantic_proposal_provenance: FieldProvenance | None = None
+    scientific_claim: "CanonicalScientificClaim | None" = None
+    claim_policy: "ClaimEvidencePolicy | None" = None
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1061,6 +1063,41 @@ class EphemeralAuditPlan:
             ):
                 raise AnalysisContractError(
                     "plan semantic proposal must remain provider provenance"
+                )
+        if (self.scientific_claim is None) != (self.claim_policy is None):
+            raise AnalysisContractError(
+                "plan scientific claim and claim policy must appear together"
+            )
+        if self.scientific_claim is not None:
+            from .claim_types import (
+                CanonicalScientificClaim,
+                ClaimEvidencePolicy,
+                MetricImprovementClaim,
+                claim_evidence_policy,
+                compile_audit_claim,
+            )
+
+            if type(self.scientific_claim) is not CanonicalScientificClaim:
+                raise TypeError(
+                    "plan scientific_claim must be CanonicalScientificClaim or null"
+                )
+            if type(self.claim_policy) is not ClaimEvidencePolicy:
+                raise TypeError("plan claim_policy must be ClaimEvidencePolicy or null")
+            if self.scientific_claim.reference != self.claim:
+                raise AnalysisContractError(
+                    "plan scientific claim reference must match its claim"
+                )
+            if self.claim_policy != claim_evidence_policy(self.scientific_claim):
+                raise AnalysisContractError(
+                    "plan claim policy must match canonical claim semantics"
+                )
+            if type(self.scientific_claim.primary) is not MetricImprovementClaim:
+                raise AnalysisContractError(
+                    "executable plan requires a metric improvement primary claim"
+                )
+            if self.audit_claim != compile_audit_claim(self.scientific_claim):
+                raise AnalysisContractError(
+                    "plan audit claim must match the deterministic compiler"
                 )
 
 

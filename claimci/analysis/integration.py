@@ -93,7 +93,9 @@ def run_unified_analysis(
         return UnifiedAnalysisResult(
             state=AnalysisState.PARTIAL,
             unavailable_reason=(
-                None if planning.missing_evidence else _REPRESENTATION_PARTIAL
+                None
+                if planning.missing_evidence
+                else planning.reason or _REPRESENTATION_PARTIAL
             ),
             missing_evidence=planning.missing_evidence,
         )

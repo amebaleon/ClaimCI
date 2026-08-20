@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from claimci.analysis import (
+    AbsoluteMetricClaim,
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
@@ -18,6 +19,8 @@ from claimci.analysis import (
     GitCommitSha,
     MappingCandidate,
     MappingTrust,
+    MetricImprovementClaim,
+    PrimaryClaimKind,
     ProvenanceKind,
     RepoMapping,
     RepositoryIdentity,
@@ -41,6 +44,7 @@ from claimci.analysis.discovery.repository import (
 from claimci.analysis.discovery.claims import as_scientific_claim, discover_claims
 from claimci.analysis.discovery.artifacts import discover_artifacts
 from claimci.analysis.discovery.mappings import resolve_mappings
+from claimci.models import Direction
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 from claimci.review.evidence import discover_evidence
 from claimci.review.sources import collect_review_sources, validate_claim_candidates
@@ -532,6 +536,79 @@ def test_metric_claim_captures_unitless_explicit_absolute_threshold(
     assert claims[0].minimum_improvement.unit is None
 
 
+def test_held_out_metric_improvement_discovery_keeps_primary_and_constraint(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    context = collect_repository_context(
+        head,
+        pr_description=(
+            "On the held-out test set, accuracy improved from 0.70 to 0.80 "
+            "by at least 0.05."
+        ),
+        limits=DiscoveryLimits(),
+    )
+
+    claims = discover_claims(context, limits=DiscoveryLimits())
+
+    assert len(claims) == 1
+    assert claims[0].scientific_claim is not None
+    assert type(claims[0].scientific_claim.primary) is MetricImprovementClaim
+    assert [item.kind.value for item in claims[0].scientific_claim.constraints] == [
+        "held_out"
+    ]
+
+
+def test_lower_is_better_metric_improvement_is_deterministically_discovered(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    context = collect_repository_context(
+        head,
+        pr_description="Loss decreased from 0.40 to 0.20 by at least 0.10.",
+        limits=DiscoveryLimits(),
+    )
+
+    claims = discover_claims(context, limits=DiscoveryLimits())
+
+    assert len(claims) == 1
+    assert (
+        claims[0].reference.provenance.kind
+        is ProvenanceKind.DETERMINISTIC_DISCOVERY
+    )
+    assert claims[0].scientific_claim is not None
+    assert type(claims[0].scientific_claim.primary) is MetricImprovementClaim
+    assert claims[0].scientific_claim.primary.direction is Direction.LOWER
+
+
+def test_discovery_recognizes_all_primary_v0_claim_types(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    context = collect_repository_context(
+        head,
+        pr_description="\n".join(
+            (
+                "Accuracy improved by at least 0.05.",
+                "Candidate precision is at least 0.90.",
+                "The candidate generalizes across unseen domains.",
+                "The candidate uses 40% less memory.",
+            )
+        ),
+        limits=DiscoveryLimits(),
+    )
+
+    claims = discover_claims(context, limits=DiscoveryLimits())
+    primary_kinds = {
+        claim.scientific_claim.primary.kind
+        for claim in claims
+        if claim.scientific_claim is not None
+    }
+
+    assert primary_kinds == set(PrimaryClaimKind)
+
+
 def test_discovery_supports_all_existing_claim_categories_and_multiple_claims(
     tmp_path: Path,
 ) -> None:
@@ -679,6 +756,45 @@ def test_provider_claims_reject_authority_fields_bad_quotes_and_excess_items(
     ):
         with pytest.raises(DiscoveryError, match="provider"):
             discover_claims(context, provider_payload=payload, limits=limits)
+
+
+def test_provider_claim_fields_cannot_retype_an_absolute_source_bound(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    source_text = "Candidate accuracy is at least 0.90."
+    (head / "README.md").write_text(source_text, encoding="utf-8")
+    context = collect_repository_context(head, limits=DiscoveryLimits())
+    source = context.source_bundle.sources[0]
+    payload = _provider_claim_payload(
+        source.source_id,
+        source_text=source_text,
+        extra={
+            "claim_type": "metric_improvement",
+            "metric": "f1",
+            "direction": "lower",
+            "claimed_magnitude": {
+                "raw": "0.42",
+                "value": 0.42,
+                "unit": None,
+                "kind": "absolute",
+            },
+        },
+    )
+
+    claims = discover_claims(
+        context,
+        provider_payload=payload,
+        limits=DiscoveryLimits(),
+    )
+
+    assert len(claims) == 1
+    assert claims[0].scientific_claim is not None
+    assert type(claims[0].scientific_claim.primary) is AbsoluteMetricClaim
+    assert claims[0].scientific_claim.primary.metric == "accuracy"
+    assert claims[0].scientific_claim.primary.bound.value == 0.90
+    assert claims[0].reference.provenance.kind is ProvenanceKind.DETERMINISTIC_DISCOVERY
 
 
 def test_discover_artifacts_ranks_obvious_evidence_without_manifest(tmp_path: Path) -> None:

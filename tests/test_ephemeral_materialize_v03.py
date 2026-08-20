@@ -16,6 +16,7 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactKind,
     AuditClaimSpec,
+    BoundedValueRepresentation,
     ClaimReference,
     Confidence,
     ConfigValue,
@@ -47,7 +48,11 @@ from claimci.analysis import (
     Sha256Digest,
     execute_ephemeral_audit,
     execute_ephemeral_audit_with_trace,
+    claim_evidence_policy,
+    claim_semantic_projection,
+    compile_audit_claim,
     derive_ephemeral_plan_id,
+    recover_scientific_claim,
     to_jsonable,
 )
 from claimci.analysis.adapters import extract_registered_artifact
@@ -412,6 +417,47 @@ def test_traced_execution_preserves_the_exact_audit_result_and_rendering(
     assert traced.trace.head_sha == plan.head_sha
     assert traced.trace.deterministic_authority.verdict is compatibility.verdict
     assert not tuple(scratch.iterdir())
+
+
+def test_trace_retains_held_out_semantics_without_changing_audit_or_plan_identity(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    reference = dataclasses.replace(
+        plan.claim,
+        text=(
+            "On the held-out test set, accuracy improved by at least 0.05."
+        ),
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    audit_claim = compile_audit_claim(scientific_claim)
+    constrained = dataclasses.replace(
+        plan,
+        claim=reference,
+        audit_claim=audit_claim,
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+    constrained = dataclasses.replace(
+        constrained,
+        plan_id=derive_ephemeral_plan_id(constrained),
+    )
+
+    assert audit_claim == plan.audit_claim
+    assert constrained.plan_id == plan.plan_id
+
+    trace = execute_ephemeral_audit_with_trace(constrained, runtime).trace
+    claim_entries = tuple(
+        entry
+        for entry in trace.entries
+        if entry.record_kind is TraceRecordKind.NATURAL_LANGUAGE_CLAIM
+    )
+    assert len(claim_entries) == 1
+    assert claim_entries[0].authority is TraceAuthorityClass.NON_AUTHORITATIVE_INPUT
+    assert claim_entries[0].normalized_value == BoundedValueRepresentation.from_value(
+        claim_semantic_projection(scientific_claim)
+    )
 
 
 def test_trace_identity_does_not_depend_on_ephemeral_scratch_paths(
