@@ -45,6 +45,13 @@ from .contracts import (
     ProvenanceKind,
 )
 from .claims import audit_relevant_claim_projection
+from .obligations import (
+    EvidenceObligationBundle,
+    EvidenceObligationDecision,
+    EvidenceObligationReason,
+    assess_evidence_obligations,
+    legacy_missing_evidence,
+)
 
 if TYPE_CHECKING:
     from claimci.analysis.discovery import DiscoveryResult
@@ -210,6 +217,7 @@ class PlanningOutcome:
     mapping_question: MappingQuestion | None = None
     missing_evidence: tuple[MissingEvidence, ...] = ()
     reason: str | None = None
+    evidence_obligations: EvidenceObligationBundle | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, PlanningState):
@@ -230,6 +238,12 @@ class PlanningOutcome:
             not isinstance(self.reason, str) or not self.reason.strip()
         ):
             raise AnalysisContractError("planning reason must be non-empty text")
+        if self.evidence_obligations is not None and type(
+            self.evidence_obligations
+        ) is not EvidenceObligationBundle:
+            raise TypeError(
+                "planning evidence_obligations must be EvidenceObligationBundle"
+            )
 
         if self.state is PlanningState.READY:
             if (
@@ -241,6 +255,21 @@ class PlanningOutcome:
                 raise AnalysisContractError(
                     "ready planning requires only one validated plan"
                 )
+            if self.evidence_obligations is not None and (
+                self.evidence_obligations.decision
+                is not EvidenceObligationDecision.READY
+            ):
+                raise AnalysisContractError(
+                    "ready planning requires satisfied evidence obligations"
+                )
+            if (
+                self.evidence_obligations is not None
+                and self.plan is not None
+                and self.plan.evidence_obligations != self.evidence_obligations
+            ):
+                raise AnalysisContractError(
+                    "ready planning outcome and plan obligations must match"
+                )
         elif self.state is PlanningState.MAPPING_NEEDED:
             if (
                 self.mapping_question is None
@@ -251,6 +280,22 @@ class PlanningOutcome:
                 raise AnalysisContractError(
                     "mapping-needed planning requires only one mapping question"
                 )
+            if self.evidence_obligations is not None and (
+                self.evidence_obligations.decision
+                is not EvidenceObligationDecision.MAPPING_NEEDED
+            ):
+                raise AnalysisContractError(
+                    "mapping-needed planning requires ambiguous obligations"
+                )
+            if self.evidence_obligations is not None and (
+                self.evidence_obligations.mapping_question_id
+                != self.mapping_question.question_id
+                or self.evidence_obligations.blocking_obligation_ids
+                != self.mapping_question.blocking_obligation_ids
+            ):
+                raise AnalysisContractError(
+                    "mapping question linkage does not match evidence obligations"
+                )
         elif self.state is PlanningState.PARTIAL:
             if (
                 self.plan is not None
@@ -259,6 +304,13 @@ class PlanningOutcome:
             ):
                 raise AnalysisContractError(
                     "partial planning requires missing evidence or a limitation"
+                )
+            if self.evidence_obligations is not None and (
+                self.evidence_obligations.decision
+                is not EvidenceObligationDecision.PARTIAL
+            ):
+                raise AnalysisContractError(
+                    "partial planning requires blocking evidence obligations"
                 )
         elif (
             self.reason is None
@@ -621,33 +673,134 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
     if type(request) is not PlanningRequest:
         raise TypeError("ephemeral planning requires PlanningRequest")
 
+    if request.scientific_claim is None or request.claim_policy is None:
+        return _plan_legacy_request(request)
+
+    if request.approved_mapping is not None and any(
+        (binding.path, binding.kind)
+        not in {(item.path, item.kind) for item in request.artifacts}
+        for binding in request.approved_mapping.bindings
+    ):
+        return PlanningOutcome(
+            state=PlanningState.UNAVAILABLE,
+            reason="approved mapping is stale for the exact-head snapshot",
+        )
+
     if request.audit_claim is None:
+        obligations = assess_evidence_obligations(
+            claim=request.scientific_claim,
+            policy=request.claim_policy,
+            audit_claim=None,
+            artifacts=request.artifacts,
+            normalized_evidence=request.normalized_evidence,
+            mapping_candidates=request.mapping_candidates,
+            selected_mapping=None,
+            mapping_question=None,
+            ambiguity_reason=None,
+        )
         return PlanningOutcome(
             state=PlanningState.PARTIAL,
             reason=UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
-        )
-
-    missing = _planning_missing_evidence(request)
-    if missing:
-        return PlanningOutcome(
-            state=PlanningState.PARTIAL,
-            missing_evidence=missing,
+            evidence_obligations=obligations,
         )
 
     selected = _select_mapping(request)
+    valid_candidates = tuple(
+        item
+        for item in request.mapping_candidates
+        if _mapping_is_runtime_revalidatable(item, request)
+    )
+    question: MappingQuestion | None = None
+    ambiguity_reason: EvidenceObligationReason | None = None
     if selected is None:
-        question = request.upstream_mapping_question or _mapping_question(
-            request.mapping_candidates,
-            request.claim.claim_id,
-        )
-        if question is None:
-            return PlanningOutcome(
-                state=PlanningState.PARTIAL,
-                reason="no bounded mapping clarification can produce a viable plan",
+        if request.upstream_mapping_question is not None and _question_is_useful(
+            request.upstream_mapping_question,
+            request,
+        ):
+            question = request.upstream_mapping_question
+            ambiguity_reason = EvidenceObligationReason.MULTIPLE_VALIDATED_CANDIDATES
+        else:
+            candidate_question = _mapping_question(
+                valid_candidates,
+                request.claim.claim_id,
+            )
+            if candidate_question is not None and _question_is_useful(
+                candidate_question,
+                request,
+            ):
+                question = candidate_question
+            if request.approved_mapping is not None:
+                ambiguity_reason = (
+                    EvidenceObligationReason.APPROVED_MAPPING_NOT_APPLICABLE
+                    if question is not None
+                    else None
+                )
+            elif len({_mapping_signature(item) for item in valid_candidates}) > 1:
+                ambiguity_reason = (
+                    EvidenceObligationReason.CONFLICTING_VALIDATED_MAPPINGS
+                    if question is not None
+                    else EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED
+                )
+            elif valid_candidates:
+                ambiguity_reason = (
+                    EvidenceObligationReason.EXPLICIT_MAPPING_APPROVAL_REQUIRED
+                    if question is not None
+                    else EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED
+                )
+
+    obligations = assess_evidence_obligations(
+        claim=request.scientific_claim,
+        policy=request.claim_policy,
+        audit_claim=request.audit_claim,
+        artifacts=request.artifacts,
+        normalized_evidence=request.normalized_evidence,
+        mapping_candidates=request.mapping_candidates,
+        selected_mapping=selected,
+        mapping_question=question,
+        ambiguity_reason=ambiguity_reason,
+    )
+    missing = legacy_missing_evidence(obligations)
+    if obligations.decision is EvidenceObligationDecision.PARTIAL:
+        reason = None
+        if not missing:
+            blocker_by_id = {
+                item.obligation_id: item
+                for item in obligations.obligations
+                if item.target is not None
+            }
+            reason = next(
+                (
+                    blocker_by_id[item].reason.value
+                    for item in obligations.blocking_obligation_ids
+                    if item in blocker_by_id
+                ),
+                "no bounded mapping clarification can produce a viable plan",
             )
         return PlanningOutcome(
+            state=PlanningState.PARTIAL,
+            missing_evidence=missing,
+            reason=reason,
+            evidence_obligations=obligations,
+        )
+    if obligations.decision is EvidenceObligationDecision.MAPPING_NEEDED:
+        if question is None:
+            return PlanningOutcome(
+                state=PlanningState.UNAVAILABLE,
+                reason="obligation mapping linkage is unavailable",
+            )
+        linked_question = replace(
+            question,
+            blocking_obligation_ids=obligations.blocking_obligation_ids,
+        )
+        return PlanningOutcome(
             state=PlanningState.MAPPING_NEEDED,
-            mapping_question=question,
+            mapping_question=linked_question,
+            evidence_obligations=obligations,
+        )
+    if selected is None:
+        return PlanningOutcome(
+            state=PlanningState.UNAVAILABLE,
+            reason="satisfied obligations have no selected mapping",
         )
 
     evidence_by_key = {
@@ -681,8 +834,156 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
         semantic_proposal_provenance=request.semantic_proposal_provenance,
         scientific_claim=request.scientific_claim,
         claim_policy=request.claim_policy,
+        evidence_obligations=obligations,
+    )
+    return PlanningOutcome(
+        state=PlanningState.READY,
+        plan=plan,
+        evidence_obligations=obligations,
+    )
+
+
+def _plan_legacy_request(request: PlanningRequest) -> PlanningOutcome:
+    """Preserve the pre-claim-taxonomy construction seam for existing callers."""
+
+    if request.audit_claim is None:
+        return PlanningOutcome(
+            state=PlanningState.PARTIAL,
+            reason=UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
+        )
+    missing = _planning_missing_evidence(request)
+    if missing:
+        return PlanningOutcome(
+            state=PlanningState.PARTIAL,
+            missing_evidence=missing,
+        )
+    selected = _select_mapping(request)
+    if selected is None:
+        question = request.upstream_mapping_question or _mapping_question(
+            request.mapping_candidates,
+            request.claim.claim_id,
+        )
+        if question is None:
+            return PlanningOutcome(
+                state=PlanningState.PARTIAL,
+                reason="no bounded mapping clarification can produce a viable plan",
+            )
+        return PlanningOutcome(
+            state=PlanningState.MAPPING_NEEDED,
+            mapping_question=question,
+        )
+    evidence_by_key = {
+        (item.artifact.path, item.artifact.kind): item
+        for item in request.normalized_evidence
+    }
+    baseline: list[NormalizedEvidence] = []
+    candidate: list[NormalizedEvidence] = []
+    for binding in selected.bindings:
+        evidence = evidence_by_key[(binding.path, binding.kind)]
+        target = baseline if binding.role is ExperimentRole.BASELINE else candidate
+        if evidence not in target:
+            target.append(evidence)
+    baseline.sort(key=lambda item: item.evidence_id)
+    candidate.sort(key=lambda item: item.evidence_id)
+    plan = EphemeralAuditPlan(
+        plan_id=_plan_id(request, selected, (*baseline, *candidate)),
+        repository=request.repository,
+        pr_number=request.pr_number,
+        head_sha=request.head_sha,
+        claim=request.claim,
+        baseline_evidence=tuple(baseline),
+        candidate_evidence=tuple(candidate),
+        mapping_provenance=_mapping_provenance(selected),
+        missing_evidence=(),
+        confidence=_plan_confidence(request, selected, (*baseline, *candidate)),
+        audit_claim=request.audit_claim,
+        selected_mapping=selected,
+        semantic_proposal_provenance=request.semantic_proposal_provenance,
     )
     return PlanningOutcome(state=PlanningState.READY, plan=plan)
+
+
+def _binding_supports_native_slot(
+    binding: ArtifactBinding,
+    request: PlanningRequest,
+) -> bool:
+    evidence = next(
+        (
+            item
+            for item in request.normalized_evidence
+            if item.artifact.path == binding.path
+            and item.artifact.kind is binding.kind
+        ),
+        None,
+    )
+    if evidence is None or not _evidence_supports_role(evidence, binding.role):
+        return False
+    if (
+        evidence.adapter_match.adapter_id != binding.adapter_id
+        or evidence.adapter_match.mappings != binding.mappings
+    ):
+        return False
+    if binding.kind is ArtifactKind.RESULTS:
+        return any(
+            item.metric_name == request.audit_claim.metric
+            for item in evidence.observations
+        )
+    if binding.kind is ArtifactKind.CONFIG:
+        return any(item.config_values for item in evidence.observations)
+    return any(
+        reference.path == binding.path
+        for observation in evidence.observations
+        for reference in observation.dataset_references
+    )
+
+
+def _bindings_can_produce_plan(
+    bindings: tuple[ArtifactBinding, ...],
+    request: PlanningRequest,
+) -> bool:
+    if request.audit_claim is None:
+        return False
+    for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE):
+        for kind in (ArtifactKind.RESULTS, ArtifactKind.CONFIG):
+            matching = tuple(
+                item
+                for item in bindings
+                if item.role is role and item.kind is kind
+            )
+            if not matching or not all(
+                _binding_supports_native_slot(item, request) for item in matching
+            ):
+                return False
+        for split in (DatasetSplit.TRAIN, DatasetSplit.EVAL):
+            matching = tuple(
+                item
+                for item in bindings
+                if item.role is role
+                and item.kind is ArtifactKind.DATASET
+                and item.dataset_split is split
+            )
+            if len(matching) != 1 or not _binding_supports_native_slot(
+                matching[0], request
+            ):
+                return False
+    return True
+
+
+def _question_is_useful(
+    question: MappingQuestion,
+    request: PlanningRequest,
+) -> bool:
+    bases = tuple(item.bindings for item in request.mapping_candidates) or ((),)
+    for choice in question.choices:
+        for base in bases:
+            by_slot: dict[tuple[ArtifactKind, ExperimentRole, DatasetSplit | None], ArtifactBinding] = {
+                (item.kind, item.role, item.dataset_split): item for item in base
+            }
+            for binding in choice.bindings:
+                by_slot[(binding.kind, binding.role, binding.dataset_split)] = binding
+            if _bindings_can_produce_plan(tuple(by_slot.values()), request):
+                return True
+    return False
 
 
 def _planning_missing_evidence(

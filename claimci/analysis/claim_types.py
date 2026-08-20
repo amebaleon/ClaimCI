@@ -304,6 +304,7 @@ class ClaimEvidencePolicy:
     primary_kind: PrimaryClaimKind
     constraint_kinds: tuple[EvaluationConstraintKind, ...]
     deterministic_compiler_id: str | None
+    obligation_template_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _bounded_text(self.policy_id, "claim evidence policy_id", maximum=128)
@@ -324,6 +325,30 @@ class ClaimEvidencePolicy:
                 self.deterministic_compiler_id,
                 "deterministic compiler_id",
                 maximum=128,
+            )
+        if (
+            not isinstance(self.obligation_template_ids, tuple)
+            or len(self.obligation_template_ids) > 16
+            or not all(
+                isinstance(item, str)
+                and item
+                and item == item.strip()
+                and len(item) <= 128
+                and not any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in item
+                )
+                for item in self.obligation_template_ids
+            )
+        ):
+            raise ClaimTypeContractError(
+                "claim evidence obligation templates must be bounded identifiers"
+            )
+        if len(set(self.obligation_template_ids)) != len(
+            self.obligation_template_ids
+        ):
+            raise ClaimTypeContractError(
+                "claim evidence obligation templates must be unique"
             )
 
 
@@ -488,11 +513,38 @@ def claim_evidence_policy(claim: CanonicalScientificClaim) -> ClaimEvidencePolic
         or claim.primary.minimum_improvement.unit is None
     ):
         compiler = "metric-improvement-v0"
+    templates: list[str] = []
+    if type(claim.primary) is MetricImprovementClaim:
+        templates.extend(("claim.metric", "claim.direction", "claim.threshold"))
+    elif type(claim.primary) is AbsoluteMetricClaim:
+        templates.extend(("claim.metric", "claim.quantitative_bound"))
+    elif type(claim.primary) is GenericQuantitativeClaim:
+        templates.append("claim.quantitative_bound")
+    if any(
+        item.kind is EvaluationConstraintKind.HELD_OUT
+        for item in claim.constraints
+    ):
+        templates.append("claim.constraint.held_out")
+    if compiler is not None:
+        templates.extend(
+            (
+                "artifact.baseline.results.metric",
+                "artifact.candidate.results.metric",
+                "artifact.baseline.config",
+                "artifact.candidate.config",
+                "artifact.baseline.dataset.train",
+                "artifact.baseline.dataset.eval",
+                "artifact.candidate.dataset.train",
+                "artifact.candidate.dataset.eval",
+                "comparison.readiness",
+            )
+        )
     return ClaimEvidencePolicy(
         policy_id=f"claimci.claim-policy.{kind.value}.v0",
         primary_kind=kind,
         constraint_kinds=tuple(item.kind for item in claim.constraints),
         deterministic_compiler_id=compiler,
+        obligation_template_ids=tuple(templates),
     )
 
 

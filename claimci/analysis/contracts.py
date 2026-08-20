@@ -670,6 +670,7 @@ class MappingQuestion:
     prompt: str
     choices: tuple[MappingChoice, ...]
     relevant_claim_id: str | None = None
+    blocking_obligation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _bounded_id(self.question_id, "mapping question_id", maximum=128)
@@ -690,6 +691,25 @@ class MappingQuestion:
                 self.relevant_claim_id,
                 "mapping question relevant_claim_id",
                 maximum=128,
+            )
+        if (
+            not isinstance(self.blocking_obligation_ids, tuple)
+            or len(self.blocking_obligation_ids) > 16
+        ):
+            raise AnalysisContractError(
+                "mapping question obligation linkage exceeds its bound"
+            )
+        for obligation_id in self.blocking_obligation_ids:
+            _bounded_id(
+                obligation_id,
+                "mapping question blocking obligation_id",
+                maximum=128,
+            )
+        if len(set(self.blocking_obligation_ids)) != len(
+            self.blocking_obligation_ids
+        ):
+            raise AnalysisContractError(
+                "mapping question blocking obligation IDs must be unique"
             )
 
 
@@ -986,6 +1006,7 @@ class EphemeralAuditPlan:
     semantic_proposal_provenance: FieldProvenance | None = None
     scientific_claim: "CanonicalScientificClaim | None" = None
     claim_policy: "ClaimEvidencePolicy | None" = None
+    evidence_obligations: "EvidenceObligationBundle | None" = None
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1098,6 +1119,33 @@ class EphemeralAuditPlan:
             if self.audit_claim != compile_audit_claim(self.scientific_claim):
                 raise AnalysisContractError(
                     "plan audit claim must match the deterministic compiler"
+                )
+        if self.evidence_obligations is not None:
+            from .obligations import (
+                EvidenceObligationBundle,
+                EvidenceObligationDecision,
+            )
+
+            if type(self.evidence_obligations) is not EvidenceObligationBundle:
+                raise TypeError(
+                    "plan evidence_obligations must be EvidenceObligationBundle or null"
+                )
+            if (
+                self.evidence_obligations.decision
+                is not EvidenceObligationDecision.READY
+            ):
+                raise AnalysisContractError(
+                    "an executable plan requires satisfied evidence obligations"
+                )
+            if self.evidence_obligations.claim_id != self.claim.claim_id:
+                raise AnalysisContractError(
+                    "plan evidence obligations must match the selected claim"
+                )
+            if self.claim_policy is not None and (
+                self.evidence_obligations.policy_id != self.claim_policy.policy_id
+            ):
+                raise AnalysisContractError(
+                    "plan evidence obligations must match the claim policy"
                 )
 
 
@@ -1227,6 +1275,7 @@ class UnifiedAnalysisResult:
     unavailable_reason: str | None = None
     missing_evidence: tuple[MissingEvidence, ...] = ()
     evidence_trace: "EvidenceTraceBundle | None" = None
+    evidence_obligations: "EvidenceObligationBundle | None" = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("UnifiedAnalysisResult is final to preserve authority")
@@ -1284,6 +1333,40 @@ class UnifiedAnalysisResult:
             ) != (self.research_interpretation is None):
                 raise AnalysisContractError(
                     "evidence trace advisory state does not match Research Review"
+                )
+        if self.evidence_obligations is not None:
+            from .obligations import (
+                EvidenceObligationBundle,
+                EvidenceObligationDecision,
+            )
+
+            if type(self.evidence_obligations) is not EvidenceObligationBundle:
+                raise TypeError(
+                    "unified evidence_obligations must be EvidenceObligationBundle"
+                )
+            if self.state is AnalysisState.MAPPING_NEEDED:
+                expected_decisions = {EvidenceObligationDecision.MAPPING_NEEDED}
+            elif self.deterministic is None and self.state is AnalysisState.PARTIAL:
+                expected_decisions = {EvidenceObligationDecision.PARTIAL}
+            else:
+                expected_decisions = {EvidenceObligationDecision.READY}
+            if self.evidence_obligations.decision not in expected_decisions:
+                raise AnalysisContractError(
+                    "unified evidence obligations do not match analysis lifecycle"
+                )
+            if self.state is AnalysisState.MAPPING_NEEDED and (
+                self.mapping_question is None
+                or self.evidence_obligations.mapping_question_id
+                != self.mapping_question.question_id
+                or self.evidence_obligations.blocking_obligation_ids
+                != self.mapping_question.blocking_obligation_ids
+            ):
+                raise AnalysisContractError(
+                    "mapping question linkage does not match evidence obligations"
+                )
+            if self.state is AnalysisState.UNAVAILABLE:
+                raise AnalysisContractError(
+                    "operationally unavailable analysis cannot carry evidence obligations"
                 )
 
         if self.state is AnalysisState.COMPLETE:
@@ -1359,6 +1442,15 @@ class UnifiedAnalysisResult:
 def to_jsonable(value: object) -> object:
     """Return a detached JSON-compatible view of approved analysis values."""
 
+    if type(value).__module__ == "claimci.analysis.obligations":
+        from .obligations import ArtifactEvidenceSupport
+
+        if type(value) is ArtifactEvidenceSupport:
+            return {
+                "support_id": value.support_id,
+                "evidence_id": value.evidence_id,
+                "binding_id": value.binding_id,
+            }
     if type(value).__module__ == "claimci.analysis.trace":
         from .trace import trace_to_jsonable
 
