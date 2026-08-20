@@ -25,8 +25,11 @@ from claimci.analysis import (
     RepositoryIdentity,
     Sha256Digest,
     TraceCompleteness,
+    UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
     UnifiedAnalysisResult,
+    claim_evidence_policy,
     plan_ephemeral_audit,
+    recover_scientific_claim,
     run_unified_analysis,
 )
 from claimci.analysis.adapters import extract_registered_artifact
@@ -86,6 +89,8 @@ def _request_from_plan(plan: object) -> PlanningRequest:
         artifacts=tuple(item.artifact for item in evidence),
         normalized_evidence=evidence,
         mapping_candidates=(plan.selected_mapping,),
+        scientific_claim=plan.scientific_claim,
+        claim_policy=plan.claim_policy,
     )
 
 
@@ -389,6 +394,47 @@ def test_scenario_d_missing_dataset_is_pre_audit_partial(tmp_path: Path) -> None
     assert result.state is AnalysisState.PARTIAL
     assert result.authoritative_verdict is None
     assert {item.kind for item in result.missing_evidence} == {ArtifactKind.DATASET}
+
+
+def test_unsupported_primary_is_exact_partial_and_never_reaches_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    reference = dataclasses.replace(
+        request.claim,
+        text="Candidate accuracy is at least 0.90.",
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    unsupported = dataclasses.replace(
+        request,
+        claim=reference,
+        audit_claim=None,
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+
+    def fail_if_executed(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsupported claim reached deterministic Audit")
+
+    monkeypatch.setattr(
+        "claimci.analysis.integration.execute_ephemeral_audit_with_trace",
+        fail_if_executed,
+    )
+
+    result = run_unified_analysis(
+        unsupported,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=IntegrationProvider(),
+    )
+
+    assert result.state is AnalysisState.PARTIAL
+    assert result.unavailable_reason == UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER
+    assert result.authoritative_verdict is None
+    assert result.deterministic is None
+    assert result.mapping_question is None
 
 
 def test_scenario_e_advisory_disagreement_cannot_override_audit(

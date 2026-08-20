@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
+from claimci.analysis.claim_types import (
+    ClaimTypeContractError,
+    MetricImprovementClaim,
+    UnsupportedDeterministicClaimCompiler,
+    compile_audit_claim,
+    recover_scientific_claim,
+)
 from claimci.analysis.claims import audit_relevant_claim_projection
 from claimci.analysis.confidence import Confidence
 from claimci.analysis.contracts import (
@@ -36,23 +41,6 @@ from .models import (
 )
 from .openai_provider import OpenAIReviewerProvider
 from .provider import ProviderResponse, ReviewerProvider, StructuredRequest
-
-
-_BOUNDED_THRESHOLD = re.compile(
-    r"(?:\bat\s+least\b|\bminimum(?:\s+of)?\b|>=|\bno\s+less\s+than\b)"
-    r"\s*(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))",
-    flags=re.IGNORECASE,
-)
-_DIRECTION_TERMS = {
-    ClaimDirection.HIGHER: re.compile(
-        r"\b(?:improv(?:e|ed|es|ement)|increas(?:e|ed|es)|higher|gain(?:ed|s)?|rose|rises?)\b",
-        flags=re.IGNORECASE,
-    ),
-    ClaimDirection.LOWER: re.compile(
-        r"\b(?:decreas(?:e|ed|es)|lower|reduc(?:e|ed|es|tion)|drop(?:ped|s)?|fell|falls?)\b",
-        flags=re.IGNORECASE,
-    ),
-}
 
 
 _ANALYSIS_SYNTHESIS_SCHEMA: dict[str, object] = {
@@ -154,48 +142,6 @@ def _source_quote(claim: ScientificClaim, sources: SourceBundle) -> str:
     )
 
 
-def _anchored_token(text: str, token: str) -> bool:
-    return (
-        re.search(
-            rf"(?<![\w]){re.escape(token)}(?![\w])",
-            text,
-            flags=re.IGNORECASE,
-        )
-        is not None
-    )
-
-
-def _validated_threshold(claim: ScientificClaim) -> float | None:
-    match = _BOUNDED_THRESHOLD.search(claim.source_text)
-    if match is None:
-        return None
-    magnitude = claim.claimed_magnitude
-    if magnitude is None:
-        return None
-    if magnitude.kind is not MagnitudeKind.ABSOLUTE or magnitude.value is None:
-        raise ReviewError("bounded threshold requires an absolute magnitude")
-    if magnitude.unit is not None:
-        raise ReviewError(
-            "bounded threshold unit cannot be represented by the native Audit"
-        )
-    if magnitude.raw not in claim.source_text:
-        raise ReviewError("claimed threshold magnitude is not anchored in source text")
-    try:
-        source_value = Decimal(match.group("value"))
-        magnitude_value = Decimal(str(float(magnitude.value)))
-    except (InvalidOperation, TypeError, ValueError, OverflowError) as error:
-        raise ReviewError("claimed threshold magnitude is invalid") from error
-    if (
-        not source_value.is_finite()
-        or source_value < 0
-        or source_value != magnitude_value
-    ):
-        raise ReviewError(
-            "claimed threshold does not match the bounded source requirement"
-        )
-    return float(source_value)
-
-
 def validate_scientific_claim_for_audit(
     claim: ScientificClaim,
     sources: SourceBundle,
@@ -208,19 +154,6 @@ def validate_scientific_claim_for_audit(
         raise TypeError("audit claim conversion requires SourceBundle")
     if claim.source_text != _source_quote(claim, sources):
         raise ReviewError("scientific claim source quote does not match")
-    if claim.claim_type is not ClaimType.METRIC_IMPROVEMENT:
-        raise ReviewError("deterministic planner supports metric improvement claims")
-    if claim.metric is None or not _anchored_token(claim.source_text, claim.metric):
-        raise ReviewError("scientific claim metric is not anchored in its source")
-    direction = {
-        ClaimDirection.HIGHER: Direction.HIGHER,
-        ClaimDirection.LOWER: Direction.LOWER,
-    }.get(claim.direction)
-    if direction is None:
-        raise ReviewError("scientific claim direction is unsupported")
-    if _DIRECTION_TERMS[claim.direction].search(claim.source_text) is None:
-        raise ReviewError("scientific claim direction is not anchored in its source")
-    threshold = _validated_threshold(claim)
     source_path = (
         None if claim.source.path is None else RepositoryPath(claim.source.path)
     )
@@ -230,15 +163,49 @@ def validate_scientific_claim_for_audit(
         source_path,
         claim.source.source_id,
     )
-    return AuditClaimSpec(
+    reference = ClaimReference(
         claim_id=claim.claim_id,
-        metric=claim.metric,
-        direction=direction,
-        minimum_absolute_improvement=threshold,
-        metric_provenance=provenance,
-        direction_provenance=provenance,
-        threshold_provenance=provenance if threshold is not None else None,
+        text=claim.source_text,
+        source_path=source_path,
+        confidence=Confidence(claim.confidence),
+        provenance=provenance,
     )
+    canonical = recover_scientific_claim(reference)
+    if canonical is None:
+        raise ReviewError("scientific claim source semantics are ambiguous")
+    try:
+        compiled = compile_audit_claim(canonical)
+    except UnsupportedDeterministicClaimCompiler as error:
+        raise ReviewError(str(error)) from error
+    except ClaimTypeContractError as error:
+        raise ReviewError(f"scientific claim source semantics are invalid: {error}") from error
+    if type(canonical.primary) is not MetricImprovementClaim:
+        raise ReviewError("deterministic planner supports metric improvement claims")
+    if claim.claim_type is not ClaimType.METRIC_IMPROVEMENT:
+        raise ReviewError("scientific claim type conflicts with its source")
+    if claim.metric is None or claim.metric.casefold() != compiled.metric:
+        raise ReviewError("scientific claim metric conflicts with its source")
+    direction = {
+        ClaimDirection.HIGHER: Direction.HIGHER,
+        ClaimDirection.LOWER: Direction.LOWER,
+    }.get(claim.direction)
+    if direction is None or direction is not compiled.direction:
+        raise ReviewError("scientific claim direction conflicts with its source")
+    if compiled.minimum_absolute_improvement is not None:
+        magnitude = claim.claimed_magnitude
+        if (
+            magnitude is None
+            or magnitude.kind is not MagnitudeKind.ABSOLUTE
+            or magnitude.value is None
+            or magnitude.unit is not None
+            or not math.isfinite(float(magnitude.value))
+            or float(magnitude.value) != compiled.minimum_absolute_improvement
+            or magnitude.raw not in claim.source_text
+        ):
+            raise ReviewError(
+                "scientific claim threshold magnitude conflicts with its source"
+            )
+    return compiled
 
 
 def _strict_json(text: str) -> object:

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from claimci.analysis import (
+    AbsoluteMetricClaim,
     AdapterMatch,
     AnalysisContractError,
     ArtifactBinding,
@@ -38,6 +39,7 @@ from claimci.analysis import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
     audit_relevant_claim_projection,
     plan_ephemeral_audit,
     planning_request_from_discovery,
@@ -186,7 +188,7 @@ def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBind
 
 
 def _claim(
-    text: str = "Accuracy improved by at least 0.05.",
+    text: str = "Accuracy improved from 0.71 to 0.79 by at least 0.05.",
     *,
     minimum: float | None = 0.05,
     provenance_kind: ProvenanceKind = ProvenanceKind.DETERMINISTIC_DISCOVERY,
@@ -275,6 +277,85 @@ def test_discovery_boundary_preserves_reference_values_and_explicit_threshold() 
         "direction": "higher",
         "minimum_absolute_improvement": 0.05,
     }
+    assert request.scientific_claim is claim.scientific_claim
+    assert request.claim_policy is not None
+    assert request.claim_policy.deterministic_compiler_id == "metric-improvement-v0"
+
+
+def test_recognized_unsupported_claim_is_partial_before_evidence_or_mapping() -> None:
+    claim = _claim(
+        "Candidate accuracy is at least 0.90.",
+        minimum=0.90,
+        provenance_kind=ProvenanceKind.PROVIDER_PROPOSAL,
+    )
+    request = _request(claim=claim, mappings=())
+
+    assert request.scientific_claim is not None
+    assert type(request.scientific_claim.primary) is AbsoluteMetricClaim
+    assert request.audit_claim is None
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.reason == UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER
+    assert outcome.missing_evidence == ()
+    assert outcome.mapping_question is None
+    assert outcome.plan is None
+
+
+def test_unrepresentable_metric_threshold_is_exact_compiler_partial() -> None:
+    request = _request(
+        claim=_claim(
+            "Accuracy improved by at least 5 percentage points.",
+            minimum=5.0,
+        ),
+        mappings=(),
+    )
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.reason == UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER
+    assert outcome.mapping_question is None
+    assert outcome.plan is None
+
+
+def test_held_out_constraint_does_not_change_audit_claim_or_plan_identity() -> None:
+    plain = _request(
+        claim=_claim(
+            "Accuracy improved from 0.71 to 0.79 by at least 0.05."
+        )
+    )
+    held_out = _request(
+        claim=_claim(
+            "On held-out data, accuracy improved from 0.71 to 0.79 "
+            "by at least 0.05."
+        )
+    )
+
+    assert plain.audit_claim == held_out.audit_claim
+    assert json.dumps(
+        to_jsonable(plain.audit_claim),
+        sort_keys=True,
+        separators=(",", ":"),
+    ) == json.dumps(
+        to_jsonable(held_out.audit_claim),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert plain.scientific_claim is not None
+    assert held_out.scientific_claim is not None
+    assert plain.scientific_claim.constraints == ()
+    assert [item.kind.value for item in held_out.scientific_claim.constraints] == [
+        "held_out"
+    ]
+
+    plain_outcome = plan_ephemeral_audit(plain)
+    held_out_outcome = plan_ephemeral_audit(held_out)
+
+    assert plain_outcome.plan is not None
+    assert held_out_outcome.plan is not None
+    assert plain_outcome.plan.plan_id == held_out_outcome.plan.plan_id
 
 
 def test_discovery_boundary_does_not_turn_from_to_values_into_threshold() -> None:
@@ -380,6 +461,7 @@ def test_discovery_boundary_scopes_repository_wide_inputs_to_selected_claim() ->
             None,
             selected_claim.reference.provenance,
         ),
+        scientific_claim=None,
     )
     selected_evidence = (
         _evidence("accuracy/baseline_results.json", ArtifactKind.RESULTS, ExperimentRole.BASELINE),
@@ -1412,6 +1494,8 @@ def test_plan_id_ignores_descriptive_claim_and_discovery_prose() -> None:
         claim=changed_claim,
         audit_claim=changed_audit_claim,
         mapping_candidates=(changed_mapping,),
+        scientific_claim=None,
+        claim_policy=None,
     )
 
     first = plan_ephemeral_audit(original)
@@ -1440,6 +1524,8 @@ def test_plan_id_changes_for_deterministic_inputs(change: str) -> None:
         changed = dataclasses.replace(
             original,
             audit_claim=dataclasses.replace(original.audit_claim, metric="f1"),
+            scientific_claim=None,
+            claim_policy=None,
         )
     elif change == "direction":
         from claimci.models import Direction
@@ -1450,6 +1536,8 @@ def test_plan_id_changes_for_deterministic_inputs(change: str) -> None:
                 original.audit_claim,
                 direction=Direction.LOWER,
             ),
+            scientific_claim=None,
+            claim_policy=None,
         )
     elif change == "threshold":
         changed = dataclasses.replace(
@@ -1458,6 +1546,8 @@ def test_plan_id_changes_for_deterministic_inputs(change: str) -> None:
                 original.audit_claim,
                 minimum_absolute_improvement=0.06,
             ),
+            scientific_claim=None,
+            claim_policy=None,
         )
     else:
         changed_mapping = dataclasses.replace(

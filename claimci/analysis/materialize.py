@@ -17,6 +17,7 @@ import yaml
 from claimci.audit import audit_research
 from claimci.models import AuditResult
 
+from .claim_types import claim_semantic_projection
 from .contracts import (
     AnalysisContractError,
     ArtifactBinding,
@@ -951,6 +952,13 @@ def _claim_trace_entries(
         source_path=plan.claim.source_path,
         source_id=plan.claim.provenance.source_id,
         source_value=BoundedValueRepresentation.from_value(plan.claim.text),
+        normalized_value=(
+            None
+            if plan.scientific_claim is None
+            else BoundedValueRepresentation.from_value(
+                claim_semantic_projection(plan.scientific_claim)
+            )
+        ),
         consumer_rule_ids=result_rules,
     )
     proposal_provenance = plan.semantic_proposal_provenance

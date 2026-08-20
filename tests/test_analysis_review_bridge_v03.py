@@ -69,6 +69,7 @@ def _scientific_claim(
     magnitude: ClaimMagnitude | None = None,
     direction: ClaimDirection = ClaimDirection.HIGHER,
     claim_type: ClaimType = ClaimType.METRIC_IMPROVEMENT,
+    metric: str = "accuracy",
 ) -> ScientificClaim:
     return ScientificClaim(
         claim_id="claim-1",
@@ -82,7 +83,7 @@ def _scientific_claim(
             1,
             1,
         ),
-        metric="accuracy",
+        metric=metric,
         direction=direction,
         claimed_magnitude=magnitude
         or ClaimMagnitude("0.05", 0.05, None, MagnitudeKind.ABSOLUTE),
@@ -185,6 +186,54 @@ def test_from_to_claimed_values_do_not_become_a_minimum_threshold() -> None:
 
     assert converted.minimum_absolute_improvement is None
     assert converted.threshold_provenance is None
+
+
+def test_provider_cannot_upgrade_absolute_metric_claim_to_executable() -> None:
+    text = "Candidate accuracy is at least 0.90."
+    claim = _scientific_claim(source_text=text)
+
+    with pytest.raises(
+        ReviewError,
+        match="unsupported_deterministic_claim_compiler",
+    ):
+        validate_scientific_claim_for_audit(claim, _sources(text))
+
+
+def test_provider_cannot_invent_metric_direction_or_threshold() -> None:
+    wrong_metric = _scientific_claim(metric="f1")
+    wrong_direction = _scientific_claim(
+        source_text="Accuracy decreased by at least 0.05.",
+        direction=ClaimDirection.HIGHER,
+    )
+    wrong_threshold = _scientific_claim(
+        magnitude=ClaimMagnitude("0.06", 0.06, None, MagnitudeKind.ABSOLUTE),
+    )
+
+    with pytest.raises(ReviewError, match="metric"):
+        validate_scientific_claim_for_audit(wrong_metric, _sources())
+    with pytest.raises(ReviewError, match="direction"):
+        validate_scientific_claim_for_audit(
+            wrong_direction,
+            _sources(wrong_direction.source_text),
+        )
+    with pytest.raises(ReviewError, match="threshold|magnitude"):
+        validate_scientific_claim_for_audit(wrong_threshold, _sources())
+
+
+def test_provider_magnitude_cannot_promote_an_unrelated_bound_to_threshold() -> None:
+    text = (
+        "Accuracy improved, while loss moved from 0.40 to 0.20 "
+        "and remained at least 0.10."
+    )
+    claim = _scientific_claim(
+        source_text=text,
+        magnitude=ClaimMagnitude("0.10", 0.10, None, MagnitudeKind.ABSOLUTE),
+    )
+
+    converted = validate_scientific_claim_for_audit(claim, _sources(text))
+
+    assert converted.claimed_values == ()
+    assert converted.minimum_absolute_improvement is None
 
 
 @pytest.mark.parametrize(
