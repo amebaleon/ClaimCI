@@ -63,11 +63,11 @@ The eight Benchmark slots are exactly:
 7. `benchmark.environment`
 8. `benchmark.evaluator`
 
-Factory-only `ProfileEvidenceSupport` is created from one selected mapping and freshly normalized issued evidence. It commits support kind, slot, role, source binding identities, and a bounded canonical structured projection. Provider provenance cannot create support. Detailed values remain in Evidence Trace rather than obligation prose.
+Factory-only `ProfileEvidenceSupport` is created from one selected mapping and freshly normalized issued evidence. It commits support kind, slot, role, source binding identities, and a bounded canonical structured projection. Every projected scalar must be named by an exact selected field mapping; merely placing a value in a normalized object is not support. Provider provenance cannot create support. Detailed values remain in Evidence Trace rather than obligation prose.
 
 ## Metric separation
 
-`claim.metric` is the canonical semantic assertion owned by Claim Type. `measurement.metric_identity` is the represented metric definition/configuration recovered from result, evaluator, and config evidence. They are separate obligations. A satisfied claim field never satisfies measurement identity. Before Audit, the exact recovered measured metric must agree with the claim metric; baseline and candidate identities must be comparable under Measurement Drift. Claim direction and improvement threshold are excluded from measurement-protocol identity.
+`claim.metric` is the canonical semantic assertion owned by Claim Type. `measurement.metric_identity` is the represented metric definition/configuration recovered from result, evaluator, and config evidence. They are separate obligations. A satisfied claim field never satisfies measurement identity. Before Audit, each role must expose one independently recovered measured-metric identity. A known disagreement with the claim or between roles reaches the native `BENCHMARK.METRIC_MISMATCH` check and invalidates there; it is not misreported as missing evidence. Claim direction and improvement threshold are excluded from measurement-protocol identity.
 
 ## Selection policy
 
@@ -83,13 +83,13 @@ Fixed metric routing is:
 
 The exact historical results/config/train/eval mapping is positive Training evidence. Benchmark selection requires positive, independently recovered benchmark component facts; a `BENCHMARK` artifact kind alone and absence of train/eval data are never positive facts. Performance metrics route to Benchmark even when facts are incomplete, yielding Benchmark-specific `PARTIAL` rather than a Training JSONL complaint.
 
-For quality metrics, one complete shape selects its profile. If both Training and Benchmark shapes are independently complete and canonical semantics/fixed facts do not resolve them, planning returns `PARTIAL` with exact reason `evidence_profile_ambiguous`. It never asks an authoritative Training-or-Benchmark question. `MAPPING_NEEDED` is permitted only when a bounded issued binding/selector choice indirectly yields one executable profile; after approval selection reruns from the fresh mapping.
+For quality metrics, one complete shape selects its profile. A legacy baseline/candidate results-plus-config footprint remains an incomplete Training selection so its historical dataset obligations and mapping lifecycle stay compatible. If neither that positive Training footprint nor positive Benchmark facts exist, selection remains `UNRESOLVED` and planning returns `PARTIAL` with `required_profile_evidence_not_recovered`; it does not default to Training or invent train/eval blockers. If both Training and Benchmark shapes are independently complete and canonical semantics/fixed facts do not resolve them, planning returns `PARTIAL` with exact reason `evidence_profile_ambiguous`. It never asks an authoritative Training-or-Benchmark question. `MAPPING_NEEDED` is permitted only when a bounded issued binding/selector choice indirectly yields one executable profile; after approval selection reruns from the fresh mapping.
 
 ## Benchmark facts and Table Adapter
 
 Benchmark Table Adapter v0 remains CSV/TSV only. JSON and JSONL continue through existing registered adapters. Exact row-key `TableSelector` predicates identify selected cells; row positions and first matches are forbidden. Fixed profile-field targets may project only selected scalar cells into bounded `ConfigValue` components. Types are not guessed: selected table scalars remain exact text until a fixed profile parser validates a required canonical integer/decimal/enum.
 
-One physical table can supply baseline and candidate result rows plus workload/config cells through distinct selector-scoped evidence identities. Materialization captures the physical bytes once, reruns the fixed adapter for every selected variant, and never persists complete rows.
+One physical table, whether discovered as `BENCHMARK` or an existing `RESULTS` artifact, can supply baseline and candidate result rows plus workload/config cells through distinct selector-scoped evidence identities. Materialization captures the physical bytes once, reruns the fixed adapter for every selected variant, and never persists complete rows. Measurement source snapshots commit a SHA-256 projection of the complete canonical table selector, including predicates and expected cardinality; a column name alone is not selector identity.
 
 Structured components use fixed bounded scalar keys under the eight slot namespaces. Each Benchmark variant has an activation policy defining required keys and role mode. Subject fields are `SYSTEM_UNDER_TEST` and excluded from protocol equality. Procedure fields are `MEASUREMENT_PROCEDURE`; unresolved scope is `UNKNOWN` and blocks where required. Provider output cannot assign scope.
 
@@ -98,6 +98,8 @@ Structured components use fixed bounded scalar keys under the eight slot namespa
 `RAW_RUN_SERIES` requires exact passive scalar observations for both roles. ClaimCI applies `claimci_verification_reduction=arithmetic_mean_v1`; this does not assert the upstream evaluator used that aggregation. Historical Training claims explicitly defined as the mean of supplied runs remain unchanged.
 
 `REPORTED_AGGREGATE` requires independently recovered statistic identity, aggregate value, sample count, and aggregation identity for both roles. Audit compares the represented aggregate directly and records that it was aggregate evidence. It never reinterprets it as raw runs. Missing sample count or aggregation blocks planning.
+
+For reported aggregates and deterministic derivations, the public Measurement Drift companion records `claimci_verification_reduction=not_applicable`; only raw-run verification reports `arithmetic_mean_v1`.
 
 `DETERMINISTIC_DERIVATION` permits only a fixed ClaimCI formula family. V0 supports bounded multiplication (`unit_value * quantity`) for cost/resource evidence. Exact passive inputs are recomputed; arbitrary expressions, scripts, provider formulas, and customer execution are forbidden.
 
@@ -111,11 +113,11 @@ All variants require subject, results, workload, measurement configuration, metr
 - `MODEL_QUALITY`: evaluation corpus/workload, evaluator/scorer identity, metric configuration; evaluator-scoped prompt/template/decoding only when represented. It does not require a training dataset.
 - `COST`: workload volume, provider/SKU/resource configuration, included cost components, pricing snapshot/version, measurement window, and reported aggregation or the fixed deterministic formula.
 
-Environment is required for latency, throughput/resource, kernel, and cost. Evaluator is required for model quality and deterministic cost derivation. Optional represented components are still traced and compared.
+Environment is required for latency, throughput/resource, kernel, and cost. Evaluator is required for model quality and every cost form because included/excluded cost components are measurement-critical. Optional represented components are still traced and compared.
 
 ## Obligation bound
 
-The bundle cap remains 16. The maximum executable activation is four claim fields, eight grouped profile slots, and one comparison composite: 13. No scalar field becomes a separate obligation. Parameterized tests enumerate every variant/result-form activation and assert `<=13`. Legacy Training calls continue through the existing obligation function and preserve exact IDs, states, serialization, and plan identity.
+The bundle cap remains 16. The maximum executable activation is four claim fields, eight grouped profile slots, and one comparison composite: 13. No scalar field becomes a separate obligation. The ordinary v0 activations are 11 for latency, throughput/resource, kernel, and model quality; 12 for cost; and exactly 13 for a cost claim with the fourth supported claim-field constraint. Parameterized tests prove all of these counts. Legacy Training calls continue through the existing obligation function and preserve exact IDs, states, serialization, and plan identity.
 
 ## Planning, materialization, and Audit
 
@@ -125,7 +127,7 @@ Planning first recovers a profile outcome, then evaluates only profile-valid map
 
 Materialization revalidates repository/head, path, kind, SHA-256, adapter, selector, role, mapping, and profile support against fresh passive bytes. Reference evidence is folded into both measurement source snapshots only where fixed policy marks it shared procedure evidence. Any drift is `UNAVAILABLE`.
 
-One profile-aware dispatcher calls the unchanged Training Audit for Training. Benchmark Audit consumes only freshly materialized normalized evidence, applies the selected result-form reducer, invokes Measurement Drift with a profile/version/variant/activation policy ID, emits ordinary `Finding` values, calls the existing `determine_verdict()`, and returns ordinary `AuditResult`. There is no Benchmark verdict type or second reducer.
+One profile-aware dispatcher calls the unchanged Training Audit for Training. Benchmark Audit consumes only freshly materialized normalized evidence, applies the selected result-form comparison, invokes Measurement Drift with a profile/version/variant/activation policy ID, emits ordinary `Finding` values, calls the existing `determine_verdict()`, and returns ordinary `AuditResult`. There is no Benchmark verdict type or second verdict function.
 
 V0 adds only the smallest truthful native rule surface:
 
@@ -134,8 +136,10 @@ V0 adds only the smallest truthful native rule surface:
 - `BENCHMARK.CONFIG_MISMATCH` (`INVALIDATES`)
 - `BENCHMARK.PROCEDURE_INSUFFICIENT` (`INSUFFICIENT`)
 - `BENCHMARK.DERIVATION_MISMATCH` (`INVALIDATES`)
+- `BENCHMARK.PROTOCOL_VERIFIED` (`NONE`, informational)
+- `RESULT.AGGREGATE_VERIFIED` (`NONE`, informational; exact reported aggregate source)
 
-Existing `RESULT.*` rules remain the numeric claim authority where truthful. Every `BENCHMARK.*` finding is classified by Evidence Trace in this same change; no unclassified native rule may ship.
+Existing numeric `RESULT.*` claim rules remain the numeric claim authority where truthful. Every new `BENCHMARK.*` and `RESULT.AGGREGATE_VERIFIED` finding is classified by Evidence Trace in this same change; no unclassified native rule may ship.
 
 ## Compatibility and exclusions
 

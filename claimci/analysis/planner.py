@@ -56,7 +56,16 @@ from .obligations import (
     EvidenceObligationReason,
     EvidenceObligationState,
     assess_evidence_obligations,
+    assess_profiled_evidence_obligations,
     legacy_missing_evidence,
+)
+from .profiles import (
+    EvidenceProfileId,
+    EvidenceProfileSelection,
+    ProfileSelectionState,
+    mapping_matches_evidence_profile,
+    profiled_evidence_policy,
+    select_evidence_profile,
 )
 
 if TYPE_CHECKING:
@@ -689,11 +698,38 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
             evidence_obligations=obligations,
         )
 
-    selected = _select_mapping(request)
+    profile_outcome = select_evidence_profile(
+        request.scientific_claim,
+        normalized_evidence=request.normalized_evidence,
+        mapping_candidates=request.mapping_candidates,
+        approved_mapping=request.approved_mapping,
+    )
+    if profile_outcome.state is ProfileSelectionState.AMBIGUOUS:
+        return PlanningOutcome(
+            state=PlanningState.PARTIAL,
+            reason="evidence_profile_ambiguous",
+        )
+    if profile_outcome.state is ProfileSelectionState.UNRESOLVED:
+        return PlanningOutcome(
+            state=PlanningState.PARTIAL,
+            reason=profile_outcome.reason,
+        )
+    profile_selection = profile_outcome.selection
+    if profile_selection is None:
+        return PlanningOutcome(
+            state=PlanningState.UNAVAILABLE,
+            reason="deterministic evidence profile selection is unavailable",
+        )
+    profiled_policy = profiled_evidence_policy(
+        request.scientific_claim,
+        profile_selection,
+    )
+
+    selected = _select_mapping(request, profile_selection)
     valid_candidates = tuple(
         item
         for item in request.mapping_candidates
-        if _mapping_is_runtime_revalidatable(item, request)
+        if _mapping_is_runtime_revalidatable(item, request, profile_selection)
     )
     question: MappingQuestion | None = None
     ambiguity_reason: EvidenceObligationReason | None = None
@@ -701,6 +737,7 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
         if request.upstream_mapping_question is not None and _question_is_useful(
             request.upstream_mapping_question,
             request,
+            profile_selection,
         ):
             question = request.upstream_mapping_question
             ambiguity_reason = EvidenceObligationReason.MULTIPLE_VALIDATED_CANDIDATES
@@ -712,6 +749,7 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
             if candidate_question is not None and _question_is_useful(
                 candidate_question,
                 request,
+                profile_selection,
             ):
                 question = candidate_question
             if request.approved_mapping is not None:
@@ -733,9 +771,9 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
                     else EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED
                 )
 
-    obligations = assess_evidence_obligations(
+    obligations = assess_profiled_evidence_obligations(
         claim=request.scientific_claim,
-        policy=request.claim_policy,
+        policy=profiled_policy,
         audit_claim=request.audit_claim,
         artifacts=request.artifacts,
         normalized_evidence=request.normalized_evidence,
@@ -805,21 +843,39 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
 
     baseline: list[NormalizedEvidence] = []
     candidate: list[NormalizedEvidence] = []
+    reference: list[NormalizedEvidence] = []
     for binding in selected.bindings:
         evidence = _evidence_for_binding(binding, request.normalized_evidence)
         if evidence is None:
             raise AnalysisContractError(
                 "selected binding does not resolve to one exact evidence variant"
             )
-        target = baseline if binding.role is ExperimentRole.BASELINE else candidate
+        if binding.role is ExperimentRole.BASELINE:
+            target = baseline
+        elif binding.role is ExperimentRole.CANDIDATE:
+            target = candidate
+        elif binding.role is ExperimentRole.REFERENCE:
+            target = reference
+        else:
+            raise AnalysisContractError("selected profile binding role is not executable")
         if evidence not in target:
             target.append(evidence)
     baseline.sort(key=lambda item: item.evidence_id)
     candidate.sort(key=lambda item: item.evidence_id)
+    reference.sort(key=lambda item: item.evidence_id)
     mapping_provenance = _mapping_provenance(selected)
-    confidence = _plan_confidence(request, selected, (*baseline, *candidate))
+    confidence = _plan_confidence(
+        request,
+        selected,
+        (*baseline, *candidate, *reference),
+    )
     plan = EphemeralAuditPlan(
-        plan_id=_plan_id(request, selected, (*baseline, *candidate)),
+        plan_id=_plan_id(
+            request,
+            selected,
+            (*baseline, *candidate, *reference),
+            profiled_policy=profiled_policy,
+        ),
         repository=request.repository,
         pr_number=request.pr_number,
         head_sha=request.head_sha,
@@ -835,6 +891,8 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
         scientific_claim=request.scientific_claim,
         claim_policy=request.claim_policy,
         evidence_obligations=obligations,
+        profiled_policy=profiled_policy,
+        reference_evidence=tuple(reference),
     )
     return PlanningOutcome(
         state=PlanningState.READY,
@@ -932,9 +990,21 @@ def _binding_supports_native_slot(
 def _bindings_can_produce_plan(
     bindings: tuple[ArtifactBinding, ...],
     request: PlanningRequest,
+    profile_selection: EvidenceProfileSelection | None = None,
 ) -> bool:
     if request.audit_claim is None:
         return False
+    if (
+        profile_selection is not None
+        and profile_selection.profile_id
+        is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0
+    ):
+        signatures = {
+            tuple(sorted(_binding_signature(item) for item in candidate.bindings))
+            for candidate in request.mapping_candidates
+            if _mapping_is_runtime_revalidatable(candidate, request, profile_selection)
+        }
+        return tuple(sorted(_binding_signature(item) for item in bindings)) in signatures
     for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE):
         for kind in (ArtifactKind.RESULTS, ArtifactKind.CONFIG):
             matching = tuple(
@@ -964,16 +1034,36 @@ def _bindings_can_produce_plan(
 def _question_is_useful(
     question: MappingQuestion,
     request: PlanningRequest,
+    profile_selection: EvidenceProfileSelection | None = None,
 ) -> bool:
     bases = tuple(item.bindings for item in request.mapping_candidates) or ((),)
+    benchmark_profile = (
+        profile_selection is not None
+        and profile_selection.profile_id
+        is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0
+    )
     for choice in question.choices:
         for base in bases:
-            by_slot: dict[tuple[ArtifactKind, ExperimentRole, DatasetSplit | None], ArtifactBinding] = {
-                (item.kind, item.role, item.dataset_split): item for item in base
+            by_slot: dict[tuple[object, ...], ArtifactBinding] = {
+                (
+                    (item.path, item.kind, item.role, item.dataset_split)
+                    if benchmark_profile
+                    else (item.kind, item.role, item.dataset_split)
+                ): item
+                for item in base
             }
             for binding in choice.bindings:
-                by_slot[(binding.kind, binding.role, binding.dataset_split)] = binding
-            if _bindings_can_produce_plan(tuple(by_slot.values()), request):
+                key = (
+                    (binding.path, binding.kind, binding.role, binding.dataset_split)
+                    if benchmark_profile
+                    else (binding.kind, binding.role, binding.dataset_split)
+                )
+                by_slot[key] = binding
+            if _bindings_can_produce_plan(
+                tuple(by_slot.values()),
+                request,
+                profile_selection,
+            ):
                 return True
     return False
 
@@ -1143,14 +1233,22 @@ def _mapping_signature(
 def _mapping_is_runtime_revalidatable(
     mapping: MappingCandidate | RepoMapping,
     request: PlanningRequest,
+    profile_selection: EvidenceProfileSelection | None = None,
 ) -> bool:
     if not mapping.bindings:
         return False
     for binding in mapping.bindings:
-        if binding.role not in {
+        allowed_roles = {
             ExperimentRole.BASELINE,
             ExperimentRole.CANDIDATE,
-        }:
+        }
+        if (
+            profile_selection is not None
+            and profile_selection.profile_id
+            is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0
+        ):
+            allowed_roles.add(ExperimentRole.REFERENCE)
+        if binding.role not in allowed_roles:
             return False
         evidence = _evidence_for_binding(binding, request.normalized_evidence)
         if evidence is None:
@@ -1169,13 +1267,23 @@ def _mapping_is_runtime_revalidatable(
             for reference in observation.dataset_references
         ):
             return False
-    return _mapping_covers_native_inputs(mapping, request)
+    return _mapping_covers_native_inputs(mapping, request, profile_selection)
 
 
 def _mapping_covers_native_inputs(
     mapping: MappingCandidate | RepoMapping,
     request: PlanningRequest,
+    profile_selection: EvidenceProfileSelection | None = None,
 ) -> bool:
+    if profile_selection is not None:
+        if request.scientific_claim is None:
+            return False
+        return mapping_matches_evidence_profile(
+            request.scientific_claim,
+            profile_selection,
+            mapping,
+            request.normalized_evidence,
+        )
     for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE):
         role_bindings = tuple(item for item in mapping.bindings if item.role is role)
         if not all(
@@ -1197,15 +1305,16 @@ def _mapping_covers_native_inputs(
 
 def _select_mapping(
     request: PlanningRequest,
+    profile_selection: EvidenceProfileSelection | None = None,
 ) -> MappingCandidate | RepoMapping | None:
     valid_candidates = tuple(
         item
         for item in request.mapping_candidates
-        if _mapping_is_runtime_revalidatable(item, request)
+        if _mapping_is_runtime_revalidatable(item, request, profile_selection)
     )
     approved = request.approved_mapping
     if approved is not None:
-        if _mapping_is_runtime_revalidatable(approved, request):
+        if _mapping_is_runtime_revalidatable(approved, request, profile_selection):
             return approved
         return None
 
@@ -1317,6 +1426,8 @@ def _plan_id(
     request: PlanningRequest,
     mapping: MappingCandidate | RepoMapping,
     evidence: tuple[NormalizedEvidence, ...],
+    *,
+    profiled_policy: object | None = None,
 ) -> str:
     if request.audit_claim is None:
         raise AnalysisContractError(
@@ -1329,6 +1440,7 @@ def _plan_id(
         audit_claim=request.audit_claim,
         mapping=mapping,
         evidence=evidence,
+        profiled_policy=profiled_policy,
     )
 
 
@@ -1340,6 +1452,7 @@ def _plan_id_from_components(
     audit_claim: AuditClaimSpec,
     mapping: MappingCandidate | RepoMapping,
     evidence: tuple[NormalizedEvidence, ...],
+    profiled_policy: object | None = None,
 ) -> str:
     artifacts = {
         (item.artifact.path, item.artifact.kind): item.artifact
@@ -1388,6 +1501,20 @@ def _plan_id_from_components(
             ),
         ),
     }
+    if profiled_policy is not None:
+        from .profiles import ProfiledEvidencePolicy
+
+        if type(profiled_policy) is not ProfiledEvidencePolicy:
+            raise TypeError("plan profile identity requires ProfiledEvidencePolicy")
+        selection = profiled_policy.profile_selection
+        if selection.profile_id is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0:
+            projection["evidence_profile"] = {
+                "profile_id": selection.profile_id.value,
+                "version": selection.profile_version,
+                "variant": selection.benchmark_variant.value,
+                "result_form": selection.result_form.value,
+                "activation_policy_id": selection.activation_policy_id,
+            }
     canonical = json.dumps(
         projection,
         sort_keys=True,
@@ -1413,7 +1540,12 @@ def derive_ephemeral_plan_id(plan: EphemeralAuditPlan) -> str:
         head_sha=plan.head_sha,
         audit_claim=plan.audit_claim,
         mapping=plan.selected_mapping,
-        evidence=(*plan.baseline_evidence, *plan.candidate_evidence),
+        evidence=(
+            *plan.baseline_evidence,
+            *plan.candidate_evidence,
+            *plan.reference_evidence,
+        ),
+        profiled_policy=plan.profiled_policy,
     )
 
 

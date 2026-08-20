@@ -15,6 +15,7 @@ from claimci.analysis import (
     AnalysisContractError,
     ArtifactKind,
     Confidence,
+    ConfigValue,
     ExperimentRole,
     FieldMapping,
     NormalizedEvidence,
@@ -26,6 +27,7 @@ from claimci.analysis import (
     TableSelector,
     selector_identity,
 )
+from claimci.analysis.profiles import _BENCHMARK_PROFILE_FIELDS
 
 from .core import (
     MAX_COLUMNS,
@@ -49,7 +51,7 @@ _CSV_KINDS = frozenset(
 )
 _RUN_NAMES = frozenset({"run", "run_id", "trial"})
 _SEED_NAMES = frozenset({"seed", "random_seed"})
-_TARGETS = frozenset({"metric_value", "run_id", "seed"})
+_TARGETS = frozenset({"metric_value", "run_id", "seed"}) | _BENCHMARK_PROFILE_FIELDS
 _HEADER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. -]{0,255}\Z")
 _INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
 _TABLE_NUMBER = re.compile(
@@ -397,16 +399,34 @@ class CsvAdapter:
         if any(
             type(mapping.selector) is TableSelector
             for target, mapping in mappings.items()
-            if target != "metric_value"
+            if target in {"run_id", "seed"}
         ):
-            raise AdapterSelectorError(
-                "only metric_value may use an exact table row selector"
-            )
+            raise AdapterSelectorError("run_id and seed cannot use table selectors")
         table_selector = (
             metric_mapping.selector
             if type(metric_mapping.selector) is TableSelector
             else None
         )
+        profile_mappings = tuple(
+            mapping
+            for target, mapping in mappings.items()
+            if target in _BENCHMARK_PROFILE_FIELDS
+        )
+        if profile_mappings and table_selector is None:
+            raise AdapterSelectorError(
+                "profile cells require an exact metric table row selector"
+            )
+        if any(type(mapping.selector) is not TableSelector for mapping in profile_mappings):
+            raise AdapterSelectorError("profile cells require exact table selectors")
+        if table_selector is not None and any(
+            mapping.selector.predicates != table_selector.predicates
+            or mapping.selector.expected_cardinality
+            != table_selector.expected_cardinality
+            for mapping in profile_mappings
+        ):
+            raise AdapterSelectorError(
+                "profile cells and metric must select the same exact row"
+            )
         selected_rows = (
             tuple(range(len(rows)))
             if table_selector is None
@@ -459,6 +479,17 @@ class CsvAdapter:
                 selector=f"row[{row_index}].{metric_mapping.selector.expression}",
                 inferred="inferred=true" in metric_mapping.provenance.detail,
             )
+            config_values: list[ConfigValue] = []
+            for target, mapping in sorted(canonical_mappings.items()):
+                if target not in _BENCHMARK_PROFILE_FIELDS:
+                    continue
+                assert type(mapping.selector) is TableSelector
+                cell = row[indices[mapping.selector.column]]
+                if not cell:
+                    raise AdapterSelectorError(
+                        f"selected profile cell {mapping.selector.column!r} is empty"
+                    )
+                config_values.append(ConfigValue(target, cell, provenance))
             try:
                 observations.append(
                     NormalizedObservation(
@@ -471,6 +502,7 @@ class CsvAdapter:
                         run_id=run_text,
                         seed=seed,
                         experiment_role=ExperimentRole.UNSPECIFIED,
+                        config_values=tuple(config_values),
                     )
                 )
             except AdapterError:

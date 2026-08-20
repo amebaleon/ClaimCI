@@ -56,6 +56,7 @@ class ClaimCIVerificationReduction(str, Enum):
     """ClaimCI's reduction, not a claim about an upstream experiment."""
 
     ARITHMETIC_MEAN_V1 = "arithmetic_mean_v1"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class UpstreamAggregationProcedure(str, Enum):
@@ -292,9 +293,13 @@ class MeasurementSourceBinding:
             raise MeasurementContractError("measurement source role is invalid")
         if self.split is not None and self.split not in _SOURCE_SPLITS:
             raise MeasurementContractError("measurement source split is invalid")
-        if (self.kind == "dataset") != (self.split is not None):
+        if self.kind == "dataset" and self.split is None and self.role != "reference":
             raise MeasurementContractError(
                 "measurement dataset bindings require an exact split"
+            )
+        if self.kind != "dataset" and self.split is not None:
+            raise MeasurementContractError(
+                "only measurement dataset bindings may carry a split"
             )
         material = {
             "path": self.path,
@@ -556,8 +561,12 @@ class MeasurementAuditContext:
                 "measurement Audit source snapshots must share repository and head"
             )
         if any(
-            item.role != "baseline" for item in self.baseline_source.bindings
-        ) or any(item.role != "candidate" for item in self.candidate_source.bindings):
+            item.role not in {"baseline", "reference"}
+            for item in self.baseline_source.bindings
+        ) or any(
+            item.role not in {"candidate", "reference"}
+            for item in self.candidate_source.bindings
+        ):
             raise MeasurementContractError(
                 "measurement Audit source snapshots must preserve exact experiment roles"
             )
@@ -835,6 +844,97 @@ def recover_measurement_protocol_pair(
     )
 
 
+def _recover_benchmark_protocol(
+    *,
+    policy_id: str,
+    source: MeasurementSourceSnapshot,
+    metric: str,
+    components: Mapping[str, Mapping[str, object]],
+) -> MeasurementProtocolIdentity:
+    _bounded_text(metric, "measurement metric", maximum=256, canonical=True)
+    if not isinstance(components, MappingABC):
+        raise TypeError("Benchmark measurement components must be mappings")
+    source_ids = tuple(item.binding_id for item in source.bindings)
+    fixed: dict[MeasurementComponentKind, tuple[str, bool]] = {
+        MeasurementComponentKind.METRIC: ("measurement.metric_identity", True),
+        MeasurementComponentKind.EVALUATION_DATASET: ("benchmark.workload", True),
+        MeasurementComponentKind.EVALUATION_CONFIG: (
+            "benchmark.measurement_config",
+            True,
+        ),
+        MeasurementComponentKind.EVALUATOR_IMPLEMENTATION: (
+            "benchmark.evaluator",
+            False,
+        ),
+        MeasurementComponentKind.RETRY_AGGREGATION: (
+            "benchmark.run_protocol",
+            True,
+        ),
+        MeasurementComponentKind.BENCHMARK_VERSION: (
+            "benchmark.environment",
+            False,
+        ),
+    }
+    values: list[MeasurementProtocolComponent] = []
+    for kind in MeasurementComponentKind:
+        specification = fixed.get(kind)
+        if specification is None:
+            represented = None
+            required = False
+        else:
+            key, required = specification
+            raw = components.get(key)
+            if raw is not None and not isinstance(raw, MappingABC):
+                raise MeasurementContractError(
+                    "Benchmark measurement component must be a mapping"
+                )
+            represented = None if raw is None else dict(raw)
+            if kind is MeasurementComponentKind.METRIC:
+                represented = {"name": metric, **(represented or {})}
+        values.append(
+            _component_from_values(
+                kind=kind,
+                schema_id=_COMPONENT_SCHEMA_IDS[kind],
+                values=represented,
+                source_binding_ids=source_ids,
+                required=required,
+            )
+        )
+    return MeasurementProtocolIdentity.from_components(
+        policy_id=policy_id,
+        source_snapshot=source,
+        components=tuple(values),
+    )
+
+
+def recover_benchmark_measurement_protocol_pair(
+    context: MeasurementAuditContext,
+    *,
+    baseline_metric: str,
+    candidate_metric: str,
+    baseline_components: Mapping[str, Mapping[str, object]],
+    candidate_components: Mapping[str, Mapping[str, object]],
+) -> MeasurementProtocolPair:
+    """Recover Benchmark procedure identity from fixed passive component fields."""
+
+    if type(context) is not MeasurementAuditContext:
+        raise TypeError("Benchmark measurement recovery requires Audit context")
+    return MeasurementProtocolPair(
+        baseline=_recover_benchmark_protocol(
+            policy_id=context.policy_id,
+            source=context.baseline_source,
+            metric=baseline_metric,
+            components=baseline_components,
+        ),
+        candidate=_recover_benchmark_protocol(
+            policy_id=context.policy_id,
+            source=context.candidate_source,
+            metric=candidate_metric,
+            components=candidate_components,
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class MeasurementDriftFinding:
     component_kind: MeasurementComponentKind
@@ -949,6 +1049,7 @@ class MeasurementDriftReport:
         baseline_source_snapshot_id: str,
         candidate_source_snapshot_id: str,
         findings: tuple[MeasurementDriftFinding, ...],
+        claimci_verification_reduction: ClaimCIVerificationReduction,
     ) -> "MeasurementDriftReport":
         instance = object.__new__(MeasurementDriftReport)
         object.__setattr__(instance, "state", state)
@@ -976,7 +1077,7 @@ class MeasurementDriftReport:
         object.__setattr__(
             instance,
             "claimci_verification_reduction",
-            ClaimCIVerificationReduction.ARITHMETIC_MEAN_V1,
+            claimci_verification_reduction,
         )
         instance.__post_init__()
         return instance
@@ -1015,6 +1116,7 @@ def _component_state(
                 rule_id
                 for rule_id in native_rule_ids
                 if rule_id in {"CONFIG.MISSING_FIELDS"}
+                or rule_id == "BENCHMARK.PROCEDURE_INSUFFICIENT"
                 or rule_id.startswith("DATASET.MISSING")
                 or rule_id.startswith("DATASET.INVALID")
             )
@@ -1046,11 +1148,22 @@ def _component_state(
             baseline_id,
             candidate_id,
         )
-    candidates = (
-        {"DATASET.EVALUATION_MISMATCH", "CONFIG.EVALUATION_MISMATCH"}
-        if kind is MeasurementComponentKind.EVALUATION_DATASET
-        else {"CONFIG.EVALUATION_MISMATCH"}
-    )
+    if kind is MeasurementComponentKind.EVALUATION_DATASET:
+        candidates = {
+            "DATASET.EVALUATION_MISMATCH",
+            "CONFIG.EVALUATION_MISMATCH",
+            "BENCHMARK.WORKLOAD_MISMATCH",
+        }
+    elif kind is MeasurementComponentKind.METRIC:
+        candidates = {
+            "CONFIG.EVALUATION_MISMATCH",
+            "BENCHMARK.METRIC_MISMATCH",
+        }
+    else:
+        candidates = {
+            "CONFIG.EVALUATION_MISMATCH",
+            "BENCHMARK.CONFIG_MISMATCH",
+        }
     invalidating = tuple(sorted(native_rule_ids & candidates))
     if invalidating:
         return MeasurementDriftFinding._from_comparison(
@@ -1066,6 +1179,7 @@ def _component_state(
             rule_id
             for rule_id in native_rule_ids
             if rule_id == "CONFIG.MISSING_FIELDS"
+            or rule_id == "BENCHMARK.PROCEDURE_INSUFFICIENT"
             or rule_id.startswith("DATASET.MISSING")
             or rule_id.startswith("DATASET.INVALID")
         )
@@ -1084,11 +1198,16 @@ def compare_measurement_protocols(
     pair: MeasurementProtocolPair,
     *,
     native_rule_ids: tuple[str, ...],
+    claimci_verification_reduction: ClaimCIVerificationReduction = (
+        ClaimCIVerificationReduction.ARITHMETIC_MEAN_V1
+    ),
 ) -> MeasurementDriftReport:
     """Compare trusted identities while leaving verdict authority to native Audit."""
 
     if type(pair) is not MeasurementProtocolPair:
         raise TypeError("measurement comparison requires a protocol pair")
+    if type(claimci_verification_reduction) is not ClaimCIVerificationReduction:
+        raise TypeError("ClaimCI verification reduction is invalid")
     if not isinstance(native_rule_ids, tuple) or len(native_rule_ids) > 128:
         raise MeasurementContractError("measurement native rule set exceeds bound")
     for rule_id in native_rule_ids:
@@ -1119,6 +1238,7 @@ def compare_measurement_protocols(
         baseline_source_snapshot_id=pair.baseline.source_snapshot_id,
         candidate_source_snapshot_id=pair.candidate.source_snapshot_id,
         findings=findings,
+        claimci_verification_reduction=claimci_verification_reduction,
     )
 
 
@@ -1173,4 +1293,5 @@ __all__ = [
     "compare_measurement_protocols",
     "measurement_report_to_jsonable",
     "recover_measurement_protocol_pair",
+    "recover_benchmark_measurement_protocol_pair",
 ]

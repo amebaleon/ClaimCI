@@ -13,6 +13,7 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactKind,
     Confidence,
+    ConfigValue,
     ExperimentRole,
     FieldMapping,
     FieldProvenance,
@@ -147,6 +148,110 @@ def test_csv_table_selector_extracts_only_the_exact_vessl_row() -> None:
     assert evidence.adapter_match.mappings[0].selector.provenance.kind is (
         ProvenanceKind.ADAPTER_EXTRACTION
     )
+
+
+def test_csv_table_selector_projects_only_fixed_profile_cells_from_same_exact_row() -> None:
+    artifact = _artifact(
+        b"role,latency,workload,timing,hardware,ignored\n"
+        b"baseline,100,decode-v1,wall_clock,A100,secret-row-data\n"
+        b"candidate,80,decode-v1,wall_clock,A100,secret-row-data\n"
+    )
+    provenance = FieldProvenance(
+        ProvenanceKind.PROVIDER_PROPOSAL,
+        f"issued table selector; sha256={artifact.candidate.sha256}",
+        artifact.candidate.path,
+    )
+    predicates = (TablePredicate("role", TableScalarType.STRING, "baseline"),)
+    mappings = tuple(
+        FieldMapping(
+            target,
+            TableSelector(column, predicates, 1, provenance),
+            provenance,
+        )
+        for target, column in (
+            ("metric_value", "latency"),
+            ("benchmark.workload.id", "workload"),
+            ("benchmark.measurement_config.timing_boundary", "timing"),
+            ("benchmark.environment.hardware", "hardware"),
+        )
+    )
+    match = AdapterMatch(
+        CsvAdapter.adapter_id,
+        artifact.candidate.path,
+        Confidence(0.7),
+        mappings,
+        (provenance,),
+    )
+
+    evidence = CsvAdapter().extract(artifact, match)
+
+    assert tuple(evidence.observations[0].config_values) == (
+        ConfigValue(
+            "benchmark.environment.hardware",
+            "A100",
+            evidence.observations[0].config_values[0].provenance,
+        ),
+        ConfigValue(
+            "benchmark.measurement_config.timing_boundary",
+            "wall_clock",
+            evidence.observations[0].config_values[1].provenance,
+        ),
+        ConfigValue(
+            "benchmark.workload.id",
+            "decode-v1",
+            evidence.observations[0].config_values[2].provenance,
+        ),
+    )
+    assert "ignored" not in repr(evidence.observations)
+    assert "secret-row-data" not in repr(evidence.observations)
+    assert all(
+        item.provenance.kind is ProvenanceKind.ADAPTER_EXTRACTION
+        for item in evidence.observations[0].config_values
+    )
+
+
+def test_profile_cell_selectors_must_share_the_metric_row_identity() -> None:
+    artifact = _artifact(
+        b"role,latency,workload\n"
+        b"baseline,100,decode-v1\n"
+        b"candidate,80,decode-v2\n"
+    )
+    provenance = FieldProvenance(
+        ProvenanceKind.PROVIDER_PROPOSAL,
+        f"issued table selector; sha256={artifact.candidate.sha256}",
+        artifact.candidate.path,
+    )
+    match = AdapterMatch(
+        CsvAdapter.adapter_id,
+        artifact.candidate.path,
+        Confidence(0.7),
+        (
+            FieldMapping(
+                "metric_value",
+                TableSelector(
+                    "latency",
+                    (TablePredicate("role", TableScalarType.STRING, "baseline"),),
+                    1,
+                    provenance,
+                ),
+                provenance,
+            ),
+            FieldMapping(
+                "benchmark.workload.id",
+                TableSelector(
+                    "workload",
+                    (TablePredicate("role", TableScalarType.STRING, "candidate"),),
+                    1,
+                    provenance,
+                ),
+                provenance,
+            ),
+        ),
+        (provenance,),
+    )
+
+    with pytest.raises(AdapterSelectorError, match="same exact row"):
+        CsvAdapter().extract(artifact, match)
 
 
 def test_selector_scoped_evidence_identity_preserves_multi_match_sequence() -> None:

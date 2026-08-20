@@ -22,6 +22,7 @@ from .claim_types import (
     MetricImprovementClaim,
     UnsupportedDeterministicClaimCompiler,
     claim_semantic_projection,
+    claim_evidence_policy,
     compile_audit_claim,
     recover_scientific_claim,
 )
@@ -47,6 +48,14 @@ from .evidence_identity import (
     field_mapping_projection,
 )
 from .measurement import recover_upstream_procedure_requirement
+from .profiles import (
+    BenchmarkResultForm,
+    EvidenceProfileId,
+    EvidenceProfileSelection,
+    ProfileRoleMode,
+    ProfileSupportKind,
+    ProfiledEvidencePolicy,
+)
 
 
 class EvidenceObligationState(str, Enum):
@@ -82,6 +91,11 @@ class EvidenceObligationReason(str, Enum):
     NATIVE_REPRESENTATION_NOT_SUPPORTED = "native_representation_not_supported"
     MEASUREMENT_PROCEDURE_NOT_SUPPORTED = "measurement_procedure_not_supported"
     DEPENDENCY_UNSUPPORTED = "dependency_unsupported"
+    REQUIRED_PROFILE_EVIDENCE_NOT_RECOVERED = (
+        "required_profile_evidence_not_recovered"
+    )
+    PROFILE_EVIDENCE_NOT_SUPPORTED = "profile_evidence_not_supported"
+    PROFILE_EVIDENCE_AMBIGUOUS = "profile_evidence_ambiguous"
 
 
 class EvidenceObligationEffect(str, Enum):
@@ -179,8 +193,120 @@ class MeasurementComponentTarget:
             )
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class ProfileEvidenceTarget:
+    profile_id: EvidenceProfileId
+    slot_id: str
+    role_mode: ProfileRoleMode
+    allowed_artifact_kinds: tuple[ArtifactKind, ...]
+    allowed_support_kinds: tuple[ProfileSupportKind, ...]
+    activation_policy_id: str
+
+    def __init__(self) -> None:
+        raise TypeError("ProfileEvidenceTarget must come from fixed profile policy")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ProfileEvidenceTarget is final")
+
+
+_PROFILE_TARGET_SPECS: dict[
+    str,
+    tuple[ProfileRoleMode, tuple[ArtifactKind, ...], tuple[ProfileSupportKind, ...]],
+] = {
+    "benchmark.subject": (
+        ProfileRoleMode.PAIRED_BASELINE_CANDIDATE,
+        (ArtifactKind.BENCHMARK, ArtifactKind.CONFIG, ArtifactKind.RESULTS),
+        (ProfileSupportKind.STRUCTURED_COMPONENT,),
+    ),
+    "benchmark.results": (
+        ProfileRoleMode.PAIRED_BASELINE_CANDIDATE,
+        (ArtifactKind.BENCHMARK, ArtifactKind.RESULTS),
+        (
+            ProfileSupportKind.NORMALIZED_METRIC,
+            ProfileSupportKind.DETERMINISTIC_DERIVATION,
+        ),
+    ),
+    "benchmark.workload": (
+        ProfileRoleMode.SHARED_REFERENCE_OR_PAIRED,
+        (
+            ArtifactKind.BENCHMARK,
+            ArtifactKind.CONFIG,
+            ArtifactKind.DATASET,
+            ArtifactKind.DOCUMENT,
+            ArtifactKind.RESULTS,
+        ),
+        (ProfileSupportKind.ARTIFACT_BINDING, ProfileSupportKind.STRUCTURED_COMPONENT),
+    ),
+    "benchmark.measurement_config": (
+        ProfileRoleMode.PAIRED_BASELINE_CANDIDATE,
+        (ArtifactKind.BENCHMARK, ArtifactKind.CONFIG, ArtifactKind.RESULTS),
+        (ProfileSupportKind.STRUCTURED_COMPONENT,),
+    ),
+    "measurement.metric_identity": (
+        ProfileRoleMode.PAIRED_BASELINE_CANDIDATE,
+        (ArtifactKind.BENCHMARK, ArtifactKind.RESULTS, ArtifactKind.CONFIG),
+        (ProfileSupportKind.NORMALIZED_METRIC, ProfileSupportKind.STRUCTURED_COMPONENT),
+    ),
+    "benchmark.run_protocol": (
+        ProfileRoleMode.PAIRED_BASELINE_CANDIDATE,
+        (ArtifactKind.BENCHMARK, ArtifactKind.CONFIG, ArtifactKind.RESULTS),
+        (ProfileSupportKind.STRUCTURED_COMPONENT,),
+    ),
+    "benchmark.environment": (
+        ProfileRoleMode.SHARED_REFERENCE_OR_PAIRED,
+        (
+            ArtifactKind.BENCHMARK,
+            ArtifactKind.CONFIG,
+            ArtifactKind.DOCUMENT,
+            ArtifactKind.RESULTS,
+        ),
+        (ProfileSupportKind.STRUCTURED_COMPONENT,),
+    ),
+    "benchmark.evaluator": (
+        ProfileRoleMode.SHARED_REFERENCE_OR_PAIRED,
+        (
+            ArtifactKind.BENCHMARK,
+            ArtifactKind.CONFIG,
+            ArtifactKind.DOCUMENT,
+            ArtifactKind.RESULTS,
+        ),
+        (
+            ProfileSupportKind.ARTIFACT_BINDING,
+            ProfileSupportKind.STRUCTURED_COMPONENT,
+            ProfileSupportKind.DETERMINISTIC_DERIVATION,
+        ),
+    ),
+}
+
+
+def profile_evidence_target(
+    selection: EvidenceProfileSelection,
+    slot_id: str,
+) -> ProfileEvidenceTarget:
+    """Instantiate one fixed target from an engine-created Benchmark selection."""
+
+    if type(selection) is not EvidenceProfileSelection:
+        raise TypeError("profile target requires EvidenceProfileSelection")
+    if selection.profile_id is not EvidenceProfileId.BENCHMARK_MEASUREMENT_V0:
+        raise AnalysisContractError("Training uses its exact legacy artifact targets")
+    if slot_id not in _PROFILE_TARGET_SPECS:
+        raise AnalysisContractError("profile target slot is not in the fixed registry")
+    role_mode, artifact_kinds, support_kinds = _PROFILE_TARGET_SPECS[slot_id]
+    instance = object.__new__(ProfileEvidenceTarget)
+    object.__setattr__(instance, "profile_id", selection.profile_id)
+    object.__setattr__(instance, "slot_id", slot_id)
+    object.__setattr__(instance, "role_mode", role_mode)
+    object.__setattr__(instance, "allowed_artifact_kinds", artifact_kinds)
+    object.__setattr__(instance, "allowed_support_kinds", support_kinds)
+    object.__setattr__(instance, "activation_policy_id", selection.activation_policy_id)
+    return instance
+
+
 ObligationTarget: TypeAlias = (
-    ClaimFieldTarget | ArtifactEvidenceSlot | MeasurementComponentTarget
+    ClaimFieldTarget
+    | ArtifactEvidenceSlot
+    | MeasurementComponentTarget
+    | ProfileEvidenceTarget
 )
 
 
@@ -429,11 +555,252 @@ def validated_artifact_support(
     return instance
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class ProfileEvidenceSupport:
+    support_id: str
+    profile_id: EvidenceProfileId
+    slot_id: str
+    role_mode: ProfileRoleMode
+    support_kind: ProfileSupportKind
+    source_binding_ids: tuple[str, ...]
+    semantic_projection: tuple[tuple[str, object], ...]
+
+    def __init__(self) -> None:
+        raise TypeError("ProfileEvidenceSupport must be created through its factory")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ProfileEvidenceSupport is final")
+
+
+def _profile_binding_id(
+    evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
+    mapping: MappingCandidate | RepoMapping,
+) -> str:
+    return _digest(
+        "binding-profile",
+        {
+            "artifact_sha256": str(evidence.artifact.sha256),
+            "artifact_size": evidence.artifact.size,
+            "evidence_id": evidence.evidence_id,
+            "binding": _binding_material(binding),
+            "mapping": _mapping_identity(mapping),
+        },
+    )
+
+
+def _profile_projection(
+    target: ProfileEvidenceTarget,
+    evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
+    *,
+    claim_metric: str,
+) -> tuple[tuple[str, object], ...]:
+    values: list[tuple[str, object]] = []
+    if any(
+        item.kind is not ProvenanceKind.ADAPTER_EXTRACTION
+        for item in evidence.adapter_match.match_evidence
+    ):
+        raise AnalysisContractError(
+            "only adapter-extracted evidence can create profile support"
+        )
+    selected_keys = {
+        value
+        for mapping in binding.mappings
+        for value in (mapping.target_field, mapping.selector.expression)
+    }
+    metric_selected = any(
+        mapping.target_field == "metric_value" for mapping in binding.mappings
+    )
+    if (
+        target.slot_id == "benchmark.workload"
+        and binding.kind is ArtifactKind.DATASET
+    ):
+        references = tuple(
+            reference
+            for observation in evidence.observations
+            for reference in observation.dataset_references
+            if reference.path == binding.path
+        )
+        if len(references) != 1:
+            raise AnalysisContractError(
+                "profile workload dataset must identify one exact passive artifact"
+            )
+        values.extend(
+            (
+                (f"{binding.role.value}.dataset_path", str(binding.path)),
+                (
+                    f"{binding.role.value}.dataset_sha256",
+                    str(evidence.artifact.sha256),
+                ),
+                (f"{binding.role.value}.dataset_size", evidence.artifact.size),
+                (
+                    f"{binding.role.value}.dataset_split",
+                    references[0].split,
+                ),
+            )
+        )
+    for observation in evidence.observations:
+        if observation.provenance.kind is not ProvenanceKind.ADAPTER_EXTRACTION:
+            raise AnalysisContractError(
+                "only adapter-extracted values can create profile support"
+            )
+        if metric_selected and target.slot_id in {
+            "benchmark.results",
+            "measurement.metric_identity",
+        }:
+            if observation.metric_name is not None:
+                values.append((f"{binding.role.value}.metric_name", observation.metric_name))
+                if target.slot_id == "benchmark.results":
+                    values.append((f"{binding.role.value}.metric_value", observation.metric_value))
+        prefix = target.slot_id + "."
+        for item in observation.config_values:
+            if item.provenance.kind is not ProvenanceKind.ADAPTER_EXTRACTION:
+                raise AnalysisContractError(
+                    "only adapter-extracted values can create profile support"
+                )
+            if item.key in selected_keys and item.key.startswith(prefix):
+                values.append((f"{binding.role.value}.{item.key}", item.value))
+    return tuple(values)
+
+
+def validated_profile_evidence_support(
+    *,
+    target: ProfileEvidenceTarget,
+    selection: EvidenceProfileSelection,
+    normalized_evidence: tuple[NormalizedEvidence, ...],
+    selected_mapping: MappingCandidate | RepoMapping,
+    claim_metric: str,
+    required_procedure: UpstreamAggregationProcedure | None = None,
+) -> ProfileEvidenceSupport:
+    """Bind one grouped profile slot to exact trusted normalized evidence."""
+
+    if type(target) is not ProfileEvidenceTarget:
+        raise TypeError("profile support requires ProfileEvidenceTarget")
+    if type(selection) is not EvidenceProfileSelection:
+        raise TypeError("profile support requires EvidenceProfileSelection")
+    if (
+        target.profile_id is not selection.profile_id
+        or target.activation_policy_id != selection.activation_policy_id
+    ):
+        raise AnalysisContractError("profile support target does not match selection")
+    if type(selected_mapping) not in {MappingCandidate, RepoMapping}:
+        raise TypeError("profile support requires one selected mapping")
+    if not _mapping_is_trusted_for_support(selected_mapping):
+        raise AnalysisContractError(
+            "provider profile mapping requires explicit RepoMapping approval"
+        )
+    if not isinstance(normalized_evidence, tuple) or not all(
+        type(item) is NormalizedEvidence for item in normalized_evidence
+    ):
+        raise TypeError("profile support requires normalized evidence")
+    if not isinstance(claim_metric, str) or not claim_metric.strip():
+        raise AnalysisContractError("profile support claim metric is invalid")
+    if required_procedure is not None:
+        if type(required_procedure) is not UpstreamAggregationProcedure:
+            raise TypeError("profile support procedure is invalid")
+        if target.slot_id != "benchmark.run_protocol":
+            raise AnalysisContractError(
+                "only the Benchmark run-protocol slot may require aggregation"
+            )
+        if (
+            _mapping_procedure_status(
+                selected_mapping,
+                normalized_evidence,
+                required_procedure,
+            )
+            != "satisfied"
+        ):
+            raise AnalysisContractError(
+                "required benchmark aggregation is not independently recoverable"
+            )
+    projection: list[tuple[str, object]] = []
+    binding_ids: list[str] = []
+    represented_roles: set[ExperimentRole] = set()
+    supporting_kinds: set[ArtifactKind] = set()
+    for binding in selected_mapping.bindings:
+        if binding.kind not in target.allowed_artifact_kinds:
+            continue
+        evidence = evidence_for_binding(binding, normalized_evidence)
+        if evidence is None or not _evidence_matches_binding(evidence, binding):
+            continue
+        values = _profile_projection(
+            target,
+            evidence,
+            binding,
+            claim_metric=claim_metric,
+        )
+        if not values:
+            continue
+        projection.extend(values)
+        binding_ids.append(_profile_binding_id(evidence, binding, selected_mapping))
+        represented_roles.add(binding.role)
+        supporting_kinds.add(binding.kind)
+    paired = {
+        ExperimentRole.BASELINE,
+        ExperimentRole.CANDIDATE,
+    }.issubset(represented_roles)
+    shared = ExperimentRole.REFERENCE in represented_roles
+    if target.role_mode is ProfileRoleMode.PAIRED_BASELINE_CANDIDATE and not paired:
+        raise AnalysisContractError("profile slot needs baseline and candidate support")
+    if target.role_mode is ProfileRoleMode.SHARED_REFERENCE and not shared:
+        raise AnalysisContractError("profile slot needs shared reference support")
+    if target.role_mode is ProfileRoleMode.SHARED_REFERENCE_OR_PAIRED and not (
+        shared or paired
+    ):
+        raise AnalysisContractError("profile slot needs shared or paired support")
+    if not projection or not binding_ids:
+        raise AnalysisContractError("profile evidence is not independently recoverable")
+    if required_procedure is not None:
+        projection.append(
+            ("required_upstream_aggregation", required_procedure.value)
+        )
+    if len(binding_ids) > 16 or len(projection) > 64:
+        raise AnalysisContractError("profile support exceeds its structural bound")
+    ordered_projection = tuple(sorted(set(projection), key=lambda item: (item[0], repr(item[1]))))
+    ordered_bindings = tuple(sorted(set(binding_ids)))
+    if (
+        target.slot_id == "benchmark.workload"
+        and ArtifactKind.DATASET in supporting_kinds
+    ):
+        support_kind = ProfileSupportKind.ARTIFACT_BINDING
+    elif (
+        target.slot_id == "benchmark.evaluator"
+        and selection.result_form is BenchmarkResultForm.DETERMINISTIC_DERIVATION
+    ):
+        support_kind = ProfileSupportKind.DETERMINISTIC_DERIVATION
+    elif target.slot_id in {"benchmark.results", "measurement.metric_identity"}:
+        support_kind = ProfileSupportKind.NORMALIZED_METRIC
+    else:
+        support_kind = ProfileSupportKind.STRUCTURED_COMPONENT
+    if support_kind not in target.allowed_support_kinds:
+        raise AnalysisContractError("profile support kind is not allowed for its slot")
+    material = {
+        "profile_id": target.profile_id.value,
+        "slot_id": target.slot_id,
+        "activation": target.activation_policy_id,
+        "role_mode": target.role_mode.value,
+        "support_kind": support_kind.value,
+        "bindings": ordered_bindings,
+        "projection": ordered_projection,
+    }
+    instance = object.__new__(ProfileEvidenceSupport)
+    object.__setattr__(instance, "support_id", _digest("support-profile", material))
+    object.__setattr__(instance, "profile_id", target.profile_id)
+    object.__setattr__(instance, "slot_id", target.slot_id)
+    object.__setattr__(instance, "role_mode", target.role_mode)
+    object.__setattr__(instance, "support_kind", support_kind)
+    object.__setattr__(instance, "source_binding_ids", ordered_bindings)
+    object.__setattr__(instance, "semantic_projection", ordered_projection)
+    return instance
+
+
 _PROCEDURE_CONFIG_KEYS = frozenset(
     {
         "evaluation.aggregation",
         "evaluation.aggregation_procedure",
         "evaluation.retry_aggregation",
+        "benchmark.run_protocol.aggregation",
     }
 )
 
@@ -454,27 +821,44 @@ class MeasurementProcedureSupport:
 
 def _procedure_values(
     evidence: NormalizedEvidence,
+    binding: ArtifactBinding,
 ) -> tuple[object, ...]:
-    return tuple(
+    selected_keys = {
+        value
+        for mapping in binding.mappings
+        for value in (mapping.target_field, mapping.selector.expression)
+    }
+    values = tuple(
         config.value
         for observation in evidence.observations
         for config in observation.config_values
-        if config.key in _PROCEDURE_CONFIG_KEYS
+        if config.key in _PROCEDURE_CONFIG_KEYS and config.key in selected_keys
     )
+    unique = {
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ): value
+        for value in values
+    }
+    return tuple(unique[key] for key in sorted(unique))
 
 
 def _procedure_bindings(
     mapping: MappingCandidate | RepoMapping,
-    evidence_by_key: dict[tuple[object, ArtifactKind], NormalizedEvidence],
+    normalized_evidence: tuple[NormalizedEvidence, ...],
 ) -> tuple[tuple[NormalizedEvidence, ArtifactBinding], ...]:
     values: list[tuple[NormalizedEvidence, ArtifactBinding]] = []
     for binding in mapping.bindings:
         if (
-            binding.kind is not ArtifactKind.CONFIG
+            binding.kind not in {ArtifactKind.CONFIG, ArtifactKind.BENCHMARK}
             or binding.role not in {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}
         ):
             continue
-        evidence = evidence_by_key.get((binding.path, binding.kind))
+        evidence = evidence_for_binding(binding, normalized_evidence)
         if evidence is not None and _evidence_matches_binding(evidence, binding):
             values.append((evidence, binding))
     return tuple(values)
@@ -482,15 +866,15 @@ def _procedure_bindings(
 
 def _mapping_procedure_status(
     mapping: MappingCandidate | RepoMapping,
-    evidence_by_key: dict[tuple[object, ArtifactKind], NormalizedEvidence],
+    normalized_evidence: tuple[NormalizedEvidence, ...],
     procedure: UpstreamAggregationProcedure,
 ) -> str:
     by_role: dict[ExperimentRole, list[object]] = {
         ExperimentRole.BASELINE: [],
         ExperimentRole.CANDIDATE: [],
     }
-    for evidence, binding in _procedure_bindings(mapping, evidence_by_key):
-        by_role[binding.role].extend(_procedure_values(evidence))
+    for evidence, binding in _procedure_bindings(mapping, normalized_evidence):
+        by_role[binding.role].extend(_procedure_values(evidence, binding))
     if any(not values for values in by_role.values()):
         return "missing"
     flattened = tuple(value for values in by_role.values() for value in values)
@@ -536,18 +920,15 @@ def validated_measurement_procedure_support(
         type(item) is NormalizedEvidence for item in normalized_evidence
     ):
         raise TypeError("measurement procedure support requires normalized evidence")
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item for item in normalized_evidence
-    }
     if (
-        _mapping_procedure_status(selected_mapping, evidence_by_key, procedure)
+        _mapping_procedure_status(selected_mapping, normalized_evidence, procedure)
         != "satisfied"
     ):
         raise AnalysisContractError(
             "required measurement procedure is not independently recoverable"
         )
-    artifact_supports: list[ArtifactEvidenceSupport] = []
-    for evidence, binding in _procedure_bindings(selected_mapping, evidence_by_key):
+    support_records: list[tuple[str, str, str]] = []
+    for evidence, binding in _procedure_bindings(selected_mapping, normalized_evidence):
         if any(
             provenance.kind is not ProvenanceKind.ADAPTER_EXTRACTION
             for observation in evidence.observations
@@ -559,25 +940,47 @@ def validated_measurement_procedure_support(
             raise AnalysisContractError(
                 "provider values cannot create measurement procedure support"
             )
-        if _procedure_values(evidence):
-            artifact_supports.append(
-                validated_artifact_support(
+        if _procedure_values(evidence, binding):
+            if binding.kind is ArtifactKind.CONFIG:
+                support = validated_artifact_support(
                     evidence,
                     binding,
                     selected_mapping,
                     metric=claim.primary.metric,
                 )
-            )
-    if len(artifact_supports) != 2:
+                support_records.append(
+                    (support.evidence_id, support.binding_id, support.support_id)
+                )
+            else:
+                binding_id = _profile_binding_id(
+                    evidence,
+                    binding,
+                    selected_mapping,
+                )
+                support_records.append(
+                    (
+                        evidence.evidence_id,
+                        binding_id,
+                        _digest(
+                            "support-benchmark-procedure",
+                            {
+                                "evidence_id": evidence.evidence_id,
+                                "binding_id": binding_id,
+                                "procedure": procedure.value,
+                            },
+                        ),
+                    )
+                )
+    if len(support_records) != 2:
         raise AnalysisContractError(
             "measurement procedure needs one exact config support per role"
         )
-    ordered = tuple(sorted(artifact_supports, key=lambda item: item.binding_id))
+    ordered = tuple(sorted(support_records, key=lambda item: item[1]))
     material = {
         "claim_id": claim.reference.claim_id,
         "claim_source_sha256": requirement.source_text_sha256,
         "procedure": procedure.value,
-        "supports": [item.support_id for item in ordered],
+        "supports": [item[2] for item in ordered],
     }
     instance = object.__new__(MeasurementProcedureSupport)
     object.__setattr__(
@@ -589,18 +992,21 @@ def validated_measurement_procedure_support(
     object.__setattr__(
         instance,
         "evidence_ids",
-        tuple(item.evidence_id for item in ordered),
+        tuple(item[0] for item in ordered),
     )
     object.__setattr__(
         instance,
         "binding_ids",
-        tuple(item.binding_id for item in ordered),
+        tuple(item[1] for item in ordered),
     )
     return instance
 
 
 ObligationSupportReference: TypeAlias = (
-    ClaimFieldSupport | ArtifactEvidenceSupport | MeasurementProcedureSupport
+    ClaimFieldSupport
+    | ArtifactEvidenceSupport
+    | MeasurementProcedureSupport
+    | ProfileEvidenceSupport
 )
 
 
@@ -614,6 +1020,7 @@ _MISSING_REASONS = frozenset(
         EvidenceObligationReason.REQUIRED_SPLIT_NOT_RECOVERED,
         EvidenceObligationReason.REQUIRED_MEASUREMENT_PROCEDURE_NOT_RECOVERED,
         EvidenceObligationReason.DEPENDENCY_MISSING,
+        EvidenceObligationReason.REQUIRED_PROFILE_EVIDENCE_NOT_RECOVERED,
     }
 )
 _AMBIGUOUS_REASONS = frozenset(
@@ -623,6 +1030,7 @@ _AMBIGUOUS_REASONS = frozenset(
         EvidenceObligationReason.EXPLICIT_MAPPING_APPROVAL_REQUIRED,
         EvidenceObligationReason.APPROVED_MAPPING_NOT_APPLICABLE,
         EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED,
+        EvidenceObligationReason.PROFILE_EVIDENCE_AMBIGUOUS,
     }
 )
 _UNSUPPORTED_REASONS = frozenset(
@@ -635,6 +1043,7 @@ _UNSUPPORTED_REASONS = frozenset(
         EvidenceObligationReason.NATIVE_REPRESENTATION_NOT_SUPPORTED,
         EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
         EvidenceObligationReason.DEPENDENCY_UNSUPPORTED,
+        EvidenceObligationReason.PROFILE_EVIDENCE_NOT_SUPPORTED,
     }
 )
 
@@ -667,6 +1076,7 @@ class EvidenceObligation:
             ClaimFieldTarget,
             ArtifactEvidenceSlot,
             MeasurementComponentTarget,
+            ProfileEvidenceTarget,
         }:
             raise TypeError("obligation target is invalid")
         if type(self.state) is not EvidenceObligationState:
@@ -684,6 +1094,7 @@ class EvidenceObligation:
                     ClaimFieldSupport,
                     ArtifactEvidenceSupport,
                     MeasurementProcedureSupport,
+                    ProfileEvidenceSupport,
                 }
                 for item in self.support_references
             )
@@ -720,6 +1131,16 @@ class EvidenceObligation:
         ):
             raise AnalysisContractError(
                 "measurement target requires exact procedure support"
+            )
+        if type(self.target) is ProfileEvidenceTarget and any(
+            type(item) is not ProfileEvidenceSupport
+            or item.profile_id is not self.target.profile_id
+            or item.slot_id != self.target.slot_id
+            or item.role_mode is not self.target.role_mode
+            for item in self.support_references
+        ):
+            raise AnalysisContractError(
+                "profile target requires exact profile evidence support"
             )
         if (
             not isinstance(self.dependency_ids, tuple)
@@ -893,7 +1314,7 @@ def _derived_composite(
 def _build_obligation_bundle(
     *,
     claim_id: str,
-    policy: ClaimEvidencePolicy,
+    policy: ClaimEvidencePolicy | ProfiledEvidencePolicy,
     compiler_supported: bool,
     obligations: tuple[EvidenceObligation, ...],
     mapping_question_id: str | None,
@@ -901,8 +1322,8 @@ def _build_obligation_bundle(
     """Internal factory used only after deterministic obligation instantiation."""
 
     _canonical_id(claim_id, "obligation bundle claim_id")
-    if type(policy) is not ClaimEvidencePolicy:
-        raise TypeError("obligation bundle policy must be ClaimEvidencePolicy")
+    if type(policy) not in {ClaimEvidencePolicy, ProfiledEvidencePolicy}:
+        raise TypeError("obligation bundle policy is invalid")
     if type(compiler_supported) is not bool:
         raise TypeError("compiler support must be boolean")
     if (
@@ -1377,14 +1798,10 @@ def _measurement_procedure_obligation(
             reason=EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
             effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
         )
-    evidence_by_key = {
-        (item.artifact.path, item.artifact.kind): item
-        for item in normalized_evidence
-    }
     if selected_mapping is not None:
         status = _mapping_procedure_status(
             selected_mapping,
-            evidence_by_key,
+            normalized_evidence,
             requirement.procedure,
         )
         if status == "satisfied":
@@ -1438,7 +1855,11 @@ def _measurement_procedure_obligation(
         )
 
     statuses = tuple(
-        _mapping_procedure_status(candidate, evidence_by_key, requirement.procedure)
+        _mapping_procedure_status(
+            candidate,
+            normalized_evidence,
+            requirement.procedure,
+        )
         for candidate in mapping_candidates
     )
     if "satisfied" in statuses:
@@ -1637,6 +2058,158 @@ def assess_evidence_obligations(
     )
 
 
+def assess_profiled_evidence_obligations(
+    *,
+    claim: CanonicalScientificClaim,
+    policy: ProfiledEvidencePolicy,
+    audit_claim: AuditClaimSpec | None,
+    artifacts: tuple[ArtifactCandidate, ...],
+    normalized_evidence: tuple[NormalizedEvidence, ...],
+    mapping_candidates: tuple[MappingCandidate, ...],
+    selected_mapping: MappingCandidate | RepoMapping | None,
+    mapping_question: MappingQuestion | None,
+    ambiguity_reason: EvidenceObligationReason | None,
+) -> EvidenceObligationBundle:
+    """Assess one fixed evidence profile without changing legacy assessment."""
+
+    if type(policy) is not ProfiledEvidencePolicy:
+        raise TypeError("profiled obligation assessment requires ProfiledEvidencePolicy")
+    if policy.claim_policy != claim_evidence_policy(claim):
+        raise AnalysisContractError("profiled policy does not match claim semantics")
+    if policy.profile_id is EvidenceProfileId.TRAINING_EXPERIMENT_V0:
+        return assess_evidence_obligations(
+            claim=claim,
+            policy=policy.claim_policy,
+            audit_claim=audit_claim,
+            artifacts=artifacts,
+            normalized_evidence=normalized_evidence,
+            mapping_candidates=mapping_candidates,
+            selected_mapping=selected_mapping,
+            mapping_question=mapping_question,
+            ambiguity_reason=ambiguity_reason,
+        )
+    selection = policy.profile_selection
+    if selection.profile_id is not EvidenceProfileId.BENCHMARK_MEASUREMENT_V0:
+        raise AnalysisContractError("profiled obligation selection is invalid")
+    if audit_claim is None or type(audit_claim) is not AuditClaimSpec:
+        raise AnalysisContractError("Benchmark obligations require an executable claim")
+    if audit_claim != compile_audit_claim(claim):
+        raise AnalysisContractError("Benchmark obligations require the canonical Audit claim")
+
+    obligations: list[EvidenceObligation] = [
+        _claim_obligation(template_id, claim)
+        for template_id in policy.claim_template_ids
+    ]
+    profile_ids = tuple(
+        item for item in policy.profile_template_ids if item.startswith("benchmark.")
+    )
+    if "measurement.metric_identity" in policy.profile_template_ids:
+        profile_ids = (*profile_ids, "measurement.metric_identity")
+    procedure_requirement = recover_upstream_procedure_requirement(claim.reference)
+    for slot_id in profile_ids:
+        target = profile_evidence_target(selection, slot_id)
+        if selected_mapping is not None:
+            if (
+                slot_id == "benchmark.run_protocol"
+                and procedure_requirement is not None
+                and not procedure_requirement.deterministically_supported
+            ):
+                obligation = EvidenceObligation(
+                    obligation_id=slot_id,
+                    target=target,
+                    state=EvidenceObligationState.UNSUPPORTED,
+                    reason=EvidenceObligationReason.MEASUREMENT_PROCEDURE_NOT_SUPPORTED,
+                    effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+                )
+            else:
+                try:
+                    support = validated_profile_evidence_support(
+                        target=target,
+                        selection=selection,
+                        normalized_evidence=normalized_evidence,
+                        selected_mapping=selected_mapping,
+                        claim_metric=audit_claim.metric,
+                        required_procedure=(
+                            procedure_requirement.procedure
+                            if slot_id == "benchmark.run_protocol"
+                            and procedure_requirement is not None
+                            else None
+                        ),
+                    )
+                except AnalysisContractError:
+                    obligation = EvidenceObligation(
+                        obligation_id=slot_id,
+                        target=target,
+                        state=EvidenceObligationState.MISSING,
+                        reason=(
+                            EvidenceObligationReason.REQUIRED_PROFILE_EVIDENCE_NOT_RECOVERED
+                        ),
+                        effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+                    )
+                else:
+                    obligation = EvidenceObligation(
+                        obligation_id=slot_id,
+                        target=target,
+                        state=EvidenceObligationState.SATISFIED,
+                        reason=EvidenceObligationReason.VALIDATED_SUPPORT_BOUND,
+                        effect=EvidenceObligationEffect.NONE,
+                        support_references=(support,),
+                    )
+        else:
+            if mapping_candidates and mapping_question is not None:
+                obligation = EvidenceObligation(
+                    obligation_id=slot_id,
+                    target=target,
+                    state=EvidenceObligationState.AMBIGUOUS,
+                    reason=(
+                        ambiguity_reason
+                        if ambiguity_reason in _AMBIGUOUS_REASONS
+                        else EvidenceObligationReason.PROFILE_EVIDENCE_AMBIGUOUS
+                    ),
+                    effect=EvidenceObligationEffect.REQUIRES_MAPPING,
+                )
+            elif mapping_candidates:
+                obligation = EvidenceObligation(
+                    obligation_id=slot_id,
+                    target=target,
+                    state=EvidenceObligationState.AMBIGUOUS,
+                    reason=EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED,
+                    effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+                )
+            else:
+                obligation = EvidenceObligation(
+                    obligation_id=slot_id,
+                    target=target,
+                    state=EvidenceObligationState.MISSING,
+                    reason=(
+                        EvidenceObligationReason.REQUIRED_PROFILE_EVIDENCE_NOT_RECOVERED
+                    ),
+                    effect=EvidenceObligationEffect.BLOCKS_PARTIAL,
+                )
+        obligations.append(obligation)
+
+    dependencies = tuple(item.obligation_id for item in obligations)
+    obligations.append(
+        EvidenceObligation(
+            obligation_id=policy.comparison_template_id,
+            target=None,
+            state=EvidenceObligationState.SATISFIED,
+            reason=EvidenceObligationReason.VALIDATED_DEPENDENCIES_SATISFIED,
+            effect=EvidenceObligationEffect.NONE,
+            dependency_ids=dependencies,
+        )
+    )
+    return _build_obligation_bundle(
+        claim_id=claim.reference.claim_id,
+        policy=policy,
+        compiler_supported=True,
+        obligations=tuple(obligations),
+        mapping_question_id=(
+            mapping_question.question_id if mapping_question is not None else None
+        ),
+    )
+
+
 def legacy_missing_evidence(
     bundle: EvidenceObligationBundle,
 ) -> tuple[MissingEvidence, ...]:
@@ -1738,6 +2311,8 @@ __all__ = [
     "ClaimFieldTarget",
     "MeasurementComponentTarget",
     "MeasurementProcedureSupport",
+    "ProfileEvidenceSupport",
+    "ProfileEvidenceTarget",
     "EvidenceObligationDecision",
     "EvidenceObligationEffect",
     "EvidenceObligation",
@@ -1747,9 +2322,12 @@ __all__ = [
     "ObligationSupportReference",
     "ObligationTarget",
     "assess_evidence_obligations",
+    "assess_profiled_evidence_obligations",
     "claim_field_support",
     "evidence_obligations_json_bytes",
     "legacy_missing_evidence",
+    "profile_evidence_target",
     "validated_artifact_support",
     "validated_measurement_procedure_support",
+    "validated_profile_evidence_support",
 ]

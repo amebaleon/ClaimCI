@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Mapping
@@ -22,8 +23,11 @@ from .contracts import (
     ClaimReference,
     EphemeralAuditPlan,
     ExperimentRole,
+    FieldMapping,
     NormalizedEvidence,
     PassiveArtifact,
+    TableSelector,
+    selector_identity,
 )
 
 
@@ -131,6 +135,30 @@ def recover_upstream_procedure_requirement(
 _ADAPTER_VERSION = re.compile(r"(?:^|[-_.])(v[0-9]+)\Z")
 
 
+def _measurement_source_selector(mapping: FieldMapping) -> MeasurementSourceSelector:
+    if type(mapping) is not FieldMapping:
+        raise TypeError("measurement source selector requires FieldMapping")
+    selector = mapping.selector
+    if type(selector) is TableSelector:
+        canonical = json.dumps(
+            selector_identity(selector),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return MeasurementSourceSelector(
+            target_field=mapping.target_field,
+            kind="table_row",
+            expression="sha256:" + hashlib.sha256(canonical).hexdigest(),
+        )
+    return MeasurementSourceSelector(
+        target_field=mapping.target_field,
+        kind=selector.kind.value,
+        expression=selector.expression,
+    )
+
+
 def measurement_audit_context_from_materialization(
     plan: EphemeralAuditPlan,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
@@ -159,6 +187,7 @@ def measurement_audit_context_from_materialization(
     by_role: dict[ExperimentRole, list[MeasurementSourceBinding]] = {
         ExperimentRole.BASELINE: [],
         ExperimentRole.CANDIDATE: [],
+        ExperimentRole.REFERENCE: [],
     }
     for evidence, binding in bound:
         passive = captured.get(str(binding.path))
@@ -170,12 +199,7 @@ def measurement_audit_context_from_materialization(
             raise AnalysisContractError("measurement source role is not executable")
         matched = _ADAPTER_VERSION.search(binding.adapter_id)
         selectors = tuple(
-            MeasurementSourceSelector(
-                target_field=item.target_field,
-                kind=item.selector.kind.value,
-                expression=item.selector.expression,
-            )
-            for item in binding.mappings
+            _measurement_source_selector(item) for item in binding.mappings
         )
         by_role[binding.role].append(
             MeasurementSourceBinding(
@@ -195,21 +219,32 @@ def measurement_audit_context_from_materialization(
             )
         )
     if not all(by_role.values()):
-        raise AnalysisContractError(
-            "measurement source context requires both experiment roles"
-        )
+        if not all(
+            by_role[role]
+            for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE)
+        ):
+            raise AnalysisContractError(
+                "measurement source context requires both experiment roles"
+            )
     repository_id = f"{plan.repository.owner}/{plan.repository.name}"
+    shared = tuple(by_role[ExperimentRole.REFERENCE])
+    policy_id = (
+        "claimci.measurement.pilot.v1"
+        if plan.profiled_policy is None
+        else plan.profiled_policy.profile_selection.activation_policy_id
+    )
     return MeasurementAuditContext(
         baseline_source=MeasurementSourceSnapshot.from_bindings(
             repository_id=repository_id,
             head_sha=str(plan.head_sha),
-            bindings=tuple(by_role[ExperimentRole.BASELINE]),
+            bindings=tuple((*by_role[ExperimentRole.BASELINE], *shared)),
         ),
         candidate_source=MeasurementSourceSnapshot.from_bindings(
             repository_id=repository_id,
             head_sha=str(plan.head_sha),
-            bindings=tuple(by_role[ExperimentRole.CANDIDATE]),
+            bindings=tuple((*by_role[ExperimentRole.CANDIDATE], *shared)),
         ),
+        policy_id=policy_id,
     )
 
 
