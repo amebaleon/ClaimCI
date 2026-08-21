@@ -18,7 +18,10 @@ from claimci.audit import audit_profiled, audit_research
 from claimci.models import AuditResult
 
 from .claim_types import claim_semantic_projection
-from .measurement import measurement_audit_context_from_materialization
+from .measurement import (
+    _verification_measurement_context_from_materialization,
+    measurement_audit_context_from_materialization,
+)
 from .contracts import (
     AnalysisContractError,
     ArtifactBinding,
@@ -38,6 +41,7 @@ from .contracts import (
     RepoMapping,
     RepositoryIdentity,
     SelectorKind,
+    Sha256Digest,
     TableSelector,
     field_mapping_identity,
 )
@@ -66,6 +70,17 @@ from .trace import (
     TraceSelector,
     TraceTablePredicate,
     stable_audit_projection,
+)
+from .replay import (
+    ReplayAuditCommitment,
+    ReplayEngineProvenance,
+    ReplayRecipe,
+    ReplayTraceReference,
+)
+from .verification import (
+    VerificationInputSnapshot,
+    _dataset_record_hashes,
+    build_verification_input_snapshot,
 )
 
 
@@ -195,6 +210,9 @@ class RuntimeExecutionContext:
     head_sha: GitCommitSha
     scratch_root: Path
     limits: MaterializationLimits = field(default_factory=MaterializationLimits)
+    base_sha: GitCommitSha | None = None
+    engine_source_revision: GitCommitSha | None = None
+    engine_distribution_sha256: Sha256Digest | None = None
     _checkout_identity: tuple[int, int, int] = field(init=False, repr=False)
     _scratch_identity: tuple[int, int, int] = field(init=False, repr=False)
 
@@ -205,6 +223,18 @@ class RuntimeExecutionContext:
             object.__setattr__(self, "head_sha", GitCommitSha(self.head_sha))
         if type(self.limits) is not MaterializationLimits:
             raise TypeError("runtime limits must be MaterializationLimits")
+        for name in ("base_sha", "engine_source_revision"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, GitCommitSha):
+                object.__setattr__(self, name, GitCommitSha(value))
+        if self.engine_distribution_sha256 is not None and not isinstance(
+            self.engine_distribution_sha256, Sha256Digest
+        ):
+            object.__setattr__(
+                self,
+                "engine_distribution_sha256",
+                Sha256Digest(self.engine_distribution_sha256),
+            )
         checkout_input = Path(self.checkout_root)
         scratch_input = Path(self.scratch_root)
         try:
@@ -1414,6 +1444,118 @@ def _cleanup_plan_tree(plan_root: Path, created_identity: tuple[int, int]) -> No
         ) from error
 
 
+def _measurement_pair_before_audit(
+    plan: EphemeralAuditPlan,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, PassiveArtifact],
+    measurement_context: object,
+    *,
+    benchmark_profile: bool,
+) -> object:
+    """Recover the same protocol inputs before native Audit is invoked."""
+
+    from claimci.measurement import (
+        MeasurementAuditContext,
+        recover_benchmark_measurement_protocol_pair,
+        recover_measurement_protocol_pair,
+    )
+
+    if type(measurement_context) is not MeasurementAuditContext:
+        raise MaterializationUnavailable(
+            "verification snapshot requires a trusted measurement context"
+        )
+    if plan.audit_claim is None:
+        raise MaterializationUnavailable(
+            "verification snapshot requires an Audit claim"
+        )
+    by_role = {
+        role: tuple(
+            evidence for evidence, binding in bound if binding.role is role
+        )
+        for role in (
+            ExperimentRole.BASELINE,
+            ExperimentRole.CANDIDATE,
+            ExperimentRole.REFERENCE,
+        )
+    }
+    if benchmark_profile:
+        from claimci.benchmark_audit import (
+            _config_projection as benchmark_config_projection,
+            _effective_component,
+            _represented_metric_identity,
+        )
+
+        selection = plan.profiled_policy.profile_selection
+        baseline_config = benchmark_config_projection(by_role[ExperimentRole.BASELINE])
+        candidate_config = benchmark_config_projection(by_role[ExperimentRole.CANDIDATE])
+        reference_config = benchmark_config_projection(by_role[ExperimentRole.REFERENCE])
+        prefixes = (
+            "benchmark.workload",
+            "benchmark.measurement_config",
+            "benchmark.run_protocol",
+            "benchmark.environment",
+            "benchmark.evaluator",
+            "measurement.metric_identity",
+        )
+        baseline_protocol: dict[str, Mapping[str, object]] = {}
+        candidate_protocol: dict[str, Mapping[str, object]] = {}
+        for prefix in prefixes:
+            baseline, _ = _effective_component(
+                prefix,
+                reference_config,
+                baseline_config,
+                selection,
+            )
+            candidate, _ = _effective_component(
+                prefix,
+                reference_config,
+                candidate_config,
+                selection,
+            )
+            if baseline:
+                baseline_protocol[prefix] = baseline
+            if candidate:
+                candidate_protocol[prefix] = candidate
+        return recover_benchmark_measurement_protocol_pair(
+            measurement_context,
+            baseline_metric=_represented_metric_identity(
+                by_role[ExperimentRole.BASELINE],
+                role="baseline",
+            ),
+            candidate_metric=_represented_metric_identity(
+                by_role[ExperimentRole.CANDIDATE],
+                role="candidate",
+            ),
+            baseline_components=baseline_protocol,
+            candidate_components=candidate_protocol,
+        )
+
+    def evaluation_hashes(role: ExperimentRole) -> tuple[str, ...] | None:
+        matches = tuple(
+            (evidence, binding)
+            for evidence, binding in bound
+            if binding.role is role
+            and binding.kind is ArtifactKind.DATASET
+            and binding.dataset_split is DatasetSplit.EVAL
+        )
+        if len(matches) != 1:
+            return None
+        evidence, binding = matches[0]
+        passive = captured.get(str(binding.path))
+        if type(passive) is not PassiveArtifact:
+            return None
+        return _dataset_record_hashes(passive.content)
+
+    return recover_measurement_protocol_pair(
+        measurement_context,
+        metric=plan.audit_claim.metric,
+        baseline_config=_config_payload(by_role[ExperimentRole.BASELINE]),
+        candidate_config=_config_payload(by_role[ExperimentRole.CANDIDATE]),
+        baseline_evaluation_hashes=evaluation_hashes(ExperimentRole.BASELINE),
+        candidate_evaluation_hashes=evaluation_hashes(ExperimentRole.CANDIDATE),
+    )
+
+
 def execute_ephemeral_audit_with_trace(
     plan: EphemeralAuditPlan,
     runtime: RuntimeExecutionContext,
@@ -1500,6 +1642,41 @@ def execute_ephemeral_audit_with_trace(
                 captured,
             )
         )
+        snapshot_measurement_context = measurement_context
+        if snapshot_measurement_context is None:
+            # Legacy executable plans predate Measurement Drift.  Recover a
+            # source-bound context through the same confined factory so Replay
+            # never substitutes an untrusted or provider-authored identity.
+            try:
+                snapshot_measurement_context = (
+                    _verification_measurement_context_from_materialization(
+                        plan,
+                        bound,
+                        captured,
+                    )
+                )
+            except AnalysisContractError as error:
+                raise MaterializationUnavailable(
+                    "verification measurement identity is unavailable"
+                ) from error
+        measurement_pair = _measurement_pair_before_audit(
+            plan,
+            bound,
+            captured,
+            snapshot_measurement_context,
+            benchmark_profile=benchmark_profile,
+        )
+        input_snapshot = build_verification_input_snapshot(
+            plan,
+            runtime,
+            bound,
+            captured,
+            measurement_pair,
+        )
+        if type(input_snapshot) is not VerificationInputSnapshot:
+            raise MaterializationUnavailable(
+                "verification snapshot factory returned an untrusted value"
+            )
         if plan.profiled_policy is None:
             assert manifest is not None
             result = (
@@ -1545,7 +1722,23 @@ def execute_ephemeral_audit_with_trace(
                 head_sha=plan.head_sha,
                 result=result,
             )
-        return EphemeralAuditExecution(result, trace)
+        audit_commitment = ReplayAuditCommitment.from_audit_result(result)
+        trace_reference = ReplayTraceReference.from_trace(trace, audit_commitment)
+        replay_recipe = ReplayRecipe.from_execution(
+            input_snapshot=input_snapshot,
+            engine_provenance=ReplayEngineProvenance.current(
+                source_revision=runtime.engine_source_revision,
+                distribution_sha256=runtime.engine_distribution_sha256,
+            ),
+            audit_commitment=audit_commitment,
+            trace_reference=trace_reference,
+        )
+        return EphemeralAuditExecution(
+            result,
+            trace,
+            input_snapshot,
+            replay_recipe,
+        )
     except (MaterializationPartial, MaterializationUnavailable):
         raise
     except Exception as error:

@@ -83,8 +83,10 @@ role, split, and selector. One physical Benchmark table selected through
 different baseline/candidate predicates therefore produces distinct evidence
 identities even though `path` and `source_sha256` are equal.
 
-Training result semantics contain only the audited metric observations, run
-IDs, seeds, and represented summary consumed by the native result check.
+Training result semantics contain only the audited metric observations and
+integer seeds consumed by the native result check. Run IDs remain extraction
+and full provenance only because the current deterministic Audit does not
+consume them.
 Training config semantics contain the exact generated scalar mapping consumed
 by config checks. Training dataset semantics contain canonical JSONL record
 hashes with counts, so formatting-only JSON changes do not alter Audit

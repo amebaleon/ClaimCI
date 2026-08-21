@@ -898,6 +898,8 @@ class EvidenceTraceBundle:
 class EphemeralAuditExecution:
     audit_result: AuditResult
     trace: EvidenceTraceBundle
+    input_snapshot: "VerificationInputSnapshot | None" = None
+    replay_recipe: "ReplayRecipe | None" = None
 
     def __post_init__(self) -> None:
         if type(self.audit_result) is not AuditResult:
@@ -909,6 +911,30 @@ class EphemeralAuditExecution:
             raise TraceContractError(
                 "ephemeral trace authority does not match its AuditResult"
             )
+        if (self.input_snapshot is None) != (self.replay_recipe is None):
+            raise TraceContractError(
+                "ephemeral replay companions must appear together"
+            )
+        if self.input_snapshot is not None:
+            from .replay import ReplayAuditCommitment, ReplayRecipe
+            from .verification import VerificationInputSnapshot
+
+            if type(self.input_snapshot) is not VerificationInputSnapshot:
+                raise TypeError(
+                    "ephemeral input_snapshot must be VerificationInputSnapshot"
+                )
+            if type(self.replay_recipe) is not ReplayRecipe:
+                raise TypeError("ephemeral replay_recipe must be ReplayRecipe")
+            if self.replay_recipe.input_snapshot != self.input_snapshot:
+                raise TraceContractError(
+                    "ephemeral Replay recipe does not match its input snapshot"
+                )
+            if self.replay_recipe.audit_commitment != ReplayAuditCommitment.from_audit_result(
+                self.audit_result
+            ):
+                raise TraceContractError(
+                    "ephemeral Replay recipe does not match its AuditResult"
+                )
 
 
 def trace_json_bytes(bundle: EvidenceTraceBundle) -> bytes:

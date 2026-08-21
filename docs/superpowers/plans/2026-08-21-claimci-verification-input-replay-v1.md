@@ -33,12 +33,12 @@
 - Produces immutable `VerificationArtifactIdentity`, companion identity records, `AuditSemanticsCompatibility`, and `VerificationInputSnapshot`.
 - Produces canonical JSON projection helpers used by replay and materialization.
 
-- [ ] Write failing tests for constructor sealing, subclass rejection, malformed IDs/hashes/paths/selectors, deep immutability, and provider-shaped dictionaries being rejected.
-- [ ] Run `python -m pytest -q -p no:cacheprovider tests/test_verification_replay_v1.py` and verify failure because the module/interfaces do not exist.
-- [ ] Implement bounded canonical helpers and factory-only records.
-- [ ] Add literal digest golden vectors for artifact, compatibility, captured input, comparison frame, and complete snapshot.
-- [ ] Verify RED with hand-written expected SHA-256 values, then implement minimal canonical projections until GREEN.
-- [ ] Add identity-only reduction tests with an explicit small complete-projection ceiling; assert the full snapshot digest is retained and `UNAVAILABLE` cannot execute.
+- [x] Write failing tests for constructor sealing, subclass rejection, malformed IDs/hashes/paths/selectors, deep immutability, and provider-shaped dictionaries being rejected.
+- [x] Run `python -m pytest -q -p no:cacheprovider tests/test_verification_replay_v1.py` and verify failure because the module/interfaces do not exist.
+- [x] Implement bounded canonical helpers and factory-only records.
+- [x] Add literal digest golden vectors for artifact, compatibility, captured input, comparison frame, and complete snapshot.
+- [x] Verify RED with hand-written expected SHA-256 values, then implement minimal canonical projections until GREEN.
+- [x] Add identity-only reduction tests with an explicit small complete-projection ceiling; assert the full snapshot digest is retained and `UNAVAILABLE` cannot execute.
 
 ### Task 2: Post-Audit replay contracts
 
@@ -52,11 +52,11 @@
 - `ReplayTraceReference.from_trace(trace, commitment) -> ReplayTraceReference`
 - `ReplayRecipe.from_execution(...) -> ReplayRecipe`
 
-- [ ] Write failing tests proving direct/subclass construction is closed and a fake verdict/provider object cannot create an Audit commitment.
-- [ ] Verify the test fails for missing interfaces.
-- [ ] Implement commitment by delegating to the existing stable Audit projection and requiring exact `AuditResult`/`Verdict` types.
-- [ ] Test trace/audit mismatch, engine-revision separation from compatibility, fixed `experiment_replay_supported=False`, and recipe golden digest.
-- [ ] Implement the minimal factories and canonical recipe projection.
+- [x] Write failing tests proving direct/subclass construction is closed and a fake verdict/provider object cannot create an Audit commitment.
+- [x] Verify the test fails for missing interfaces.
+- [x] Implement commitment by delegating to the existing stable Audit projection and requiring exact `AuditResult`/`Verdict` types.
+- [x] Test trace/audit mismatch, engine-revision separation from compatibility, fixed `experiment_replay_supported=False`, and recipe golden digest.
+- [x] Implement the minimal factories and canonical recipe projection.
 
 ### Task 3: Exact-head artifact projectors and snapshot builder
 
@@ -69,12 +69,12 @@
 - Internal `build_verification_input_snapshot(plan, runtime, bound, captured, manifest, measurement_context) -> VerificationInputSnapshot`.
 - Internal projectors produce extraction and Audit-semantic commitments without source-format bytes.
 
-- [ ] Add RED tests for Training result/config/JSONL projections and formatting-only JSON/YAML/JSONL changes.
-- [ ] Add RED Benchmark test where one physical table has distinct baseline/candidate selectors and values; assert equal source SHA but distinct verification evidence IDs and Audit-semantic hashes.
-- [ ] Implement projectors using only freshly revalidated `NormalizedEvidence`, `ArtifactBinding`, and `PassiveArtifact` values.
-- [ ] Add profile selection and Evidence Obligation identity tests, then implement their fixed semantic/full projections.
-- [ ] Add measurement reference tests proving source-only changes alter only source snapshot and complete input snapshot identities.
-- [ ] Add comparison-frame tests proving candidate result values are excluded while candidate measurement-protocol semantics remain included.
+- [x] Add RED tests for Training result/config/JSONL projections and formatting-only JSON/YAML/JSONL changes.
+- [x] Add RED Benchmark test where one physical table has distinct baseline/candidate selectors and values; assert equal source SHA but distinct verification evidence IDs and Audit-semantic hashes.
+- [x] Implement projectors using only freshly revalidated `NormalizedEvidence`, `ArtifactBinding`, and `PassiveArtifact` values.
+- [x] Add profile selection and Evidence Obligation identity tests, then implement their fixed semantic/full projections.
+- [x] Add measurement reference tests proving source-only changes alter only source snapshot and complete input snapshot identities.
+- [x] Add comparison-frame tests proving candidate result values are excluded while candidate measurement-protocol semantics remain included.
 
 ### Task 4: Canonical execution ordering and replay creation
 
@@ -93,12 +93,12 @@
 - Canonical materialization populates both; compatibility execution still returns `AuditResult`.
 - `UnifiedAnalysisResult` carries companions only with deterministic authority.
 
-- [ ] Write a failing ordering test whose Audit fake asserts the snapshot factory has already completed before invocation.
-- [ ] Implement pre-Audit snapshot construction immediately after exact capture/profile revalidation/native-tree preparation.
-- [ ] Write failing tests for factory-created Audit commitment, Trace reference, and recipe after exactly one Audit call.
-- [ ] Implement replay creation after Trace construction and bind Trace/Audit identities.
-- [ ] Add state-matrix tests preventing replay companions without deterministic authority and proving advisory content cannot alter recipe or verdict.
-- [ ] Export only the approved public contracts and serialization helpers.
+- [x] Write a failing ordering test whose Audit fake asserts the snapshot factory has already completed before invocation.
+- [x] Implement pre-Audit snapshot construction immediately after exact capture/profile revalidation/native-tree preparation.
+- [x] Write failing tests for factory-created Audit commitment, Trace reference, and recipe after exactly one Audit call.
+- [x] Implement replay creation after Trace construction and bind Trace/Audit identities.
+- [x] Add state-matrix tests preventing replay companions without deterministic authority and proving advisory content cannot alter recipe or verdict.
+- [x] Export only the approved public contracts and serialization helpers.
 
 ### Task 5: Trust, bounds, compatibility, and focused gates
 
@@ -106,15 +106,15 @@
 - Modify: `tests/test_verification_replay_v1.py`
 - Modify focused existing tests only where additive fields require assertions.
 
-- [ ] Add hostile provider verdict/identity injection and unapproved mapping regressions.
-- [ ] Add approved-mapping test proving approval affects binding identity but not Audit commitment authority.
-- [ ] Add source revision/distribution changes with equal Audit semantics compatibility.
-- [ ] Add legacy direct Audit, manifest, report, and CLI byte-compatibility tests.
-- [ ] Run focused Replay/snapshot tests.
-- [ ] Run Benchmark Profile, Measurement Drift, adapters, obligations/planner/materializer, Trace/Audit/report/CLI suites.
-- [ ] Run full `python -m pytest -q -p no:cacheprovider`.
-- [ ] Run `python -m compileall -q claimci`.
-- [ ] Run `git diff --check 122f6176388ceabbb792ff071f0e4e20f4b32bbe...HEAD`.
+- [x] Add hostile provider verdict/identity injection and unapproved mapping regressions.
+- [x] Add approved-mapping test proving approval affects binding identity but not Audit commitment authority.
+- [x] Add source revision/distribution changes with equal Audit semantics compatibility.
+- [x] Add legacy direct Audit, manifest, report, and CLI byte-compatibility tests.
+- [x] Run focused Replay/snapshot tests.
+- [x] Run Benchmark Profile, Measurement Drift, adapters, obligations/planner/materializer, Trace/Audit/report/CLI suites.
+- [x] Run full `python -m pytest -q -p no:cacheprovider`.
+- [x] Run `python -m compileall -q claimci`.
+- [x] Run `git diff --check 122f6176388ceabbb792ff071f0e4e20f4b32bbe...HEAD`.
 
 ### Task 6: Security review and stacked Draft PR
 
@@ -123,7 +123,7 @@
 
 - [ ] Freeze the exact base/head diff and run the scoped security-diff workflow.
 - [ ] Validate factory-only authority, canonical digest separation, path/selector confinement, no execution surface, no provider trust elevation, and bounded projections.
-- [ ] Re-run the complete verification gate after any review fix.
-- [ ] Inspect `git status`, `git diff`, and `git diff --check`.
+- [x] Re-run the complete verification gate after any review fix.
+- [x] Inspect `git status`, `git diff`, and `git diff --check`.
 - [ ] Commit focused implementation changes, push `codex/verification-input-replay-v1`, and open a Draft PR against `codex/benchmark-evidence-profile-v0`.
 - [ ] Report exact base/head, files, tests, digest contracts, capabilities, security result, and blockers; stop before merge.

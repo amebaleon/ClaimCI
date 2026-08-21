@@ -421,7 +421,252 @@ def test_traced_execution_preserves_the_exact_audit_result_and_rendering(
     assert traced.trace.completeness is TraceCompleteness.COMPLETE
     assert traced.trace.head_sha == plan.head_sha
     assert traced.trace.deterministic_authority.verdict is compatibility.verdict
+    assert traced.input_snapshot is not None
+    assert traced.input_snapshot.capability.value == "complete"
+    assert traced.input_snapshot.head_sha == plan.head_sha
+    assert traced.input_snapshot.artifact_count == 8
+    assert traced.replay_recipe is not None
+    assert (
+        traced.replay_recipe.input_snapshot.input_snapshot_sha256
+        == traced.input_snapshot.input_snapshot_sha256
+    )
+    assert traced.replay_recipe.audit_commitment.verdict is compatibility.verdict
+    assert (
+        traced.replay_recipe.trace_reference.stable_audit_sha256
+        == traced.trace.deterministic_authority.audit_sha256
+    )
+    assert traced.replay_recipe.experiment_replay_supported is False
+    assert str(traced.input_snapshot.captured_audit_input_sha256) == (
+        "40f2cb5ccb6fe56af5701141da55c32ab083af67453d30fd848e3ce0f343fd88"
+    )
+    assert str(traced.input_snapshot.comparison_frame_sha256) == (
+        "b71b11c8643f5026cf221dcad41b92bc91c8ff696c301f3b05b042838df32cdc"
+    )
+    assert str(traced.input_snapshot.input_snapshot_sha256) == (
+        "fa91cc01b449fb8f20ca88e4e66b2cbe89df9c94419a3427914e997c268d25c7"
+    )
+    assert str(traced.replay_recipe.recipe_sha256) == (
+        "1a1038aa9055d82c7e3e565be5c4fa03616d5b825fdf27d155a1bbc26e4b0b40"
+    )
     assert not tuple(scratch.iterdir())
+
+
+def test_snapshot_is_built_before_audit_and_over_bound_reduces_to_identity_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    original_builder = materialize.build_verification_input_snapshot
+    original_audit = materialize.audit_research
+    state = {"built": False, "audited": False}
+
+    def bounded_builder(*args: object, **kwargs: object):
+        snapshot = original_builder(*args, **kwargs, max_complete_bytes=1)
+        state["built"] = True
+        return snapshot
+
+    def ordered_audit(*args: object, **kwargs: object) -> AuditResult:
+        assert state["built"] is True
+        state["audited"] = True
+        return original_audit(*args, **kwargs)
+
+    monkeypatch.setattr(materialize, "build_verification_input_snapshot", bounded_builder)
+    monkeypatch.setattr(materialize, "audit_research", ordered_audit)
+
+    execution = execute_ephemeral_audit_with_trace(plan, runtime)
+
+    assert state == {"built": True, "audited": True}
+    assert execution.input_snapshot is not None
+    assert execution.input_snapshot.capability.value == "identity_only"
+    assert execution.input_snapshot.artifacts == ()
+    assert execution.input_snapshot.artifact_count == 8
+    assert execution.input_snapshot.artifacts_sha256 is not None
+    assert execution.replay_recipe is not None
+
+
+def test_provider_shaped_snapshot_cannot_reach_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.analysis.materialize as materialize
+
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    audited = False
+
+    def hostile_builder(*_args: object, **_kwargs: object) -> object:
+        return {
+            "input_snapshot_sha256": "0" * 64,
+            "verdict": "SUPPORTED",
+            "authority": "deterministic",
+        }
+
+    def forbidden_audit(*_args: object, **_kwargs: object) -> AuditResult:
+        nonlocal audited
+        audited = True
+        raise AssertionError("Audit must not run with a forged snapshot")
+
+    monkeypatch.setattr(materialize, "build_verification_input_snapshot", hostile_builder)
+    monkeypatch.setattr(materialize, "audit_research", forbidden_audit)
+
+    with pytest.raises(MaterializationUnavailable, match="snapshot"):
+        execute_ephemeral_audit_with_trace(plan, runtime)
+
+    assert audited is False
+
+
+def test_repo_mapping_approval_changes_only_binding_authority(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    assert type(plan.selected_mapping) is MappingCandidate
+    approved = RepoMapping.approve(
+        plan.repository,
+        plan.selected_mapping,
+        approved_by="pilot-user",
+    )
+    approved_plan = dataclasses.replace(
+        plan,
+        selected_mapping=approved,
+        mapping_provenance=(approved.approval_provenance,),
+    )
+    approved_plan = dataclasses.replace(
+        approved_plan,
+        plan_id=derive_ephemeral_plan_id(approved_plan),
+    )
+
+    inferred_execution = execute_ephemeral_audit_with_trace(plan, runtime)
+    approved_execution = execute_ephemeral_audit_with_trace(approved_plan, runtime)
+
+    assert (
+        inferred_execution.audit_result.verdict
+        is approved_execution.audit_result.verdict
+    )
+    assert inferred_execution.replay_recipe is not None
+    assert approved_execution.replay_recipe is not None
+    assert (
+        inferred_execution.replay_recipe.audit_commitment
+        == approved_execution.replay_recipe.audit_commitment
+    )
+    assert approved_execution.input_snapshot is not None
+    assert inferred_execution.input_snapshot is not None
+    assert (
+        inferred_execution.input_snapshot.captured_audit_input_sha256
+        == approved_execution.input_snapshot.captured_audit_input_sha256
+    )
+    assert approved_execution.input_snapshot.mapping_identity is not None
+    assert approved_execution.input_snapshot.mapping_identity.trust is MappingTrust.USER_APPROVED
+    assert approved_execution.input_snapshot.mapping_identity.approval_sha256 is not None
+
+
+def test_candidate_result_value_is_excluded_from_comparison_frame(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_plan, first_runtime, _checkout, _scratch = _plan_fixture(first_root)
+    second_plan, second_runtime, checkout, _scratch = _plan_fixture(second_root)
+    path = RepositoryPath("results/candidate.json")
+    content = b'{"accuracy":0.75,"seed":11}\n'
+    (checkout / str(path)).write_bytes(content)
+    changed_evidence = tuple(
+        dataclasses.replace(
+            item,
+            artifact=dataclasses.replace(
+                item.artifact,
+                sha256=Sha256Digest(hashlib.sha256(content).hexdigest()),
+                size=len(content),
+            ),
+            observations=(
+                dataclasses.replace(item.observations[0], metric_value=0.75),
+            ),
+        )
+        if item.artifact.path == path
+        else item
+        for item in second_plan.candidate_evidence
+    )
+    second_plan = dataclasses.replace(
+        second_plan,
+        candidate_evidence=changed_evidence,
+    )
+    second_plan = dataclasses.replace(
+        second_plan,
+        plan_id=derive_ephemeral_plan_id(second_plan),
+    )
+
+    first = execute_ephemeral_audit_with_trace(first_plan, first_runtime)
+    second = execute_ephemeral_audit_with_trace(second_plan, second_runtime)
+
+    assert first.input_snapshot is not None
+    assert second.input_snapshot is not None
+    assert (
+        first.input_snapshot.comparison_frame_sha256
+        == second.input_snapshot.comparison_frame_sha256
+    )
+    assert (
+        first.input_snapshot.captured_audit_input_sha256
+        != second.input_snapshot.captured_audit_input_sha256
+    )
+    assert (
+        first.input_snapshot.input_snapshot_sha256
+        != second.input_snapshot.input_snapshot_sha256
+    )
+
+
+def test_base_and_engine_build_identity_do_not_change_audit_semantics(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+    first_runtime = dataclasses.replace(
+        runtime,
+        base_sha=GitCommitSha("b" * 40),
+        engine_source_revision=GitCommitSha("c" * 40),
+        engine_distribution_sha256=Sha256Digest("1" * 64),
+    )
+    second_runtime = dataclasses.replace(
+        runtime,
+        base_sha=GitCommitSha("b" * 40),
+        engine_source_revision=GitCommitSha("d" * 40),
+        engine_distribution_sha256=Sha256Digest("2" * 64),
+    )
+    different_base_runtime = dataclasses.replace(
+        runtime,
+        base_sha=GitCommitSha("e" * 40),
+        engine_source_revision=GitCommitSha("c" * 40),
+        engine_distribution_sha256=Sha256Digest("1" * 64),
+    )
+
+    first = execute_ephemeral_audit_with_trace(plan, first_runtime)
+    second = execute_ephemeral_audit_with_trace(plan, second_runtime)
+    different_base = execute_ephemeral_audit_with_trace(plan, different_base_runtime)
+
+    assert first.input_snapshot is not None
+    assert second.input_snapshot is not None
+    assert different_base.input_snapshot is not None
+    assert first.replay_recipe is not None
+    assert second.replay_recipe is not None
+    assert (
+        first.input_snapshot.audit_compatibility
+        == second.input_snapshot.audit_compatibility
+        == different_base.input_snapshot.audit_compatibility
+    )
+    assert (
+        first.input_snapshot.captured_audit_input_sha256
+        == second.input_snapshot.captured_audit_input_sha256
+        == different_base.input_snapshot.captured_audit_input_sha256
+    )
+    assert (
+        first.input_snapshot.input_snapshot_sha256
+        == second.input_snapshot.input_snapshot_sha256
+    )
+    assert first.replay_recipe.recipe_sha256 != second.replay_recipe.recipe_sha256
+    assert (
+        first.input_snapshot.input_snapshot_sha256
+        != different_base.input_snapshot.input_snapshot_sha256
+    )
 
 
 def test_shared_benchmark_table_is_recaptured_once_and_each_selector_is_revalidated(
@@ -618,6 +863,22 @@ def _with_scientific_claim(plan: EphemeralAuditPlan) -> EphemeralAuditPlan:
     return dataclasses.replace(changed, plan_id=derive_ephemeral_plan_id(changed))
 
 
+def test_public_measurement_context_factory_still_requires_canonical_claim_policy(
+    tmp_path: Path,
+) -> None:
+    from claimci.analysis.measurement import (
+        measurement_audit_context_from_materialization,
+    )
+
+    plan, _runtime, _checkout, _scratch = _plan_fixture(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="requires canonical scientific claim policy",
+    ):
+        measurement_audit_context_from_materialization(plan, (), {})
+
+
 def test_scientific_exact_head_execution_attaches_bounded_measurement_report(
     tmp_path: Path,
 ) -> None:
@@ -634,6 +895,25 @@ def test_scientific_exact_head_execution_attaches_bounded_measurement_report(
     }
     assert report.baseline_semantic_protocol_id.startswith("measurement-semantic-")
     assert report.baseline_source_snapshot_id.startswith("measurement-source-")
+    assert execution.input_snapshot is not None
+    assert execution.input_snapshot.baseline_measurement is not None
+    assert execution.input_snapshot.candidate_measurement is not None
+    assert (
+        execution.input_snapshot.baseline_measurement.semantic_protocol_id
+        == report.baseline_semantic_protocol_id
+    )
+    assert (
+        execution.input_snapshot.baseline_measurement.source_snapshot_id
+        == report.baseline_source_snapshot_id
+    )
+    assert (
+        execution.input_snapshot.candidate_measurement.semantic_protocol_id
+        == report.candidate_semantic_protocol_id
+    )
+    assert (
+        execution.input_snapshot.candidate_measurement.source_snapshot_id
+        == report.candidate_source_snapshot_id
+    )
     assert execution.trace.completeness is TraceCompleteness.COMPLETE
     assert not any(
         finding.rule_id.startswith("MEASUREMENT.")
@@ -696,8 +976,10 @@ def test_comment_only_config_change_changes_source_not_semantic_identity(
         plan_id=derive_ephemeral_plan_id(second_plan),
     )
 
-    first = execute_ephemeral_audit(first_plan, first_runtime)
-    second = execute_ephemeral_audit(second_plan, second_runtime)
+    first_execution = execute_ephemeral_audit_with_trace(first_plan, first_runtime)
+    second_execution = execute_ephemeral_audit_with_trace(second_plan, second_runtime)
+    first = first_execution.audit_result
+    second = second_execution.audit_result
 
     assert first.measurement_drift is not None
     assert second.measurement_drift is not None
@@ -710,6 +992,81 @@ def test_comment_only_config_change_changes_source_not_semantic_identity(
         != second.measurement_drift.baseline_source_snapshot_id
     )
     assert first.verdict is second.verdict
+    first_snapshot = first_execution.input_snapshot
+    second_snapshot = second_execution.input_snapshot
+    assert first_snapshot is not None
+    assert second_snapshot is not None
+    first_config = next(
+        item
+        for item in first_snapshot.artifacts
+        if item.path == RepositoryPath("configs/baseline.yaml")
+    )
+    second_config = next(
+        item
+        for item in second_snapshot.artifacts
+        if item.path == RepositoryPath("configs/baseline.yaml")
+    )
+    assert first_config.source_sha256 != second_config.source_sha256
+    assert first_config.extraction_sha256 == second_config.extraction_sha256
+    assert first_config.audit_semantics_sha256 == second_config.audit_semantics_sha256
+    assert (
+        first_snapshot.captured_audit_input_sha256
+        == second_snapshot.captured_audit_input_sha256
+    )
+    assert first_snapshot.comparison_frame_sha256 == second_snapshot.comparison_frame_sha256
+    assert first_snapshot.input_snapshot_sha256 != second_snapshot.input_snapshot_sha256
+
+
+def test_jsonl_formatting_change_changes_source_not_audit_semantics(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_plan, first_runtime, _checkout, _scratch = _plan_fixture(first_root)
+    second_plan, second_runtime, checkout, _scratch = _plan_fixture(second_root)
+    path = RepositoryPath("data/candidate-eval.jsonl")
+    content = b'{ "id" : "shared" }\n'
+    (checkout / str(path)).write_bytes(content)
+    original = next(
+        item for item in second_plan.candidate_evidence if item.artifact.path == path
+    )
+    artifact = dataclasses.replace(
+        original.artifact,
+        sha256=Sha256Digest(hashlib.sha256(content).hexdigest()),
+        size=len(content),
+    )
+    changed = extract_registered_artifact(PassiveArtifact(artifact, content))
+    assert changed is not None
+    second_plan = dataclasses.replace(
+        second_plan,
+        candidate_evidence=tuple(
+            changed if item is original else item
+            for item in second_plan.candidate_evidence
+        ),
+    )
+    second_plan = dataclasses.replace(
+        second_plan,
+        plan_id=derive_ephemeral_plan_id(second_plan),
+    )
+
+    first = execute_ephemeral_audit_with_trace(first_plan, first_runtime)
+    second = execute_ephemeral_audit_with_trace(second_plan, second_runtime)
+
+    assert first.input_snapshot is not None
+    assert second.input_snapshot is not None
+    first_dataset = next(item for item in first.input_snapshot.artifacts if item.path == path)
+    second_dataset = next(item for item in second.input_snapshot.artifacts if item.path == path)
+    assert first_dataset.source_sha256 != second_dataset.source_sha256
+    assert first_dataset.extraction_sha256 == second_dataset.extraction_sha256
+    assert first_dataset.audit_semantics_sha256 == second_dataset.audit_semantics_sha256
+    assert (
+        first.input_snapshot.captured_audit_input_sha256
+        == second.input_snapshot.captured_audit_input_sha256
+    )
+    assert first.input_snapshot.comparison_frame_sha256 == second.input_snapshot.comparison_frame_sha256
+    assert first.input_snapshot.input_snapshot_sha256 != second.input_snapshot.input_snapshot_sha256
 
 
 def test_trace_identity_does_not_depend_on_ephemeral_scratch_paths(

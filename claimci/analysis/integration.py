@@ -112,6 +112,8 @@ def run_unified_analysis(
         execution = execute_ephemeral_audit_with_trace(plan, runtime)
         audit_result = execution.audit_result
         evidence_trace = execution.trace
+        input_snapshot = execution.input_snapshot
+        replay_recipe = execution.replay_recipe
         deterministic = DeterministicAuditOutcome.from_audit_result(audit_result)
     except MaterializationPartial as error:
         if (
@@ -163,6 +165,8 @@ def run_unified_analysis(
                 unavailable_reason=_REVIEW_PARTIAL,
                 evidence_trace=evidence_trace,
                 evidence_obligations=plan.evidence_obligations,
+                verification_input_snapshot=input_snapshot,
+                replay_recipe=replay_recipe,
             )
         review_context = AnalysisReviewContext(
             claim=plan.claim,
@@ -184,6 +188,8 @@ def run_unified_analysis(
             missing_evidence=plan.missing_evidence,
             evidence_trace=evidence_trace,
             evidence_obligations=plan.evidence_obligations,
+            verification_input_snapshot=input_snapshot,
+            replay_recipe=replay_recipe,
         )
 
     try:
@@ -204,6 +210,8 @@ def run_unified_analysis(
         missing_evidence=plan.missing_evidence,
         evidence_trace=evidence_trace,
         evidence_obligations=plan.evidence_obligations,
+        verification_input_snapshot=input_snapshot,
+        replay_recipe=replay_recipe,
     )
 
 

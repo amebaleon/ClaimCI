@@ -429,6 +429,14 @@ def test_scenario_a_zero_manifest_normalized_evidence_runs_full_analysis(
     assert result.evidence_trace is not None
     assert result.evidence_trace.completeness is TraceCompleteness.COMPLETE
     assert result.evidence_trace.advisory_interpretation is not None
+    assert result.verification_input_snapshot is not None
+    assert result.replay_recipe is not None
+    assert (
+        result.replay_recipe.audit_commitment.verdict
+        is result.authoritative_verdict
+    )
+    with pytest.raises((TypeError, ValueError), match="snapshot|Replay|deterministic"):
+        dataclasses.replace(result, deterministic=None)
     assert not hasattr(result.evidence_trace.advisory_interpretation, "verdict")
     assert len(provider.calls) == 1
 
