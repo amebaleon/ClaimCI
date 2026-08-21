@@ -1588,6 +1588,7 @@ class UnifiedAnalysisResult:
             )
         if self.verification_input_snapshot is not None:
             from .replay import ReplayRecipe
+            from .trace import _stable_audit_payload_sha256
             from .verification import VerificationInputSnapshot
 
             if type(self.verification_input_snapshot) is not VerificationInputSnapshot:
@@ -1610,6 +1611,13 @@ class UnifiedAnalysisResult:
             ):
                 raise AnalysisContractError(
                     "Replay Audit commitment does not match deterministic authority"
+                )
+            if (
+                self.replay_recipe.audit_commitment.stable_audit_sha256
+                != _stable_audit_payload_sha256(self.deterministic.payload)
+            ):
+                raise AnalysisContractError(
+                    "Replay Audit commitment does not match deterministic payload"
                 )
 
         if self.state is AnalysisState.COMPLETE:

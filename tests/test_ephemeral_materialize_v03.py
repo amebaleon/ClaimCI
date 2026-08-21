@@ -22,6 +22,7 @@ from claimci.analysis import (
     ConfigValue,
     DatasetSplit,
     EvidenceTraceBundle,
+    EphemeralAuditExecution,
     TraceAuthorityClass,
     TraceCompleteness,
     TraceRecordKind,
@@ -41,6 +42,8 @@ from claimci.analysis import (
     PassiveArtifact,
     ProvenanceKind,
     RepoMapping,
+    ReplayRecipe,
+    ReplayTraceReference,
     RepositoryIdentity,
     RepositoryPath,
     RuntimeExecutionContext,
@@ -437,18 +440,39 @@ def test_traced_execution_preserves_the_exact_audit_result_and_rendering(
     )
     assert traced.replay_recipe.experiment_replay_supported is False
     assert str(traced.input_snapshot.captured_audit_input_sha256) == (
-        "40f2cb5ccb6fe56af5701141da55c32ab083af67453d30fd848e3ce0f343fd88"
+        "cf8a27cd116a717545cb9ad4d8189658ae1b217b06c3dfc4200c6a185da87f43"
     )
     assert str(traced.input_snapshot.comparison_frame_sha256) == (
-        "b71b11c8643f5026cf221dcad41b92bc91c8ff696c301f3b05b042838df32cdc"
+        "e4b3ee62722df96b135fe6b49d5f802a5652695596b513933fae6bb097eff702"
     )
     assert str(traced.input_snapshot.input_snapshot_sha256) == (
-        "fa91cc01b449fb8f20ca88e4e66b2cbe89df9c94419a3427914e997c268d25c7"
+        "8acd32c732666c3038580f9279075c07eb04610c5a6b6bf10789b9b4d67e155d"
     )
     assert str(traced.replay_recipe.recipe_sha256) == (
-        "1a1038aa9055d82c7e3e565be5c4fa03616d5b825fdf27d155a1bbc26e4b0b40"
+        "1fc5790bd515d7df17dcdde609f1097cbdd6c5c3753d401df6deba0c3a99fa43"
     )
     assert not tuple(scratch.iterdir())
+
+    alternate_trace = EvidenceTraceBundle.unavailable(
+        head_sha=HEAD_SHA,
+        result=traced.audit_result,
+    )
+    alternate_recipe = ReplayRecipe.from_execution(
+        input_snapshot=traced.input_snapshot,
+        engine_provenance=traced.replay_recipe.engine_provenance,
+        audit_commitment=traced.replay_recipe.audit_commitment,
+        trace_reference=ReplayTraceReference.from_trace(
+            alternate_trace,
+            traced.replay_recipe.audit_commitment,
+        ),
+    )
+    with pytest.raises(ValueError, match="trace"):
+        EphemeralAuditExecution(
+            traced.audit_result,
+            traced.trace,
+            traced.input_snapshot,
+            alternate_recipe,
+        )
 
 
 def test_snapshot_is_built_before_audit_and_over_bound_reduces_to_identity_only(

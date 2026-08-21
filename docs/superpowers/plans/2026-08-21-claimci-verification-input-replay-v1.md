@@ -121,8 +121,8 @@
 **Files:**
 - Review every changed file; modify only if a confirmed in-scope defect has a RED regression.
 
-- [ ] Freeze the exact base/head diff and run the scoped security-diff workflow.
-- [ ] Validate factory-only authority, canonical digest separation, path/selector confinement, no execution surface, no provider trust elevation, and bounded projections.
+- [x] Freeze the exact base/head diff and run the scoped security-diff workflow.
+- [x] Validate factory-only authority, canonical digest separation, path/selector confinement, no execution surface, no provider trust elevation, and bounded projections.
 - [x] Re-run the complete verification gate after any review fix.
 - [x] Inspect `git status`, `git diff`, and `git diff --check`.
 - [ ] Commit focused implementation changes, push `codex/verification-input-replay-v1`, and open a Draft PR against `codex/benchmark-evidence-profile-v0`.

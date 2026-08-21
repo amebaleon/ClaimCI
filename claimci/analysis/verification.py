@@ -43,6 +43,8 @@ from .claim_types import claim_semantic_projection
 from .obligations import EvidenceObligationBundle
 from .profiles import (
     _BENCHMARK_PROFILE_FIELDS,
+    _canonical_profile_scalar,
+    BenchmarkResultForm,
     EvidenceProfileId,
     EvidenceProfileSelection,
 )
@@ -690,42 +692,74 @@ def _artifact_semantic_projections(
     *,
     metric: str,
     benchmark_profile: bool,
+    benchmark_result_form: BenchmarkResultForm | None = None,
 ) -> tuple[object, object, str]:
+    if benchmark_profile:
+        if type(benchmark_result_form) is not BenchmarkResultForm:
+            raise TypeError("Benchmark semantics require a fixed result form")
+    elif benchmark_result_form is not None:
+        raise TypeError("Training semantics cannot carry a Benchmark result form")
     extraction = _normalized_extraction_projection(evidence)
     if binding.kind is ArtifactKind.DATASET:
         semantics = _dataset_hash_projection(passive.content)
         return extraction, semantics, "claimci.projector.dataset-jsonl.v1"
-    configs = tuple(
-        sorted(
-            (value.key, value.value)
-            for observation in evidence.observations
-            for value in observation.config_values
-            if not benchmark_profile
-            or value.key in _BENCHMARK_PROFILE_FIELDS
-        )
-    )
-    metrics = tuple(
-        sorted(
-            (
-                {
-                    "metric_name": observation.metric_name,
-                    "metric_value": observation.metric_value,
-                    "seed": (
-                        observation.seed
-                        if isinstance(observation.seed, int)
-                        and not isinstance(observation.seed, bool)
-                        else None
-                    ),
-                }
+    if benchmark_profile:
+        benchmark_configs: dict[str, object] = {}
+        benchmark_config_encodings: dict[str, bytes] = {}
+        for observation in evidence.observations:
+            for value in observation.config_values:
+                if value.key not in _BENCHMARK_PROFILE_FIELDS:
+                    continue
+                recovered = _canonical_profile_scalar(value.key, value.value)
+                encoded = _canonical_json_bytes(recovered)
+                previous = benchmark_config_encodings.get(value.key)
+                if previous is not None and previous != encoded:
+                    raise AnalysisContractError(
+                        "verification Benchmark config values conflict"
+                    )
+                benchmark_configs[value.key] = recovered
+                benchmark_config_encodings[value.key] = encoded
+        configs = tuple(sorted(benchmark_configs.items()))
+    else:
+        configs = tuple(
+            sorted(
+                (value.key, value.value)
                 for observation in evidence.observations
-                if observation.metric_name is not None
-                and (benchmark_profile or observation.metric_name == metric)
-            ),
-            key=_canonical_json_bytes,
+                for value in observation.config_values
+            )
         )
-    )
+    metric_values: list[dict[str, object]] = []
+    represented_metric_mismatches: set[str] = set()
+    for observation in evidence.observations:
+        if observation.metric_name is None:
+            continue
+        if observation.metric_name != metric:
+            if benchmark_profile:
+                represented_metric_mismatches.add(observation.metric_name)
+            continue
+        represented: dict[str, object] = {
+            "metric_name": observation.metric_name,
+            "metric_value": observation.metric_value,
+        }
+        if (
+            not benchmark_profile
+            or benchmark_result_form is BenchmarkResultForm.RAW_RUN_SERIES
+        ):
+            represented["seed"] = (
+                observation.seed
+                if isinstance(observation.seed, int)
+                and not isinstance(observation.seed, bool)
+                else None
+            )
+        metric_values.append(represented)
+    metrics = tuple(sorted(metric_values, key=_canonical_json_bytes))
     if binding.kind in {ArtifactKind.RESULTS, ArtifactKind.BENCHMARK}:
-        semantics = {"metric_observations": metrics, "profile_config": configs}
+        semantics = {"metric_observations": metrics}
+        if benchmark_profile:
+            semantics["profile_config"] = configs
+            semantics["represented_metric_mismatches"] = tuple(
+                sorted(represented_metric_mismatches)
+            )
         version = (
             "claimci.projector.benchmark-evidence.v1"
             if benchmark_profile
@@ -921,6 +955,11 @@ def build_verification_input_snapshot(
         plan.profiled_policy is not None
         and plan.profiled_policy.profile_id is EvidenceProfileId.BENCHMARK_MEASUREMENT_V0
     )
+    benchmark_result_form = (
+        None
+        if not benchmark
+        else plan.profiled_policy.profile_selection.result_form
+    )
     artifacts: list[VerificationArtifactIdentity] = []
     frame_by_id: dict[str, Sha256Digest] = {}
     for evidence, binding in sorted(
@@ -941,6 +980,7 @@ def build_verification_input_snapshot(
             passive,
             metric=plan.audit_claim.metric,
             benchmark_profile=benchmark,
+            benchmark_result_form=benchmark_result_form,
         )
         artifact = _artifact_identity_from_materialized(
             evidence=evidence,

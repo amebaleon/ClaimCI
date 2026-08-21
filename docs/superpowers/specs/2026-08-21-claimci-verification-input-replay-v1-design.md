@@ -90,8 +90,12 @@ consume them.
 Training config semantics contain the exact generated scalar mapping consumed
 by config checks. Training dataset semantics contain canonical JSONL record
 hashes with counts, so formatting-only JSON changes do not alter Audit
-semantics. Benchmark semantics contain the exact selector-scoped observations
-and structured components consumed by `audit_benchmark()`.
+semantics. Benchmark result semantics contain claim-metric values, integer
+seeds only for raw-run-series policy, represented non-claim metric names
+without their ignored values, and canonical deduplicated profile components.
+They therefore commit the exact selector-scoped fields consumed by the
+selected `audit_benchmark()` result form without treating ignored observation
+metadata as Audit semantics.
 
 ## Claim, mapping, profile, and obligation identities
 
@@ -235,10 +239,14 @@ These values describe the build and do not feed Audit-semantic compatibility.
 and sorted applied rule IDs. It reuses the established stable Audit projection
 that removes invocation-private scratch paths.
 
-`ReplayTraceReference` commits the exact Evidence Trace canonical bytes,
-version, completeness, reason/omission identity, head, and deterministic Audit
-digest. Its factory rejects a trace whose deterministic authority does not
-match the Replay Audit commitment.
+`ReplayTraceReference` commits the exact deterministic Evidence Trace canonical
+bytes produced by materialization before any later advisory Review attachment,
+plus version, completeness, reason/omission identity, head, and deterministic
+Audit digest. Its factory rejects a trace whose deterministic authority does
+not match the Replay Audit commitment. `EphemeralAuditExecution` also rejects
+a recipe that references a different same-head trace. A later unified result
+may expose the trace augmented with advisory metadata or a trace-only fallback;
+that does not rewrite the already committed deterministic Replay reference.
 
 `ReplayRecipe` contains the input snapshot, engine provenance, actual Audit
 commitment, and Trace reference. `recipe_sha256` commits those identities and

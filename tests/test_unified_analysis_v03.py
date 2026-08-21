@@ -21,6 +21,7 @@ from claimci.analysis import (
     EvidenceObligationState,
     EvidenceSelector,
     EvidenceTraceBundle,
+    DeterministicAuditOutcome,
     ExperimentRole,
     FieldMapping,
     GitCommitSha,
@@ -44,7 +45,7 @@ from claimci.analysis import (
 from claimci.analysis.adapters import extract_registered_artifact
 from claimci.analysis.materialize import MaterializationPartial
 from claimci.audit import audit_research
-from claimci.models import Verdict
+from claimci.models import AuditResult, Verdict
 from claimci.report import render_json
 from claimci.review import ProviderUsage, ReviewConfig
 from claimci.review.provider import ProviderResponse, StructuredRequest
@@ -437,6 +438,17 @@ def test_scenario_a_zero_manifest_normalized_evidence_runs_full_analysis(
     )
     with pytest.raises((TypeError, ValueError), match="snapshot|Replay|deterministic"):
         dataclasses.replace(result, deterministic=None)
+    different_same_verdict = DeterministicAuditOutcome.from_audit_result(
+        AuditResult(
+            verdict=Verdict.NOT_SUPPORTED,
+            findings=(),
+            manifest_path=Path("different/research.yaml"),
+            metric="accuracy",
+            minimum_improvement=0.05,
+        )
+    )
+    with pytest.raises(ValueError, match="commitment"):
+        dataclasses.replace(result, deterministic=different_same_verdict)
     assert not hasattr(result.evidence_trace.advisory_interpretation, "verdict")
     assert len(provider.calls) == 1
 

@@ -13,6 +13,7 @@ from claimci.analysis import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    BenchmarkResultForm,
     Confidence,
     ConfigValue,
     DatasetSplit,
@@ -230,9 +231,110 @@ def test_benchmark_audit_semantics_exclude_unconsumed_profile_keys() -> None:
         passive,
         metric="accuracy",
         benchmark_profile=True,
+        benchmark_result_form=BenchmarkResultForm.RAW_RUN_SERIES,
     )
 
     assert semantics["profile_config"] == ()
+
+
+def test_training_result_semantics_exclude_config_values_not_consumed_by_audit() -> None:
+    passive = _passive_result()
+    evidence, binding = _bound_result(passive)
+    provenance = evidence.observations[0].provenance
+    evidence = dataclasses.replace(
+        evidence,
+        observations=(
+            dataclasses.replace(
+                evidence.observations[0],
+                config_values=(ConfigValue("model.hidden", "ignored", provenance),),
+            ),
+        ),
+    )
+
+    _extraction, semantics, _version = _artifact_semantic_projections(
+        evidence,
+        binding,
+        passive,
+        metric="accuracy",
+        benchmark_profile=False,
+    )
+
+    assert semantics == {
+        "metric_observations": (
+            {"metric_name": "accuracy", "metric_value": 0.8, "seed": 1},
+        ),
+    }
+
+
+def test_reported_benchmark_result_semantics_exclude_unconsumed_seed() -> None:
+    passive = _passive_result()
+    first, binding = _bound_result(passive)
+    second = dataclasses.replace(
+        first,
+        observations=(dataclasses.replace(first.observations[0], seed=999),),
+    )
+
+    projections = tuple(
+        _artifact_semantic_projections(
+            evidence,
+            binding,
+            passive,
+            metric="accuracy",
+            benchmark_profile=True,
+            benchmark_result_form=BenchmarkResultForm.REPORTED_AGGREGATE,
+        )[1]
+        for evidence in (first, second)
+    )
+
+    assert projections[0] == projections[1]
+    assert "seed" not in projections[0]["metric_observations"][0]
+
+
+def test_benchmark_result_semantics_commit_only_values_for_the_claim_metric() -> None:
+    passive = _passive_result()
+    first, binding = _bound_result(passive)
+    provenance = first.observations[0].provenance
+    first = dataclasses.replace(
+        first,
+        observations=(
+            first.observations[0],
+            NormalizedObservation(
+                metric_name="loss",
+                metric_value=0.4,
+                run_id="loss-run",
+                seed=7,
+                experiment_role=ExperimentRole.BASELINE,
+                provenance=provenance,
+            ),
+        ),
+    )
+    second = dataclasses.replace(
+        first,
+        observations=(
+            first.observations[0],
+            dataclasses.replace(
+                first.observations[1],
+                metric_value=999.0,
+                run_id="changed-loss-run",
+                seed=999,
+            ),
+        ),
+    )
+
+    projections = tuple(
+        _artifact_semantic_projections(
+            evidence,
+            binding,
+            passive,
+            metric="accuracy",
+            benchmark_profile=True,
+            benchmark_result_form=BenchmarkResultForm.RAW_RUN_SERIES,
+        )[1]
+        for evidence in (first, second)
+    )
+
+    assert projections[0] == projections[1]
+    assert projections[0]["represented_metric_mismatches"] == ("loss",)
 
 
 def test_replay_audit_commitment_requires_an_actual_audit_result() -> None:

@@ -633,12 +633,54 @@ def stable_audit_projection(result: AuditResult) -> dict[str, object]:
     rendered = json.loads(render_json(result))
     if not isinstance(rendered, dict):
         raise TraceContractError("Audit rendering must be a JSON object")
-    manifest = result.manifest_path
+    return _stable_audit_payload_projection(rendered)
+
+
+def _stable_audit_payload_projection(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Normalize one immutable deterministic payload like its real AuditResult."""
+
+    def detach(value: object) -> object:
+        if value is None or type(value) in {str, bool, int, float}:
+            return value
+        if isinstance(value, Mapping):
+            if not all(type(key) is str for key in value):
+                raise TraceContractError(
+                    "deterministic Audit payload keys must be text"
+                )
+            return {key: detach(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [detach(item) for item in value]
+        raise TraceContractError(
+            "deterministic Audit payload contains an unsupported value"
+        )
+
+    rendered = detach(payload)
+    if not isinstance(rendered, dict):
+        raise TraceContractError("deterministic Audit payload must be a mapping")
+    manifest_value = rendered.get("manifest")
+    if not isinstance(manifest_value, str):
+        raise TraceContractError("deterministic Audit payload lost its manifest path")
+    manifest = Path(manifest_value)
     root = manifest.parent if manifest.is_absolute() else None
     projected = _replace_ephemeral_paths(rendered, root)
     if not isinstance(projected, dict):
         raise TraceContractError("stable Audit projection must be a mapping")
     return projected
+
+
+def _stable_audit_payload_sha256(
+    payload: Mapping[str, object],
+) -> Sha256Digest:
+    encoded = json.dumps(
+        _stable_audit_payload_projection(payload),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return Sha256Digest(hashlib.sha256(encoded).hexdigest())
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -916,7 +958,11 @@ class EphemeralAuditExecution:
                 "ephemeral replay companions must appear together"
             )
         if self.input_snapshot is not None:
-            from .replay import ReplayAuditCommitment, ReplayRecipe
+            from .replay import (
+                ReplayAuditCommitment,
+                ReplayRecipe,
+                ReplayTraceReference,
+            )
             from .verification import VerificationInputSnapshot
 
             if type(self.input_snapshot) is not VerificationInputSnapshot:
@@ -934,6 +980,13 @@ class EphemeralAuditExecution:
             ):
                 raise TraceContractError(
                     "ephemeral Replay recipe does not match its AuditResult"
+                )
+            if self.replay_recipe.trace_reference != ReplayTraceReference.from_trace(
+                self.trace,
+                self.replay_recipe.audit_commitment,
+            ):
+                raise TraceContractError(
+                    "ephemeral Replay recipe does not match its evidence trace"
                 )
 
 
