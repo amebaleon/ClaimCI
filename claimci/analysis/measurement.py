@@ -159,19 +159,15 @@ def _measurement_source_selector(mapping: FieldMapping) -> MeasurementSourceSele
     )
 
 
-def measurement_audit_context_from_materialization(
+def _measurement_context_from_materialization(
     plan: EphemeralAuditPlan,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
     captured: Mapping[str, PassiveArtifact],
 ) -> MeasurementAuditContext:
-    """Commit exact passive bindings after runtime revalidation, before Audit."""
+    """Commit exact passive bindings after runtime revalidation."""
 
     if type(plan) is not EphemeralAuditPlan:
         raise TypeError("measurement source context requires EphemeralAuditPlan")
-    if plan.scientific_claim is None or plan.claim_policy is None:
-        raise AnalysisContractError(
-            "measurement source context requires canonical scientific claim policy"
-        )
     if (
         not isinstance(bound, tuple)
         or not bound
@@ -246,6 +242,32 @@ def measurement_audit_context_from_materialization(
         ),
         policy_id=policy_id,
     )
+
+
+def measurement_audit_context_from_materialization(
+    plan: EphemeralAuditPlan,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, PassiveArtifact],
+) -> MeasurementAuditContext:
+    """Commit canonical-claim measurement inputs before deterministic Audit."""
+
+    if type(plan) is not EphemeralAuditPlan:
+        raise TypeError("measurement source context requires EphemeralAuditPlan")
+    if plan.scientific_claim is None or plan.claim_policy is None:
+        raise AnalysisContractError(
+            "measurement source context requires canonical scientific claim policy"
+        )
+    return _measurement_context_from_materialization(plan, bound, captured)
+
+
+def _verification_measurement_context_from_materialization(
+    plan: EphemeralAuditPlan,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, PassiveArtifact],
+) -> MeasurementAuditContext:
+    """Commit legacy source identity solely for the Replay snapshot companion."""
+
+    return _measurement_context_from_materialization(plan, bound, captured)
 
 
 __all__ = [

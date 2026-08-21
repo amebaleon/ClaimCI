@@ -1488,6 +1488,8 @@ class UnifiedAnalysisResult:
     missing_evidence: tuple[MissingEvidence, ...] = ()
     evidence_trace: "EvidenceTraceBundle | None" = None
     evidence_obligations: "EvidenceObligationBundle | None" = None
+    verification_input_snapshot: "VerificationInputSnapshot | None" = None
+    replay_recipe: "ReplayRecipe | None" = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("UnifiedAnalysisResult is final to preserve authority")
@@ -1579,6 +1581,43 @@ class UnifiedAnalysisResult:
             if self.state is AnalysisState.UNAVAILABLE:
                 raise AnalysisContractError(
                     "operationally unavailable analysis cannot carry evidence obligations"
+                )
+        if (self.verification_input_snapshot is None) != (self.replay_recipe is None):
+            raise AnalysisContractError(
+                "verification snapshot and Replay recipe must appear together"
+            )
+        if self.verification_input_snapshot is not None:
+            from .replay import ReplayRecipe
+            from .trace import _stable_audit_payload_sha256
+            from .verification import VerificationInputSnapshot
+
+            if type(self.verification_input_snapshot) is not VerificationInputSnapshot:
+                raise TypeError(
+                    "verification_input_snapshot must be VerificationInputSnapshot"
+                )
+            if type(self.replay_recipe) is not ReplayRecipe:
+                raise TypeError("replay_recipe must be ReplayRecipe")
+            if self.deterministic is None:
+                raise AnalysisContractError(
+                    "verification Replay companions require deterministic authority"
+                )
+            if self.replay_recipe.input_snapshot != self.verification_input_snapshot:
+                raise AnalysisContractError(
+                    "Replay recipe input does not match the verification snapshot"
+                )
+            if (
+                self.replay_recipe.audit_commitment.verdict
+                is not self.deterministic.verdict
+            ):
+                raise AnalysisContractError(
+                    "Replay Audit commitment does not match deterministic authority"
+                )
+            if (
+                self.replay_recipe.audit_commitment.stable_audit_sha256
+                != _stable_audit_payload_sha256(self.deterministic.payload)
+            ):
+                raise AnalysisContractError(
+                    "Replay Audit commitment does not match deterministic payload"
                 )
 
         if self.state is AnalysisState.COMPLETE:

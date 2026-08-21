@@ -2049,7 +2049,47 @@ def test_benchmark_materialization_recaptures_one_table_and_emits_complete_trace
         execution.audit_result.measurement_drift.baseline_source_snapshot_id
         != execution.audit_result.measurement_drift.candidate_source_snapshot_id
     )
+    assert execution.input_snapshot is not None
+    assert execution.input_snapshot.baseline_measurement is not None
+    assert execution.input_snapshot.candidate_measurement is not None
+    assert (
+        execution.input_snapshot.baseline_measurement.semantic_protocol_id
+        == execution.audit_result.measurement_drift.baseline_semantic_protocol_id
+    )
+    assert (
+        execution.input_snapshot.baseline_measurement.source_snapshot_id
+        == execution.audit_result.measurement_drift.baseline_source_snapshot_id
+    )
+    assert (
+        execution.input_snapshot.candidate_measurement.semantic_protocol_id
+        == execution.audit_result.measurement_drift.candidate_semantic_protocol_id
+    )
+    assert (
+        execution.input_snapshot.candidate_measurement.source_snapshot_id
+        == execution.audit_result.measurement_drift.candidate_source_snapshot_id
+    )
     assert execution.trace.completeness is TraceCompleteness.COMPLETE
+    assert execution.input_snapshot.profile_identity is not None
+    assert (
+        execution.input_snapshot.profile_identity.selection_id
+        == plan.profiled_policy.profile_selection.selection_id
+    )
+    assert execution.input_snapshot.obligation_identity is not None
+    assert (
+        execution.input_snapshot.obligation_identity.policy_id
+        == plan.evidence_obligations.policy_id
+    )
+    scoped = tuple(
+        item
+        for item in execution.input_snapshot.artifacts
+        if item.path == artifact.path
+    )
+    assert len(scoped) == 2
+    assert scoped[0].source_sha256 == scoped[1].source_sha256
+    assert scoped[0].verification_evidence_id != scoped[1].verification_evidence_id
+    assert scoped[0].selectors != scoped[1].selectors
+    assert scoped[0].audit_semantics_sha256 != scoped[1].audit_semantics_sha256
+    assert execution.replay_recipe is not None
     assert captures == [artifact.path]
     assert any(
         entry.detail_code == "benchmark.selected_measurement_values"
