@@ -54,9 +54,13 @@ The comparison is conservative and evaluates independent identity layers:
    and exact-byte identities;
 9. relocation candidates for a previous path that disappeared.
 
-Head and base SHA changes alone are ignored. Replay engine package version,
-source revision, and distribution digest are intentionally excluded; fixed
-`AuditSemanticsCompatibility` is the comparison boundary for Core behavior.
+Head and base SHA changes alone are ignored when all represented input
+identities, including measurement source snapshot references, remain equal.
+An opaque measurement source snapshot change is retained as provenance/source
+change even when the head also changed; v1 does not guess that the head was its
+only cause. Replay engine package version, source revision, and distribution
+digest are intentionally excluded; fixed `AuditSemanticsCompatibility` is the
+comparison boundary for Core behavior.
 
 ## Artifact comparison
 
@@ -118,8 +122,9 @@ establish equivalence.
 - no prior Replay recipe is `LEGACY_UNAVAILABLE` with
   `SUPPLY_PROVENANCE`.
 
-State precedence is material change, indeterminate, relocation, byte-only
-change, then fresh. Legacy absence is handled before comparison.
+Legacy absence and incomplete required semantic coverage are gates. Once both
+snapshots are complete, state precedence is material change, indeterminate,
+relocation, byte-only change, then fresh.
 
 ## Integration boundary
 
