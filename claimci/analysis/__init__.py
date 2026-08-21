@@ -194,6 +194,15 @@ from .replay import (
     ReplayTraceReference,
     replay_recipe_json_bytes,
 )
+from .regression import (
+    ExecutionClassification,
+    HistoricalAnalysisOutcome,
+    OutcomeComparability,
+    RegressionClassification,
+    VerdictRegressionReport,
+    VerdictTransitionKind,
+    classify_verdict_regression,
+)
 
 if TYPE_CHECKING:
     from claimci.review.models import ReviewConfig
@@ -277,6 +286,7 @@ __all__ = [
     "EvidenceTraceEntry",
     "EvaluationConstraint",
     "EvaluationConstraintKind",
+    "ExecutionClassification",
     "ExperimentRole",
     "FieldMapping",
     "FieldProvenance",
@@ -301,6 +311,7 @@ __all__ = [
     "MissingEvidence",
     "NormalizedEvidence",
     "NormalizedObservation",
+    "HistoricalAnalysisOutcome",
     "ObligationSupportReference",
     "ObligationTarget",
     "assess_evidence_obligations",
@@ -318,6 +329,8 @@ __all__ = [
     "PrimaryClaimKind",
     "PrimaryScientificClaim",
     "ProvenanceKind",
+    "OutcomeComparability",
+    "RegressionClassification",
     "RepoMapping",
     "REPLAY_RECIPE_VERSION",
     "ReplayAuditCommitment",
@@ -352,6 +365,8 @@ __all__ = [
     "VerificationSelectorIdentity",
     "VerificationSnapshotCapability",
     "VerificationTablePredicateIdentity",
+    "VerdictRegressionReport",
+    "VerdictTransitionKind",
     "UpstreamAggregationProcedure",
     "UpstreamProcedureRequirement",
     "UnsupportedDeterministicClaimCompiler",
@@ -365,6 +380,7 @@ __all__ = [
     "legacy_missing_evidence",
     "profile_evidence_target",
     "claim_semantic_projection",
+    "classify_verdict_regression",
     "compile_audit_claim",
     "derive_ephemeral_plan_id",
     "execute_ephemeral_audit",
