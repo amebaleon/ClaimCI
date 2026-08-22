@@ -41,6 +41,13 @@ _MINIMUM = re.compile(
     rf"(?:\s*(?P<unit>%|percentage\s+points?|points?))?(?![A-Za-z])",
     flags=re.IGNORECASE,
 )
+_MINIMUM_CONTINUATION = re.compile(
+    rf"^\s*(?P<verb>improved|increased|rose|grew|decreased|fell|dropped|reduced)"
+    rf"\s+by\s+(?:at\s+least|minimum(?:\s+of)?|>=|no\s+less\s+than)\s*"
+    rf"(?P<value>{_NUMBER})"
+    rf"(?:\s*(?P<unit>%|percentage\s+points?|points?))?\s*\.?\s*$",
+    flags=re.IGNORECASE,
+)
 _ABSOLUTE_METRIC = re.compile(
     rf"\b(?P<role>baseline|candidate)\s+"
     rf"(?P<metric>[A-Za-z][A-Za-z0-9_.-]{{0,63}})\s+"
@@ -390,6 +397,14 @@ def _only_separators(value: str) -> bool:
     return not any(character.isalnum() or character == "_" for character in value)
 
 
+def _verb_direction(verb: str) -> Direction:
+    return (
+        Direction.LOWER
+        if verb.casefold() in {"decreased", "fell", "dropped", "reduced"}
+        else Direction.HIGHER
+    )
+
+
 def _recover_primary(
     text: str,
     provenance: FieldProvenance,
@@ -398,12 +413,25 @@ def _recover_primary(
     if len(improvements) == 1:
         improvement = improvements[0]
         tail = text[improvement.start() :]
+        continuation_threshold: re.Match[str] | None = None
         boundary = _CLAUSE_BOUNDARY.search(tail)
         if boundary is not None:
+            if boundary.group(0) == ";":
+                candidate = _MINIMUM_CONTINUATION.fullmatch(
+                    tail[boundary.end() :]
+                )
+                if (
+                    candidate is not None
+                    and _verb_direction(candidate.group("verb"))
+                    is _verb_direction(improvement.group("verb"))
+                ):
+                    continuation_threshold = candidate
             tail = tail[: boundary.start()]
         pairs = tuple(_VALUE_PAIR.finditer(tail))
         thresholds = tuple(_MINIMUM.finditer(tail))
-        if len(pairs) > 1 or len(thresholds) > 1:
+        if len(pairs) > 1 or len(thresholds) + int(
+            continuation_threshold is not None
+        ) > 1:
             return None
         improvement_end = improvement.end() - improvement.start()
         pair = pairs[0] if pairs else None
@@ -411,18 +439,13 @@ def _recover_primary(
             tail[improvement_end : pair.start()]
         ):
             pair = None
-        threshold = thresholds[0] if thresholds else None
+        threshold = thresholds[0] if thresholds else continuation_threshold
         threshold_anchor = improvement_end if pair is None else pair.end()
-        if threshold is not None and not _only_separators(
+        if thresholds and not _only_separators(
             tail[threshold_anchor : threshold.start()]
         ):
             threshold = None
-        verb = improvement.group("verb").casefold()
-        direction = (
-            Direction.LOWER
-            if verb in {"decreased", "fell", "dropped", "reduced"}
-            else Direction.HIGHER
-        )
+        direction = _verb_direction(improvement.group("verb"))
         baseline = candidate = None
         if pair is not None:
             baseline = _paired_quantity(pair, "baseline", provenance)

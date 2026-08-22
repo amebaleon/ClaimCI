@@ -146,6 +146,109 @@ def test_metric_compiler_recovers_only_source_bound_fields() -> None:
     assert tuple(item.value for item in audit.claimed_values) == (0.40, 0.20)
 
 
+@pytest.mark.parametrize(
+    "text,expected_threshold",
+    [
+        (
+            "accuracy improved from 0.60 to 0.70; improved by at least 0.05",
+            0.05,
+        ),
+        (
+            "f1 improved from 0.50 to 0.70; improved by at least 0.10",
+            0.10,
+        ),
+        (
+            "precision improved from 0.50 to 0.65; improved by at least 0.10",
+            0.10,
+        ),
+        (
+            "auc improved from 0.60 to 0.75; improved by at least 0.10",
+            0.10,
+        ),
+        (
+            "recall improved from 0.55 to 0.70; improved by at least 0.10",
+            0.10,
+        ),
+    ],
+)
+def test_frozen_metric_e2e_titles_recover_explicit_continuation_threshold(
+    text: str,
+    expected_threshold: float,
+) -> None:
+    claim = recover_scientific_claim(_reference(text))
+
+    assert claim is not None
+    audit = compile_audit_claim(claim)
+    assert audit.minimum_absolute_improvement == expected_threshold
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Accuracy improved from 0.60 to 0.70.",
+        "Accuracy improved from 0.60 to 0.70; improved substantially.",
+        "Accuracy improved from 0.60 to 0.70; decreased by at least 0.10.",
+        "Accuracy improved from 0.60 to 0.70; improved by at least 0.05 or 0.10.",
+        "Accuracy improved from 0.60 to 0.70; loss improved by at least 0.10.",
+    ],
+)
+def test_metric_compiler_does_not_invent_or_borrow_a_continuation_threshold(
+    text: str,
+) -> None:
+    claim = recover_scientific_claim(_reference(text))
+
+    if claim is not None:
+        assert compile_audit_claim(claim).minimum_absolute_improvement is None
+
+
+def test_metric_compiler_does_not_choose_an_ambiguous_continuation_threshold() -> None:
+    claim = recover_scientific_claim(
+        _reference(
+            "Accuracy improved from 0.60 to 0.70; "
+            "improved by at least 0.10 or 10%."
+        )
+    )
+
+    assert claim is not None
+    assert compile_audit_claim(claim).minimum_absolute_improvement is None
+
+
+def test_relative_percentage_is_not_conflated_with_absolute_metric_delta() -> None:
+    absolute = recover_scientific_claim(
+        _reference(
+            "Accuracy improved from 0.60 to 0.70; improved by at least 0.10."
+        )
+    )
+    relative = recover_scientific_claim(
+        _reference(
+            "Accuracy improved from 60% to 70%; improved by at least 10%."
+        )
+    )
+    percentage_points = recover_scientific_claim(
+        _reference(
+            "Accuracy improved from 60% to 70%; "
+            "improved by at least 10 percentage points."
+        )
+    )
+
+    assert absolute is not None
+    assert absolute.primary.minimum_improvement is not None
+    assert absolute.primary.minimum_improvement.unit is None
+    assert compile_audit_claim(absolute).minimum_absolute_improvement == 0.10
+    assert relative is not None
+    assert relative.primary.minimum_improvement is not None
+    assert relative.primary.minimum_improvement.unit == "%"
+    assert percentage_points is not None
+    assert percentage_points.primary.minimum_improvement is not None
+    assert percentage_points.primary.minimum_improvement.unit == "percentage points"
+    for claim in (relative, percentage_points):
+        with pytest.raises(
+            UnsupportedDeterministicClaimCompiler,
+            match="^unsupported_deterministic_claim_compiler$",
+        ):
+            compile_audit_claim(claim)
+
+
 def test_metric_compiler_does_not_borrow_unrelated_values_or_thresholds() -> None:
     claim = recover_scientific_claim(
         _reference(
