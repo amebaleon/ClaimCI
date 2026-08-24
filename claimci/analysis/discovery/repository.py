@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from claimci.analysis.contracts import RepositoryPath, Sha256Digest
-from claimci.passive_files import PassiveFileError, capture_confined_regular_file
+from claimci.passive_files import (
+    PassiveFileError,
+    capture_confined_regular_file,
+    inspect_confined_regular_file,
+)
 from claimci.review.models import ReviewError, ReviewLimits, SourceBundle
 from claimci.review.sources import collect_review_sources
 
@@ -45,6 +49,25 @@ class ChangeComparisonBudget:
             remaining_files=limits.max_change_comparison_files,
             remaining_bytes=limits.max_change_comparison_bytes,
         )
+
+
+@dataclass(slots=True)
+class ArtifactInspectionBudget:
+    """Aggregate integrity-I/O allowance for streamed discovery artifacts."""
+
+    remaining_bytes: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.remaining_bytes, bool) or not isinstance(
+            self.remaining_bytes, int
+        ):
+            raise TypeError("artifact inspection budget must be an integer")
+        if self.remaining_bytes < 0:
+            raise DiscoveryError("artifact inspection budget cannot be negative")
+
+    @classmethod
+    def from_limits(cls, limits: DiscoveryLimits) -> ArtifactInspectionBudget:
+        return cls(remaining_bytes=limits.max_stream_total_bytes)
 
 
 def _resolved_root(raw: Path, label: str) -> Path:
@@ -118,6 +141,7 @@ def inspect_artifact(
     path: RepositoryPath,
     *,
     limits: DiscoveryLimits,
+    budget: ArtifactInspectionBudget | None = None,
 ) -> InspectedArtifact | ArtifactIssue:
     """Inspect one issued passive artifact without interpreting its content."""
 
@@ -125,6 +149,8 @@ def inspect_artifact(
         raise TypeError("repository context must be RepositoryContext")
     if not isinstance(limits, DiscoveryLimits):
         raise TypeError("discovery limits must be DiscoveryLimits")
+    if budget is not None and not isinstance(budget, ArtifactInspectionBudget):
+        raise TypeError("budget must be ArtifactInspectionBudget or null")
     if not isinstance(path, RepositoryPath):
         try:
             path = RepositoryPath(path)
@@ -135,18 +161,46 @@ def inspect_artifact(
     resolved = _confined_regular_file(context.head_root, path)
     if resolved is None:
         return ArtifactIssue(path, "artifact is not a confined regular file")
+    streamable = PurePosixPath(str(path)).suffix.casefold() in {
+        ".jsonl",
+        ".csv",
+        ".tsv",
+    }
+    discovery_bound = limits.max_artifact_bytes
     try:
-        capture = capture_confined_regular_file(
-            context.head_root,
-            str(path),
-            max_bytes=limits.max_artifact_bytes,
-        )
+        observed_size = resolved.stat().st_size
+        if observed_size > limits.max_artifact_bytes and streamable:
+            if budget is not None and observed_size > budget.remaining_bytes:
+                return ArtifactIssue(
+                    path,
+                    "artifact exceeds the streaming discovery work budget",
+                )
+            capture = inspect_confined_regular_file(
+                context.head_root,
+                str(path),
+                max_bytes=limits.max_stream_artifact_bytes,
+            )
+            discovery_bound = limits.max_stream_artifact_bytes
+            if budget is not None:
+                budget.remaining_bytes -= capture.size
+        else:
+            capture = capture_confined_regular_file(
+                context.head_root,
+                str(path),
+                max_bytes=limits.max_artifact_bytes,
+            )
+            discovery_bound = limits.max_artifact_bytes
     except PassiveFileError as error:
         if error.code == "too_large":
             return ArtifactIssue(
                 path,
-                f"artifact exceeds the {limits.max_artifact_bytes}-byte discovery limit",
+                f"artifact exceeds the {discovery_bound}-byte discovery limit",
             )
+        return ArtifactIssue(
+            path,
+            "artifact changed or is not a confined regular file",
+        )
+    except OSError:
         return ArtifactIssue(
             path,
             "artifact changed or is not a confined regular file",
@@ -240,6 +294,7 @@ def artifact_changed(
 
 
 __all__ = [
+    "ArtifactInspectionBudget",
     "ChangeComparisonBudget",
     "InspectedArtifact",
     "RepositoryContext",
