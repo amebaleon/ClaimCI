@@ -17,6 +17,7 @@ from claimci.analysis import (
 )
 
 from .core import (
+    _ArtifactEnvelope,
     _adapter_provenance,
     _supports,
     _validate_match,
@@ -24,7 +25,7 @@ from .core import (
 )
 
 
-def _dataset_evidence_id(adapter_id: str, artifact: PassiveArtifact) -> str:
+def _dataset_evidence_id(adapter_id: str, artifact: _ArtifactEnvelope) -> str:
     material = (
         f"{adapter_id}\0{artifact.candidate.path}\0{artifact.candidate.sha256}"
     ).encode("utf-8")

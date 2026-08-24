@@ -26,6 +26,7 @@ from .core import (
     AdapterLimitError,
     AdapterParseError,
     AdapterSelectorError,
+    _ArtifactEnvelope,
     _adapter_provenance,
     _config_target,
     _evidence_id,
@@ -135,7 +136,7 @@ def _unique_named_pointer(
 
 
 def _result_mappings(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     *,
     adapter_id: str,
     leaves: tuple[tuple[str, object], ...],
@@ -199,7 +200,7 @@ def _result_mappings(
 
 
 def _match(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     *,
     adapter_id: str,
     mappings: tuple[FieldMapping, ...],

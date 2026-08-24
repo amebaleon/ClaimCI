@@ -88,6 +88,7 @@ class StreamingLimits:
     max_semantic_records: int = 250_000
     max_logical_record_bytes: int = 1024 * 1024
     max_columns: int = 256
+    max_depth: int = 64
     max_nodes_per_record: int = 100_000
     max_metric_candidates: int = 32
     max_observations: int = 100_000
@@ -105,6 +106,7 @@ class StreamingLimits:
                 16 * 1024 * 1024,
             ),
             ("max_columns", self.max_columns, 256),
+            ("max_depth", self.max_depth, 64),
             ("max_nodes_per_record", self.max_nodes_per_record, 1_000_000),
             ("max_metric_candidates", self.max_metric_candidates, 64),
             ("max_observations", self.max_observations, 1_000_000),
@@ -394,6 +396,10 @@ class ArtifactScan:
         if not self._finished:
             raise StreamingIntegrityError("trace digest requires a finished scan")
         return self._trace_hash.hexdigest()
+
+    @property
+    def semantic_bytes(self) -> int:
+        return self._semantic_bytes
 
     def read_chunk(self, maximum: int = _READ_CHUNK_BYTES) -> bytes:
         if self._closed or self._finished:
