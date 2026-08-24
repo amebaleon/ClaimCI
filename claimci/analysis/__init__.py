@@ -206,6 +206,14 @@ from .trace import (
     TraceValueType,
     trace_json_bytes,
 )
+from .streaming_dataset import (
+    DatasetAlignmentFact,
+    DatasetMultisetIdentity,
+    DatasetOverlapFact,
+    DatasetScanAuditContext,
+    DatasetSplitScan,
+    stream_dataset_audit_context,
+)
 
 if TYPE_CHECKING:
     from claimci.review.models import ReviewConfig
@@ -267,6 +275,11 @@ __all__ = [
     "ConfigValue",
     "DatasetSplit",
     "DatasetReference",
+    "DatasetAlignmentFact",
+    "DatasetMultisetIdentity",
+    "DatasetOverlapFact",
+    "DatasetScanAuditContext",
+    "DatasetSplitScan",
     "DeterministicAuditOutcome",
     "DeterministicAuditTrace",
     "EVIDENCE_TRACE_MAX_BYTES",
@@ -405,6 +418,7 @@ __all__ = [
     "select_evidence_profile",
     "field_mapping_identity",
     "selector_identity",
+    "stream_dataset_audit_context",
     "trace_json_bytes",
     "validated_artifact_support",
     "validated_measurement_procedure_support",
