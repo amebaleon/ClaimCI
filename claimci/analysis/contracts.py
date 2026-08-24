@@ -36,6 +36,9 @@ _ADAPTER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _TARGET_FIELD = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\Z")
 _DOTTED_SEGMENT = re.compile(r"[A-Za-z0-9_-]+\Z")
 _COLUMN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. -]{0,255}\Z")
+_TABLE_NUMBER = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
 _INVALID_JSON_POINTER_ESCAPE = re.compile(r"~(?:[^01]|$)")
 _WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"|?*')
 _WINDOWS_RESERVED_BASENAMES = frozenset(
@@ -764,14 +767,118 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
             )
             for item in role_bindings
         )
+        baseline_table_selectors = tuple(
+            mapping.selector
+            for item in role_bindings
+            if item.role is ExperimentRole.BASELINE
+            for mapping in item.mappings
+            if type(mapping.selector) is TableSelector
+        )
+        candidate_table_selectors = tuple(
+            mapping.selector
+            for item in role_bindings
+            if item.role is ExperimentRole.CANDIDATE
+            for mapping in item.mappings
+            if type(mapping.selector) is TableSelector
+        )
+        overlapping_physical_cells = any(
+            baseline_selector.column == candidate_selector.column
+            and not _table_selectors_are_row_disjoint(
+                baseline_selector,
+                candidate_selector,
+            )
+            for baseline_selector in baseline_table_selectors
+            for candidate_selector in candidate_table_selectors
+        )
         if (
             any(not identity for identity in exact_table_identities)
             or len(set(exact_table_identities)) != len(exact_table_identities)
+            or overlapping_physical_cells
         ):
             raise AnalysisContractError(
                 f"{label} cannot assign one path to conflicting baseline and candidate roles"
             )
     return bindings
+
+
+def _table_number_text(value: str) -> Decimal | None:
+    if not _TABLE_NUMBER.fullmatch(value):
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _table_predicates_may_match_same_cell(
+    left: TablePredicate,
+    right: TablePredicate,
+) -> bool:
+    """Return whether two typed predicates can match one physical table cell.
+
+    Table adapters compare raw cell text with the fixed scalar grammar.  Keep
+    this proof local to the immutable contracts layer so role bindings cannot
+    rely on syntactically different selectors to share a physical measurement.
+    """
+
+    if left.column != right.column:
+        raise ValueError("table predicate overlap requires one shared column")
+    if left.scalar_type is TableScalarType.NULL:
+        return right.scalar_type is TableScalarType.NULL
+    if right.scalar_type is TableScalarType.NULL:
+        return False
+    if (
+        left.scalar_type is TableScalarType.STRING
+        and right.scalar_type is TableScalarType.STRING
+    ):
+        return left.value == right.value
+    if (
+        left.scalar_type is TableScalarType.BOOLEAN
+        and right.scalar_type is TableScalarType.BOOLEAN
+    ):
+        return left.value == right.value
+    if (
+        left.scalar_type is TableScalarType.NUMBER
+        and right.scalar_type is TableScalarType.NUMBER
+    ):
+        return left.canonical_value == right.canonical_value
+
+    if left.scalar_type is TableScalarType.STRING:
+        string_value = left.value
+        other = right
+    elif right.scalar_type is TableScalarType.STRING:
+        string_value = right.value
+        other = left
+    else:
+        return False
+
+    if other.scalar_type is TableScalarType.BOOLEAN:
+        return string_value == ("true" if other.value else "false")
+    if other.scalar_type is TableScalarType.NUMBER:
+        parsed = _table_number_text(string_value)
+        if parsed is None:
+            return False
+        return parsed == Decimal(other.canonical_value)
+    return False
+
+
+def _table_selectors_are_row_disjoint(
+    left: TableSelector,
+    right: TableSelector,
+) -> bool:
+    """Return whether shared predicates prove two selectors select disjoint rows."""
+
+    left_by_column = {item.column: item for item in left.predicates}
+    right_by_column = {item.column: item for item in right.predicates}
+    shared_columns = left_by_column.keys() & right_by_column.keys()
+    return any(
+        not _table_predicates_may_match_same_cell(
+            left_by_column[column],
+            right_by_column[column],
+        )
+        for column in shared_columns
+    )
 
 
 def _field_mapping_projection(

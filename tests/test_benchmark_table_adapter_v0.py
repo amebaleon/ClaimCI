@@ -606,3 +606,234 @@ def test_one_physical_table_may_bind_roles_only_through_distinct_exact_selectors
             trust=MappingTrust.INFERRED,
             provenance=provenance,
         )
+
+
+def _shared_table_mapping_candidate(
+    artifact: PassiveArtifact,
+    baseline_mappings: tuple[FieldMapping, ...],
+    candidate_mappings: tuple[FieldMapping, ...],
+) -> MappingCandidate:
+    provenance = _provenance()
+    return MappingCandidate(
+        mapping_id="mapping-shared-table-selector-regression",
+        bindings=(
+            ArtifactBinding(
+                artifact.candidate.path,
+                artifact.candidate.kind,
+                ExperimentRole.BASELINE,
+                CsvAdapter.adapter_id,
+                baseline_mappings,
+                provenance,
+            ),
+            ArtifactBinding(
+                artifact.candidate.path,
+                artifact.candidate.kind,
+                ExperimentRole.CANDIDATE,
+                CsvAdapter.adapter_id,
+                candidate_mappings,
+                provenance,
+            ),
+        ),
+        confidence=Confidence(0.8),
+        trust=MappingTrust.INFERRED,
+        provenance=provenance,
+    )
+
+
+def _table_mapping(
+    artifact: PassiveArtifact,
+    *,
+    target_field: str,
+    column: str,
+    predicates: tuple[TablePredicate, ...],
+    expected_cardinality: int = 1,
+) -> FieldMapping:
+    provenance = _provenance()
+    return FieldMapping(
+        target_field,
+        TableSelector(column, predicates, expected_cardinality, provenance),
+        provenance,
+    )
+
+
+def test_shared_table_selector_rejects_subset_and_superset_row_predicates() -> None:
+    artifact = _artifact(b"commit,status,val_bpb\nbaseline,ok,1.0\n")
+    baseline = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=(TablePredicate("commit", TableScalarType.STRING, "baseline"),),
+    )
+    candidate = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=(
+            TablePredicate("commit", TableScalarType.STRING, "baseline"),
+            TablePredicate("status", TableScalarType.STRING, "ok"),
+        ),
+    )
+
+    with pytest.raises(AnalysisContractError, match="conflicting baseline"):
+        _shared_table_mapping_candidate(artifact, (baseline,), (candidate,))
+
+
+def test_shared_table_selector_rejects_same_metric_with_extra_profile_mapping() -> None:
+    artifact = _artifact(b"commit,workload,val_bpb\nbaseline,decode-v1,1.0\n")
+    predicates = (TablePredicate("commit", TableScalarType.STRING, "baseline"),)
+    baseline = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=predicates,
+    )
+    candidate = (
+        _table_mapping(
+            artifact,
+            target_field="metric_value",
+            column="val_bpb",
+            predicates=predicates,
+        ),
+        _table_mapping(
+            artifact,
+            target_field="benchmark.workload.id",
+            column="workload",
+            predicates=predicates,
+        ),
+    )
+
+    with pytest.raises(AnalysisContractError, match="conflicting baseline"):
+        _shared_table_mapping_candidate(artifact, (baseline,), candidate)
+
+
+@pytest.mark.parametrize(
+    ("baseline_predicate", "candidate_predicate"),
+    [
+        (
+            TablePredicate("status", TableScalarType.STRING, "true"),
+            TablePredicate("status", TableScalarType.BOOLEAN, True),
+        ),
+        (
+            TablePredicate("version", TableScalarType.NUMBER, 1),
+            TablePredicate("version", TableScalarType.STRING, "1"),
+        ),
+        (
+            TablePredicate("version", TableScalarType.NUMBER, 0),
+            TablePredicate("version", TableScalarType.STRING, "-0"),
+        ),
+        (
+            TablePredicate("version", TableScalarType.NUMBER, 1),
+            TablePredicate("version", TableScalarType.STRING, "1e0"),
+        ),
+        (
+            TablePredicate("version", TableScalarType.NUMBER, 1),
+            TablePredicate("version", TableScalarType.STRING, "1.0"),
+        ),
+    ],
+)
+def test_shared_table_selector_rejects_typed_predicates_that_can_match_same_cell(
+    baseline_predicate: TablePredicate,
+    candidate_predicate: TablePredicate,
+) -> None:
+    artifact = _artifact(b"status,version,val_bpb\ntrue,1,1.0\n")
+    baseline = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=(baseline_predicate,),
+    )
+    candidate = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=(candidate_predicate,),
+    )
+
+    with pytest.raises(AnalysisContractError, match="conflicting baseline"):
+        _shared_table_mapping_candidate(artifact, (baseline,), (candidate,))
+
+
+def test_shared_table_selector_rejects_overlap_without_shared_predicate_columns() -> None:
+    artifact = _artifact(b"commit,status,val_bpb\nbaseline,ok,1.0\n")
+    baseline = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=(TablePredicate("commit", TableScalarType.STRING, "baseline"),),
+    )
+    candidate = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=(TablePredicate("status", TableScalarType.STRING, "ok"),),
+    )
+
+    with pytest.raises(AnalysisContractError, match="conflicting baseline"):
+        _shared_table_mapping_candidate(artifact, (baseline,), (candidate,))
+
+
+def test_shared_table_selector_allows_disjoint_multirow_profile_mappings() -> None:
+    artifact = _artifact(
+        b"commit,workload,val_bpb\n"
+        b"baseline,decode-v1,1.0\n"
+        b"baseline,decode-v1,1.1\n"
+        b"candidate,decode-v1,0.9\n"
+        b"candidate,decode-v1,0.8\n"
+    )
+    baseline_predicate = (
+        TablePredicate("commit", TableScalarType.STRING, "baseline"),
+    )
+    candidate_predicate = (
+        TablePredicate("commit", TableScalarType.STRING, "candidate"),
+    )
+    baseline = tuple(
+        _table_mapping(
+            artifact,
+            target_field=target_field,
+            column=column,
+            predicates=baseline_predicate,
+            expected_cardinality=2,
+        )
+        for target_field, column in (
+            ("metric_value", "val_bpb"),
+            ("benchmark.workload.id", "workload"),
+        )
+    )
+    candidate = tuple(
+        _table_mapping(
+            artifact,
+            target_field=target_field,
+            column=column,
+            predicates=candidate_predicate,
+            expected_cardinality=2,
+        )
+        for target_field, column in (
+            ("metric_value", "val_bpb"),
+            ("benchmark.workload.id", "workload"),
+        )
+    )
+
+    mapping = _shared_table_mapping_candidate(artifact, baseline, candidate)
+
+    assert len(mapping.bindings) == 2
+
+
+def test_shared_table_selector_allows_distinct_target_columns_with_overlapping_rows() -> None:
+    artifact = _artifact(b"commit,val_bpb,latency\nbaseline,1.0,10\n")
+    predicates = (TablePredicate("commit", TableScalarType.STRING, "baseline"),)
+    baseline = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="val_bpb",
+        predicates=predicates,
+    )
+    candidate = _table_mapping(
+        artifact,
+        target_field="metric_value",
+        column="latency",
+        predicates=predicates,
+    )
+
+    mapping = _shared_table_mapping_candidate(artifact, (baseline,), (candidate,))
+
+    assert len(mapping.bindings) == 2
