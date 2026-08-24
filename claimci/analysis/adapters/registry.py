@@ -11,6 +11,7 @@ from .core import AdapterSelectorError
 from .dataset import PassiveJsonLinesDatasetAdapter
 from .native import NativeConfigAdapter, NativeManifestAdapter, NativeResultsAdapter
 from .structured import JsonAdapter, JsonLinesAdapter
+from .streaming import extract_registered_source
 from .tabular import CsvAdapter, TsvAdapter
 
 
@@ -55,4 +56,9 @@ def extract_registered_artifact(
     return None
 
 
-__all__ = ["ADAPTERS", "extract_registered_artifact", "get_adapter"]
+__all__ = [
+    "ADAPTERS",
+    "extract_registered_artifact",
+    "extract_registered_source",
+    "get_adapter",
+]

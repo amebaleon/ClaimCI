@@ -36,6 +36,7 @@ from claimci.review.tools import discover_manifests
 from .claims import as_scientific_claim
 from .models import ArtifactIssue, DiscoveredClaim, DiscoveryError, DiscoveryLimits
 from .repository import (
+    ArtifactInspectionBudget,
     ChangeComparisonBudget,
     RepositoryContext,
     artifact_changed,
@@ -194,6 +195,7 @@ def _manifest_hint(
     manifest_path: RepositoryPath,
     *,
     limits: DiscoveryLimits,
+    inspection_budget: ArtifactInspectionBudget,
 ) -> tuple[MappingCandidate | None, ArtifactIssue | None]:
     text_result = read_artifact_text(context, manifest_path, limits=limits)
     if isinstance(text_result, ArtifactIssue):
@@ -236,7 +238,12 @@ def _manifest_hint(
                 path = _resolve_manifest_path(manifest_path, experiment.get(field))
                 if path not in issued:
                     raise DiscoveryError("manifest artifact is not indexed")
-                inspection = inspect_artifact(context, path, limits=limits)
+                inspection = inspect_artifact(
+                    context,
+                    path,
+                    limits=limits,
+                    budget=inspection_budget,
+                )
                 if isinstance(inspection, ArtifactIssue):
                     raise DiscoveryError("manifest artifact is not usable")
                 bindings.append(
@@ -353,13 +360,19 @@ def discover_artifacts(
     manifest_mappings: list[MappingCandidate] = []
     issue_by_path: dict[RepositoryPath, ArtifactIssue] = {}
     valid_manifests: set[RepositoryPath] = set()
+    inspection_budget = ArtifactInspectionBudget.from_limits(limits)
     for raw in discover_manifests(
         context.head_root,
         tuple(str(path) for path in context.repository_paths),
         max_manifests=min(4, limits.max_artifact_candidates),
     ):
         path = RepositoryPath(raw)
-        mapping, issue = _manifest_hint(context, path, limits=limits)
+        mapping, issue = _manifest_hint(
+            context,
+            path,
+            limits=limits,
+            inspection_budget=inspection_budget,
+        )
         if issue is not None:
             issue_by_path.setdefault(issue.path, issue)
         elif mapping is not None:
@@ -442,7 +455,12 @@ def discover_artifacts(
         path for claim in claims for path in claim.evidence_hints
     }
     for path in preliminary:
-        inspection = inspect_artifact(context, path, limits=limits)
+        inspection = inspect_artifact(
+            context,
+            path,
+            limits=limits,
+            budget=inspection_budget,
+        )
         if isinstance(inspection, ArtifactIssue):
             issue_by_path.setdefault(path, inspection)
             continue

@@ -7,8 +7,16 @@ import json
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import PurePosixPath
 from types import MappingProxyType
 
+from .artifact_source import (
+    ArtifactSource,
+    ScanCompleteness,
+    ScanReason,
+    ScanState,
+    StreamingLimits,
+)
 from .contracts import (
     AdapterMatch,
     AnalysisContractError,
@@ -59,6 +67,41 @@ class MetricCandidateLimits:
             raise AnalysisContractError(
                 "max_candidates_per_artifact must be between one and 64"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class MetricCandidateScan:
+    """Candidate set issued only by one complete verified streaming schema."""
+
+    candidates: tuple[MetricCandidate, ...]
+    match: AdapterMatch | None
+    completeness: ScanCompleteness
+    retained_raw_records: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidates, tuple) or not all(
+            type(item) is MetricCandidate for item in self.candidates
+        ):
+            raise TypeError("streaming metric candidates are invalid")
+        if type(self.completeness) is not ScanCompleteness:
+            raise TypeError("streaming metric completeness is invalid")
+        if self.retained_raw_records != 0:
+            raise AnalysisContractError(
+                "streaming metric discovery cannot retain raw records"
+            )
+        if self.completeness.complete:
+            if self.match is None or not self.completeness.integrity_verified:
+                raise AnalysisContractError(
+                    "complete streaming metrics require a verified adapter match"
+                )
+        elif self.candidates or self.match is not None:
+            raise AnalysisContractError(
+                "incomplete streaming metrics cannot expose provisional candidates"
+            )
+
+    @property
+    def retained_raw_rows(self) -> int:
+        return self.retained_raw_records
 
 
 def _candidate_id(
@@ -801,24 +844,37 @@ def integrate_metric_binding(
 
 
 def extract_bound_metric_evidence(
-    passive: PassiveArtifact,
+    passive: PassiveArtifact | ArtifactSource,
     binding: MetricBinding,
     *,
     role: ExperimentRole,
+    limits: StreamingLimits = StreamingLimits(),
 ) -> NormalizedEvidence:
     """Rerun a fixed adapter and project one exact raw metric to its claim name."""
 
-    if type(passive) is not PassiveArtifact:
-        raise TypeError("bound metric extraction requires PassiveArtifact")
+    if type(passive) not in {PassiveArtifact, ArtifactSource}:
+        raise TypeError(
+            "bound metric extraction requires PassiveArtifact or ArtifactSource"
+        )
+    if type(limits) is not StreamingLimits:
+        raise TypeError("bound metric streaming limits must be StreamingLimits")
     endpoint = _endpoint(binding, role)
     if (
         passive.candidate.path != endpoint.artifact_path
         or passive.candidate.sha256 != endpoint.artifact_sha256
     ):
         raise AnalysisContractError(
-            "passive artifact is not the exact bound metric candidate"
-        )
-    match = _probe(passive)
+            "artifact is not the exact bound metric candidate"
+    )
+    if type(passive) is ArtifactSource:
+        scan = extract_metric_candidate_scan(passive, role=role, limits=limits)
+        if not scan.completeness.complete:
+            raise AnalysisContractError(
+                "exact bound metric candidate is stale and requires pair re-approval"
+            )
+        match = scan.match
+    else:
+        match = _probe(passive)
     if match is None or match.adapter_id != endpoint.adapter_id:
         raise AnalysisContractError("bound metric adapter identity changed")
     mappings = {
@@ -844,18 +900,56 @@ def extract_bound_metric_evidence(
             dict.fromkeys((*match.match_evidence, endpoint.provenance))
         ),
     )
-    current = extract_metric_candidates(
-        passive,
-        role=role,
-        adapter_match=selected_match,
-    )
-    if endpoint not in current:
-        raise AnalysisContractError(
-            "exact bound metric candidate is stale and requires pair re-approval"
+    if type(passive) is ArtifactSource:
+        from .adapters import (
+            scan_delimited_observations,
+            scan_jsonl_observations,
         )
-    from .adapters import get_adapter
 
-    evidence = get_adapter(endpoint.adapter_id).extract(passive, selected_match)
+        current = extract_metric_candidate_scan(
+            passive,
+            role=role,
+            limits=limits,
+            adapter_match=selected_match,
+        )
+        if endpoint not in current.candidates:
+            raise AnalysisContractError(
+                "exact bound metric candidate is stale and requires pair re-approval"
+            )
+        if endpoint.adapter_id == "claimci-jsonl-v1":
+            outcome = scan_jsonl_observations(
+                passive,
+                selected_match,
+                limits=limits,
+            )
+        elif endpoint.adapter_id in {"claimci-csv-v1", "claimci-tsv-v1"}:
+            outcome = scan_delimited_observations(
+                passive,
+                selected_match,
+                limits=limits,
+            )
+        else:
+            raise AnalysisContractError(
+                "bound metric adapter has no trusted streaming implementation"
+            )
+        if not outcome.completeness.complete or outcome.evidence is None:
+            raise AnalysisContractError(
+                "exact bound metric source did not produce complete evidence"
+            )
+        evidence = outcome.evidence
+    else:
+        current = extract_metric_candidates(
+            passive,
+            role=role,
+            adapter_match=selected_match,
+        )
+        if endpoint not in current:
+            raise AnalysisContractError(
+                "exact bound metric candidate is stale and requires pair re-approval"
+            )
+        from .adapters import get_adapter
+
+        evidence = get_adapter(endpoint.adapter_id).extract(passive, selected_match)
     metric_observations = tuple(
         item for item in evidence.observations if item.metric_name is not None
     )
@@ -1071,7 +1165,7 @@ def _selected_match_candidates(
 
 
 def _structured_candidates_from_leaves(
-    passive: PassiveArtifact,
+    passive: PassiveArtifact | ArtifactSource,
     match: AdapterMatch,
     role: ExperimentRole,
     leaves: tuple[tuple[str, object], ...],
@@ -1141,6 +1235,216 @@ def _structured_candidates_from_leaves(
             )
         )
     return tuple(candidates)
+
+
+def _incomplete_candidate_report(
+    completeness: ScanCompleteness,
+    reason: ScanReason,
+) -> ScanCompleteness:
+    state = (
+        ScanState.FAILED
+        if reason in {ScanReason.MALFORMED, ScanReason.SELECTOR_MISMATCH}
+        else ScanState.INCOMPLETE_LIMIT
+    )
+    return replace(completeness, state=state, reason=reason)
+
+
+def _stream_table_candidates(
+    source: ArtifactSource,
+    match: AdapterMatch,
+    role: ExperimentRole,
+    header: tuple[str, ...],
+    numeric_columns: tuple[str, ...],
+) -> tuple[MetricCandidate, ...]:
+    from .adapters.core import _adapter_provenance
+    from .adapters.tabular import (
+        _RUN_NAMES,
+        _SEED_NAMES,
+        _unique_named_header,
+    )
+
+    excluded = {
+        name
+        for name in (
+            _unique_named_header(header, _RUN_NAMES),
+            _unique_named_header(header, _SEED_NAMES),
+        )
+        if name is not None
+    }
+    candidates: list[MetricCandidate] = []
+    for column in header:
+        if column in excluded or column not in numeric_columns:
+            continue
+        provenance = _adapter_provenance(
+            source,
+            adapter_id=match.adapter_id,
+            selector=column,
+            inferred=False,
+        )
+        selector = EvidenceSelector(SelectorKind.COLUMN, column, provenance)
+        candidates.append(
+            MetricCandidate._from_extraction(
+                role=role,
+                path=source.candidate.path,
+                sha256=source.candidate.sha256,
+                adapter_id=match.adapter_id,
+                selector=selector,
+                raw_metric_name=column,
+                provenance=provenance,
+            )
+        )
+    return tuple(candidates)
+
+
+def extract_metric_candidate_scan(
+    source: ArtifactSource,
+    *,
+    role: ExperimentRole,
+    limits: StreamingLimits = StreamingLimits(),
+    adapter_match: AdapterMatch | None = None,
+) -> MetricCandidateScan:
+    """Discover exact metric candidates from one complete streaming schema."""
+
+    if type(source) is not ArtifactSource:
+        raise TypeError("streaming metric candidate extraction requires ArtifactSource")
+    if role not in {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}:
+        raise AnalysisContractError(
+            "metric candidate extraction role must be baseline or candidate"
+        )
+    if type(limits) is not StreamingLimits:
+        raise TypeError("streaming metric candidate limits must be StreamingLimits")
+    if adapter_match is not None and type(adapter_match) is not AdapterMatch:
+        raise TypeError("streaming adapter_match must be AdapterMatch or null")
+    if source.candidate.kind not in _SUPPORTED_KINDS:
+        raise AnalysisContractError(
+            "streaming metric candidates require a results or benchmark artifact"
+        )
+
+    from .adapters.streaming import scan_delimited_schema, scan_jsonl_schema
+
+    suffix = PurePosixPath(str(source.candidate.path)).suffix.casefold()
+    if suffix == ".jsonl":
+        schema = scan_jsonl_schema(source, limits=limits)
+    elif suffix in {".csv", ".tsv"}:
+        schema = scan_delimited_schema(source, limits=limits)
+    else:
+        raise AnalysisContractError(
+            "streaming metric candidates require JSONL, CSV, or TSV"
+        )
+    if not schema.completeness.complete:
+        return MetricCandidateScan((), None, schema.completeness)
+    assert schema.match is not None
+    if adapter_match is not None:
+        if (
+            adapter_match.path != source.candidate.path
+            or adapter_match.adapter_id != schema.match.adapter_id
+        ):
+            raise AnalysisContractError(
+                "streaming metric adapter match conflicts with the fixed registry"
+            )
+        fixed_provenance = (
+            *adapter_match.match_evidence,
+            *(item.provenance for item in adapter_match.mappings),
+            *(item.selector.provenance for item in adapter_match.mappings),
+        )
+        if any(
+            item.kind is not ProvenanceKind.ADAPTER_EXTRACTION
+            for item in fixed_provenance
+        ):
+            raise AnalysisContractError(
+                "metric candidates require fixed adapter extraction provenance"
+            )
+        from .adapters.streaming import (
+            scan_delimited_observations,
+            scan_jsonl_observations,
+        )
+
+        selected = (
+            scan_jsonl_observations(source, adapter_match, limits=limits)
+            if suffix == ".jsonl"
+            else scan_delimited_observations(source, adapter_match, limits=limits)
+        )
+        if not selected.completeness.complete or selected.evidence is None:
+            return MetricCandidateScan((), None, selected.completeness)
+        names = {
+            item.metric_name
+            for item in selected.evidence.observations
+            if item.metric_name is not None
+        }
+        metric_fields = tuple(
+            item
+            for item in selected.evidence.adapter_match.mappings
+            if item.target_field == "metric_value"
+        )
+        if len(names) != 1 or len(metric_fields) != 1:
+            return MetricCandidateScan(
+                (),
+                None,
+                _incomplete_candidate_report(
+                    selected.completeness,
+                    ScanReason.SELECTOR_MISMATCH,
+                ),
+            )
+        field = metric_fields[0]
+        candidate = MetricCandidate._from_extraction(
+            role=role,
+            path=source.candidate.path,
+            sha256=source.candidate.sha256,
+            adapter_id=selected.evidence.adapter_match.adapter_id,
+            selector=field.selector,
+            raw_metric_name=next(iter(names)),
+            provenance=field.provenance,
+        )
+        return MetricCandidateScan(
+            (candidate,),
+            selected.evidence.adapter_match,
+            selected.completeness,
+        )
+    try:
+        if suffix == ".jsonl":
+            candidates = _structured_candidates_from_leaves(
+                source,
+                schema.match,
+                role,
+                schema.common_leaves,
+            )
+        else:
+            candidates = _stream_table_candidates(
+                source,
+                schema.match,
+                role,
+                schema.header,
+                schema.numeric_columns,
+            )
+    except (AnalysisContractError, TypeError, ValueError):
+        return MetricCandidateScan(
+            (),
+            None,
+            _incomplete_candidate_report(
+                schema.completeness,
+                ScanReason.MALFORMED,
+            ),
+        )
+    if len(candidates) > limits.max_metric_candidates:
+        return MetricCandidateScan(
+            (),
+            None,
+            _incomplete_candidate_report(
+                schema.completeness,
+                ScanReason.CANDIDATE_LIMIT,
+            ),
+        )
+    ordered = tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                item.raw_metric_name.casefold(),
+                item.raw_metric_name,
+                selector_identity(item.selector),
+            ),
+        )
+    )
+    return MetricCandidateScan(ordered, schema.match, schema.completeness)
 
 
 def _json_candidates(
@@ -1301,6 +1605,7 @@ def extract_metric_candidates(
 
 __all__ = [
     "MetricCandidate",
+    "MetricCandidateScan",
     "MetricCandidateLimitError",
     "MetricCandidateLimits",
     "MetricBinding",
@@ -1313,6 +1618,7 @@ __all__ = [
     "MetricIdentityAuditContext",
     "MetricIdentityKind",
     "extract_metric_candidates",
+    "extract_metric_candidate_scan",
     "extract_bound_metric_evidence",
     "approve_metric_binding",
     "identify_metric_candidate",

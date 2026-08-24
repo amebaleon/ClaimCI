@@ -8,15 +8,22 @@ import os
 import re
 import shutil
 import stat
+from contextlib import ExitStack
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Mapping
+from pathlib import Path, PurePosixPath
+from typing import Mapping, TypeAlias
 
 import yaml
 
 from claimci.audit import audit_profiled, audit_research
 from claimci.models import AuditResult
 
+from .artifact_source import (
+    ArtifactSource,
+    ScanCompleteness,
+    StreamingLimits,
+    artifact_source_from_snapshot,
+)
 from .claim_types import claim_semantic_projection
 from .measurement import measurement_audit_context_from_materialization
 from .contracts import (
@@ -37,6 +44,7 @@ from .contracts import (
     ProvenanceKind,
     RepoMapping,
     RepositoryIdentity,
+    RepositoryPath,
     SelectorKind,
     TableSelector,
     field_mapping_identity,
@@ -51,6 +59,10 @@ from .profiles import (
     ProfileSelectionState,
     profiled_evidence_policy,
     select_evidence_profile,
+)
+from .streaming_dataset import (
+    DatasetScanAuditContext,
+    stream_dataset_audit_context,
 )
 from .trace import (
     BoundedValueRepresentation,
@@ -134,11 +146,16 @@ class MaterializationUnavailable(MaterializationError):
 class MaterializationLimits:
     max_file_bytes: int = 16 * 1024 * 1024
     max_total_bytes: int = 64 * 1024 * 1024
+    max_stream_file_bytes: int = 1024 * 1024 * 1024
+    max_stream_total_bytes: int = 4 * 1024 * 1024 * 1024
+    streaming_limits: StreamingLimits = field(default_factory=StreamingLimits)
 
     def __post_init__(self) -> None:
         for label, value in (
             ("max_file_bytes", self.max_file_bytes),
             ("max_total_bytes", self.max_total_bytes),
+            ("max_stream_file_bytes", self.max_stream_file_bytes),
+            ("max_stream_total_bytes", self.max_stream_total_bytes),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise AnalysisContractError(f"{label} must be a positive integer")
@@ -146,6 +163,27 @@ class MaterializationLimits:
             raise AnalysisContractError(
                 "max_total_bytes must be at least max_file_bytes"
             )
+        if self.max_stream_file_bytes < self.max_file_bytes:
+            raise AnalysisContractError(
+                "max_stream_file_bytes must be at least max_file_bytes"
+            )
+        if self.max_stream_total_bytes < self.max_stream_file_bytes:
+            raise AnalysisContractError(
+                "max_stream_total_bytes must be at least max_stream_file_bytes"
+            )
+        if self.max_stream_total_bytes < self.max_total_bytes:
+            raise AnalysisContractError(
+                "max_stream_total_bytes must be at least max_total_bytes"
+            )
+        if type(self.streaming_limits) is not StreamingLimits:
+            raise TypeError("streaming_limits must be StreamingLimits")
+        if self.max_stream_file_bytes > self.streaming_limits.max_integrity_bytes:
+            raise AnalysisContractError(
+                "max_stream_file_bytes cannot exceed the integrity-I/O budget"
+            )
+
+
+_CapturedArtifact: TypeAlias = PassiveArtifact | ArtifactSource
 
 
 def _resolved_directory(path: Path, label: str) -> Path:
@@ -291,9 +329,40 @@ def _capture_artifact(
     runtime: RuntimeExecutionContext,
     *,
     aggregate_before: int,
-) -> PassiveArtifact:
+    stream_aggregate_before: int,
+) -> _CapturedArtifact:
+    if candidate.size > runtime.limits.max_stream_file_bytes:
+        raise MaterializationUnavailable(
+            "artifact exceeds the runtime stream-integrity file bound"
+        )
+    if (
+        stream_aggregate_before + candidate.size
+        > runtime.limits.max_stream_total_bytes
+    ):
+        raise MaterializationUnavailable(
+            "artifacts exceed the runtime stream-integrity aggregate bound"
+        )
     if candidate.size > runtime.limits.max_file_bytes:
-        raise MaterializationUnavailable("artifact exceeds the runtime file bound")
+        suffix = PurePosixPath(str(candidate.path)).suffix.casefold()
+        if suffix not in {".jsonl", ".csv", ".tsv"}:
+            raise MaterializationUnavailable(
+                "large artifact has no trusted streaming adapter"
+            )
+        try:
+            return artifact_source_from_snapshot(
+                runtime.repository,
+                runtime.head_sha,
+                runtime.checkout_root,
+                candidate,
+            )
+        except (
+            AnalysisContractError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise MaterializationUnavailable(
+                f"streaming artifact source could not be issued: {error}"
+            ) from error
     if aggregate_before + candidate.size > runtime.limits.max_total_bytes:
         raise MaterializationUnavailable("artifacts exceed the runtime aggregate bound")
     current = runtime.checkout_root
@@ -559,13 +628,15 @@ def _capture_plan_artifacts(
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
     *,
     revalidate_fixed_adapters: bool = False,
-) -> Mapping[str, PassiveArtifact]:
-    captured: dict[str, PassiveArtifact] = {}
+    metric_bound_paths: frozenset[str] = frozenset(),
+) -> Mapping[str, _CapturedArtifact]:
+    captured: dict[str, _CapturedArtifact] = {}
     captured_kinds: dict[str, ArtifactKind] = {}
     revalidated_datasets: set[str] = set()
     revalidated_tables: set[str] = set()
     revalidated_evidence: set[str] = set()
-    total = 0
+    passive_total = 0
+    integrity_total = 0
     for evidence, binding in sorted(
         bound,
         key=lambda item: (
@@ -579,17 +650,27 @@ def _capture_plan_artifacts(
             raise MaterializationUnavailable(
                 "one captured repository path cannot have conflicting artifact kinds"
             )
-        passive = captured.get(path)
-        if passive is None:
-            passive = _capture_artifact(
-                evidence.artifact,
-                runtime,
-                aggregate_before=total,
-            )
-            captured[path] = passive
+        source = captured.get(path)
+        if source is None:
+            try:
+                source = _capture_artifact(
+                    evidence.artifact,
+                    runtime,
+                    aggregate_before=passive_total,
+                    stream_aggregate_before=integrity_total,
+                )
+            except MaterializationUnavailable as error:
+                if path in metric_bound_paths:
+                    raise MaterializationUnavailable(
+                        "entire metric pair binding is stale; re-approval is required"
+                    ) from error
+                raise
+            captured[path] = source
             captured_kinds[path] = evidence.artifact.kind
-            total += len(passive.content)
-        elif passive.candidate != evidence.artifact:
+            integrity_total += evidence.artifact.size
+            if type(source) is PassiveArtifact:
+                passive_total += len(source.content)
+        elif source.candidate != evidence.artifact:
             raise MaterializationUnavailable(
                 "duplicate selected path has conflicting artifact identity"
             )
@@ -597,9 +678,14 @@ def _capture_plan_artifacts(
             evidence.artifact.kind is ArtifactKind.DATASET
             and path not in revalidated_datasets
         ):
-            _revalidate_dataset_identity(evidence, binding, passive)
+            _revalidate_dataset_identity(
+                evidence,
+                binding,
+                source,
+                runtime.limits.streaming_limits,
+            )
             revalidated_datasets.add(path)
-        if any(
+        if path not in metric_bound_paths and any(
             type(mapping.selector) is TableSelector
             for mapping in binding.mappings
         ):
@@ -607,14 +693,25 @@ def _capture_plan_artifacts(
                 raise MaterializationUnavailable(
                     "duplicate selector-scoped table evidence was selected"
                 )
-            _revalidate_table_selection(evidence, binding, passive)
+            _revalidate_table_selection(
+                evidence,
+                binding,
+                source,
+                runtime.limits.streaming_limits,
+            )
             revalidated_tables.add(evidence.evidence_id)
         elif (
-            revalidate_fixed_adapters
+            path not in metric_bound_paths
+            and (revalidate_fixed_adapters or type(source) is ArtifactSource)
             and evidence.artifact.kind is not ArtifactKind.DATASET
             and evidence.evidence_id not in revalidated_evidence
         ):
-            _revalidate_fixed_adapter(evidence, binding, passive)
+            _revalidate_fixed_adapter(
+                evidence,
+                binding,
+                source,
+                runtime.limits.streaming_limits,
+            )
             revalidated_evidence.add(evidence.evidence_id)
     return captured
 
@@ -622,7 +719,8 @@ def _capture_plan_artifacts(
 def _revalidate_metric_binding(
     plan: EphemeralAuditPlan,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
-    captured: Mapping[str, PassiveArtifact],
+    captured: Mapping[str, _CapturedArtifact],
+    limits: StreamingLimits,
 ) -> object | None:
     metric_binding = plan.metric_binding
     if metric_binding is None:
@@ -645,8 +743,8 @@ def _revalidate_metric_binding(
         (ExperimentRole.CANDIDATE, metric_binding.candidate_candidate),
     ):
         try:
-            passive = captured.get(str(endpoint.artifact_path))
-            if passive is None:
+            source = captured.get(str(endpoint.artifact_path))
+            if source is None:
                 raise AnalysisContractError("bound artifact was not captured")
             planned = tuple(
                 evidence
@@ -659,17 +757,31 @@ def _revalidate_metric_binding(
                 raise AnalysisContractError(
                     "bound endpoint has no unique planned evidence"
                 )
-            current = metric_identity.extract_metric_candidates(
-                passive,
-                role=role,
-                adapter_match=planned[0].adapter_match,
-            )
+            if type(source) is ArtifactSource:
+                candidate_scan = metric_identity.extract_metric_candidate_scan(
+                    source,
+                    role=role,
+                    limits=limits,
+                    adapter_match=planned[0].adapter_match,
+                )
+                if not candidate_scan.completeness.complete:
+                    raise AnalysisContractError(
+                        "bound candidate scan is incomplete"
+                    )
+                current = candidate_scan.candidates
+            else:
+                current = metric_identity.extract_metric_candidates(
+                    source,
+                    role=role,
+                    adapter_match=planned[0].adapter_match,
+                )
             if endpoint not in current:
                 raise AnalysisContractError("bound candidate identity is stale")
             fresh = metric_identity.extract_bound_metric_evidence(
-                passive,
+                source,
                 metric_binding,
                 role=role,
+                limits=limits,
             )
             if fresh != planned[0]:
                 raise AnalysisContractError(
@@ -689,17 +801,46 @@ def _revalidate_metric_binding(
 def _revalidate_fixed_adapter(
     evidence: NormalizedEvidence,
     binding: ArtifactBinding,
-    passive: PassiveArtifact,
+    source: _CapturedArtifact,
+    limits: StreamingLimits,
 ) -> None:
     if binding.adapter_id is None:
         raise MaterializationUnavailable(
             "profile evidence has no fixed adapter identity"
         )
     try:
-        from .adapters import get_adapter
+        if type(source) is ArtifactSource:
+            from .adapters import (
+                scan_delimited_observations,
+                scan_jsonl_observations,
+            )
 
-        adapter = get_adapter(binding.adapter_id)
-        fresh = adapter.extract(passive, evidence.adapter_match)
+            if binding.adapter_id == "claimci-jsonl-v1":
+                outcome = scan_jsonl_observations(
+                    source,
+                    evidence.adapter_match,
+                    limits=limits,
+                )
+            elif binding.adapter_id in {"claimci-csv-v1", "claimci-tsv-v1"}:
+                outcome = scan_delimited_observations(
+                    source,
+                    evidence.adapter_match,
+                    limits=limits,
+                )
+            else:
+                raise MaterializationUnavailable(
+                    "selected adapter has no trusted streaming implementation"
+                )
+            if not outcome.completeness.complete or outcome.evidence is None:
+                raise MaterializationUnavailable(
+                    "fresh streaming adapter revalidation is incomplete"
+                )
+            fresh = outcome.evidence
+        else:
+            from .adapters import get_adapter
+
+            adapter = get_adapter(binding.adapter_id)
+            fresh = adapter.extract(source, evidence.adapter_match)
     except MaterializationUnavailable:
         raise
     except Exception as error:
@@ -715,26 +856,39 @@ def _revalidate_fixed_adapter(
 def _revalidate_table_selection(
     evidence: NormalizedEvidence,
     binding: ArtifactBinding,
-    passive: PassiveArtifact,
+    source: _CapturedArtifact,
+    limits: StreamingLimits,
 ) -> None:
     if binding.adapter_id not in {"claimci-csv-v1", "claimci-tsv-v1"}:
         raise MaterializationUnavailable(
             "selected table adapter is not a fixed passive adapter"
         )
     try:
-        from .adapters import get_adapter
-
-        adapter = get_adapter(binding.adapter_id)
-        fresh = adapter.extract(
-            passive,
-            type(evidence.adapter_match)(
-                adapter_id=binding.adapter_id,
-                path=binding.path,
-                confidence=evidence.adapter_match.confidence,
-                mappings=binding.mappings,
-                match_evidence=evidence.adapter_match.match_evidence,
-            ),
+        match = type(evidence.adapter_match)(
+            adapter_id=binding.adapter_id,
+            path=binding.path,
+            confidence=evidence.adapter_match.confidence,
+            mappings=binding.mappings,
+            match_evidence=evidence.adapter_match.match_evidence,
         )
+        if type(source) is ArtifactSource:
+            from .adapters import scan_delimited_observations
+
+            outcome = scan_delimited_observations(
+                source,
+                match,
+                limits=limits,
+            )
+            if not outcome.completeness.complete or outcome.evidence is None:
+                raise MaterializationUnavailable(
+                    "fresh streaming table revalidation is incomplete"
+                )
+            fresh = outcome.evidence
+        else:
+            from .adapters import get_adapter
+
+            adapter = get_adapter(binding.adapter_id)
+            fresh = adapter.extract(source, match)
     except MaterializationUnavailable:
         raise
     except Exception as error:
@@ -750,7 +904,8 @@ def _revalidate_table_selection(
 def _revalidate_dataset_identity(
     evidence: NormalizedEvidence,
     binding: ArtifactBinding,
-    passive: PassiveArtifact,
+    source: _CapturedArtifact,
+    limits: StreamingLimits,
 ) -> None:
     if not str(evidence.artifact.path).casefold().endswith(".jsonl"):
         raise MaterializationPartial(
@@ -768,15 +923,29 @@ def _revalidate_dataset_identity(
             "passive dataset identity must not contain executable selectors"
         )
     try:
-        from .adapters import get_adapter
+        if type(source) is ArtifactSource:
+            from .adapters import extract_registered_source
 
-        adapter = get_adapter(binding.adapter_id)
-        match = adapter.probe(passive)
-        if match is None:
-            raise MaterializationUnavailable(
-                "selected dataset adapter no longer matches captured bytes"
-            )
-        fresh = adapter.extract(passive, match)
+            outcome = extract_registered_source(source, limits=limits)
+            if (
+                outcome is None
+                or not outcome.completeness.complete
+                or outcome.evidence is None
+            ):
+                raise MaterializationUnavailable(
+                    "fresh streaming dataset identity is incomplete"
+                )
+            fresh = outcome.evidence
+        else:
+            from .adapters import get_adapter
+
+            adapter = get_adapter(binding.adapter_id)
+            match = adapter.probe(source)
+            if match is None:
+                raise MaterializationUnavailable(
+                    "selected dataset adapter no longer matches captured bytes"
+                )
+            fresh = adapter.extract(source, match)
     except MaterializationUnavailable:
         raise
     except Exception as error:
@@ -861,12 +1030,12 @@ def _config_payload(evidence: tuple[NormalizedEvidence, ...]) -> dict[str, objec
     return payload
 
 
-def _dataset_artifacts(
+def _selected_dataset_artifacts(
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
     role: ExperimentRole,
-    captured: Mapping[str, PassiveArtifact],
-) -> dict[str, bytes]:
-    splits: dict[str, bytes] = {}
+    captured: Mapping[str, _CapturedArtifact],
+) -> dict[str, _CapturedArtifact]:
+    splits: dict[str, _CapturedArtifact] = {}
     selected = tuple(
         (item, binding)
         for item, binding in bound
@@ -901,12 +1070,73 @@ def _dataset_artifacts(
             raise MaterializationUnavailable(
                 "selected dataset mapping contains a duplicate split"
             )
-        splits[split.value] = captured[str(item.artifact.path)].content
+        source = captured.get(str(item.artifact.path))
+        if source is None or source.candidate != item.artifact:
+            raise MaterializationUnavailable(
+                "selected dataset mapping lost its exact captured artifact"
+            )
+        splits[split.value] = source
     if set(splits) != {"train", "eval"}:
         raise MaterializationUnavailable(
             "selected dataset mapping must contain one train and one eval split"
         )
     return splits
+
+
+def _dataset_artifacts(
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    role: ExperimentRole,
+    captured: Mapping[str, _CapturedArtifact],
+) -> dict[str, bytes]:
+    selected = _selected_dataset_artifacts(bound, role, captured)
+    if any(type(source) is not PassiveArtifact for source in selected.values()):
+        raise MaterializationUnavailable(
+            "streamed datasets require the trusted dataset Audit context"
+        )
+    return {
+        split: source.content
+        for split, source in selected.items()
+        if type(source) is PassiveArtifact
+    }
+
+
+def _streaming_dataset_sources(
+    runtime: RuntimeExecutionContext,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, _CapturedArtifact],
+) -> dict[tuple[str, str], ArtifactSource] | None:
+    selected = {
+        (role.value, split): source
+        for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE)
+        for split, source in _selected_dataset_artifacts(
+            bound,
+            role,
+            captured,
+        ).items()
+    }
+    if not any(type(source) is ArtifactSource for source in selected.values()):
+        return None
+    issued: dict[tuple[str, str], ArtifactSource] = {}
+    for key, source in selected.items():
+        if type(source) is ArtifactSource:
+            issued[key] = source
+            continue
+        try:
+            issued[key] = artifact_source_from_snapshot(
+                runtime.repository,
+                runtime.head_sha,
+                runtime.checkout_root,
+                source.candidate,
+            )
+        except (
+            AnalysisContractError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise MaterializationUnavailable(
+                f"dataset streaming source could not be issued: {error}"
+            ) from error
+    return issued
 
 
 def _exclusive_text(path: Path, content: str) -> None:
@@ -922,8 +1152,10 @@ def _exclusive_bytes(path: Path, content: bytes) -> None:
 def _write_native_tree(
     plan_root: Path,
     plan: EphemeralAuditPlan,
-    captured: Mapping[str, PassiveArtifact],
+    captured: Mapping[str, _CapturedArtifact],
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    *,
+    dataset_scan_context: DatasetScanAuditContext | None = None,
 ) -> Path:
     if plan.audit_claim is None:
         raise MaterializationPartial("plan has no deterministic audit claim")
@@ -963,7 +1195,11 @@ def _write_native_tree(
             config = _config_payload(config_evidence)
         except MaterializationPartial as error:
             raise error.for_slot(ArtifactKind.CONFIG, role) from error
-        datasets = _dataset_artifacts(bound, role, captured)
+        datasets = (
+            None
+            if dataset_scan_context is not None
+            else _dataset_artifacts(bound, role, captured)
+        )
         _exclusive_text(
             plan_root / role_name / "results.json",
             json.dumps(
@@ -979,8 +1215,15 @@ def _write_native_tree(
             plan_root / role_name / "config.yaml",
             yaml.safe_dump(config, sort_keys=True, allow_unicode=False),
         )
-        _exclusive_bytes(plan_root / role_name / "train.jsonl", datasets["train"])
-        _exclusive_bytes(plan_root / role_name / "eval.jsonl", datasets["eval"])
+        if datasets is not None:
+            _exclusive_bytes(
+                plan_root / role_name / "train.jsonl",
+                datasets["train"],
+            )
+            _exclusive_bytes(
+                plan_root / role_name / "eval.jsonl",
+                datasets["eval"],
+            )
     manifest = {
         "claim": {
             "metric": plan.audit_claim.metric,
@@ -1097,11 +1340,57 @@ def _trace_selectors(
 def _trace_artifact_values(
     evidence: NormalizedEvidence,
     binding: ArtifactBinding,
-    passive: PassiveArtifact,
+    source_artifact: _CapturedArtifact,
     metric: str,
     *,
     benchmark_profile: bool = False,
-) -> tuple[BoundedValueRepresentation, BoundedValueRepresentation, str]:
+    dataset_scan_context: DatasetScanAuditContext | None = None,
+) -> tuple[
+    BoundedValueRepresentation,
+    BoundedValueRepresentation,
+    str,
+    ScanCompleteness | None,
+]:
+    scan_completeness = evidence.scan_completeness
+    source_trace_sha256 = evidence.source_trace_sha256
+    if (
+        evidence.artifact.kind is ArtifactKind.DATASET
+        and dataset_scan_context is not None
+    ):
+        if binding.dataset_split is None:
+            raise TraceContractError("streaming dataset trace requires an exact split")
+        dataset_scan = dataset_scan_context.scan(
+            binding.role.value,
+            binding.dataset_split.value,
+        )
+        if (
+            dataset_scan.path != evidence.artifact.path
+            or dataset_scan.artifact_sha256 != evidence.artifact.sha256
+            or dataset_scan.artifact_size != evidence.artifact.size
+        ):
+            raise TraceContractError(
+                "streaming dataset trace does not match its exact artifact"
+            )
+        scan_completeness = dataset_scan.completeness
+        source_trace_sha256 = dataset_scan.source_trace_sha256
+
+    def source_representation(
+        normalized: BoundedValueRepresentation,
+    ) -> BoundedValueRepresentation:
+        if scan_completeness is None:
+            if type(source_artifact) is ArtifactSource:
+                raise TraceContractError(
+                    "streaming trace lost its scan completeness"
+                )
+            return normalized
+        if source_trace_sha256 is None:
+            raise TraceContractError("streaming trace lost its source digest")
+        return BoundedValueRepresentation.from_verified_stream(
+            source_trace_sha256,
+            evidence.artifact.size,
+            scan_completeness,
+        )
+
     if evidence.artifact.kind in {ArtifactKind.RESULTS, ArtifactKind.BENCHMARK}:
         profiled_result = (
             benchmark_profile
@@ -1157,7 +1446,12 @@ def _trace_artifact_values(
             }
             detail = "benchmark.selected_measurement_values"
         representation = BoundedValueRepresentation.from_value(value)
-        return representation, representation, detail
+        return (
+            source_representation(representation),
+            representation,
+            detail,
+            scan_completeness,
+        )
     if evidence.artifact.kind in {ArtifactKind.CONFIG, ArtifactKind.DOCUMENT}:
         values: dict[str, object] = {}
         for observation in evidence.observations:
@@ -1175,9 +1469,13 @@ def _trace_artifact_values(
             if evidence.artifact.kind is ArtifactKind.CONFIG
             else "document.selected_profile_scalars"
         )
-        return representation, representation, detail
+        return (
+            source_representation(representation),
+            representation,
+            detail,
+            scan_completeness,
+        )
     if evidence.artifact.kind is ArtifactKind.DATASET:
-        source = BoundedValueRepresentation.from_bytes(passive.content)
         normalized = BoundedValueRepresentation.from_value(
             {
                 "path": str(evidence.artifact.path),
@@ -1186,7 +1484,22 @@ def _trace_artifact_values(
                 else None,
             }
         )
-        return source, normalized, "dataset.passive_identity"
+        source = (
+            BoundedValueRepresentation.from_bytes(source_artifact.content)
+            if scan_completeness is None
+            and type(source_artifact) is PassiveArtifact
+            else source_representation(normalized)
+        )
+        return (
+            source,
+            normalized,
+            (
+                "dataset.streaming_identity"
+                if scan_completeness is not None
+                else "dataset.passive_identity"
+            ),
+            scan_completeness,
+        )
     raise TraceContractError("executable trace contains an unsupported artifact kind")
 
 
@@ -1194,7 +1507,9 @@ def _passive_trace_entries(
     plan: EphemeralAuditPlan,
     result: AuditResult,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
-    captured: Mapping[str, PassiveArtifact],
+    captured: Mapping[str, _CapturedArtifact],
+    *,
+    dataset_scan_context: DatasetScanAuditContext | None = None,
 ) -> tuple[EvidenceTraceEntry, ...]:
     if plan.audit_claim is None:
         raise TraceContractError("trace requires an executable audit claim")
@@ -1214,12 +1529,13 @@ def _passive_trace_entries(
     ):
         if binding.adapter_id is None:
             raise TraceContractError("trace requires a fixed adapter identity")
-        source, normalized, detail = _trace_artifact_values(
+        source, normalized, detail, scan_completeness = _trace_artifact_values(
             evidence,
             binding,
             captured[str(evidence.artifact.path)],
             plan.audit_claim.metric,
             benchmark_profile=benchmark_profile,
+            dataset_scan_context=dataset_scan_context,
         )
         categories = {
             ArtifactKind.RESULTS: ("RESULT", "SEED"),
@@ -1265,6 +1581,7 @@ def _passive_trace_entries(
                 dataset_split=binding.dataset_split,
                 source_value=source,
                 normalized_value=normalized,
+                scan_completeness=scan_completeness,
                 consumer_rule_ids=rule_ids,
             )
         )
@@ -1435,9 +1752,17 @@ def _build_evidence_trace(
     plan: EphemeralAuditPlan,
     result: AuditResult,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
-    captured: Mapping[str, PassiveArtifact],
+    captured: Mapping[str, _CapturedArtifact],
+    *,
+    dataset_scan_context: DatasetScanAuditContext | None = None,
 ) -> EvidenceTraceBundle:
-    passive = _passive_trace_entries(plan, result, bound, captured)
+    passive = _passive_trace_entries(
+        plan,
+        result,
+        bound,
+        captured,
+        dataset_scan_context=dataset_scan_context,
+    )
     entries = [*_claim_trace_entries(plan, result), *passive]
     approval = _approval_trace_entry(plan, passive)
     if approval is not None:
@@ -1458,6 +1783,38 @@ def _build_evidence_trace(
             result=result,
             entries=complete_entries,
         )
+
+
+def _execution_scan_reports(
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    dataset_scan_context: DatasetScanAuditContext | None,
+) -> tuple[ScanCompleteness, ...]:
+    reports: list[ScanCompleteness] = []
+    for evidence, binding in sorted(
+        bound,
+        key=lambda item: (
+            str(item[0].artifact.path),
+            item[1].role.value,
+            item[1].dataset_split.value if item[1].dataset_split else "",
+        ),
+    ):
+        if (
+            dataset_scan_context is not None
+            and evidence.artifact.kind is ArtifactKind.DATASET
+        ):
+            if binding.dataset_split is None:
+                raise MaterializationUnavailable(
+                    "streaming dataset report lost its selected split"
+                )
+            reports.append(
+                dataset_scan_context.scan(
+                    binding.role.value,
+                    binding.dataset_split.value,
+                ).completeness
+            )
+        elif evidence.scan_completeness is not None:
+            reports.append(evidence.scan_completeness)
+    return tuple(reports)
 
 
 def _cleanup_plan_tree(plan_root: Path, created_identity: tuple[int, int]) -> None:
@@ -1542,8 +1899,23 @@ def execute_ephemeral_audit_with_trace(
             runtime,
             bound,
             revalidate_fixed_adapters=benchmark_profile,
+            metric_bound_paths=(
+                frozenset()
+                if plan.metric_binding is None
+                else frozenset(
+                    {
+                        str(plan.metric_binding.baseline_candidate.artifact_path),
+                        str(plan.metric_binding.candidate_candidate.artifact_path),
+                    }
+                )
+            ),
         )
-        metric_identity_context = _revalidate_metric_binding(plan, bound, captured)
+        metric_identity_context = _revalidate_metric_binding(
+            plan,
+            bound,
+            captured,
+            runtime.limits.streaming_limits,
+        )
         _revalidate_profile_selection(plan, bound)
         try:
             plan_root.mkdir(exist_ok=False)
@@ -1554,68 +1926,118 @@ def execute_ephemeral_audit_with_trace(
         created = True
         root_stat = os.lstat(plan_root)
         created_identity = (root_stat.st_dev, root_stat.st_ino)
-        manifest = (
-            None
-            if benchmark_profile
-            else _write_native_tree(plan_root, plan, captured, bound)
-        )
-        measurement_context = (
-            None
-            if plan.scientific_claim is None
-            else measurement_audit_context_from_materialization(
-                plan,
-                bound,
-                captured,
+        with ExitStack() as resources:
+            dataset_scan_context: DatasetScanAuditContext | None = None
+            if not benchmark_profile:
+                dataset_sources = _streaming_dataset_sources(
+                    runtime,
+                    bound,
+                    captured,
+                )
+                if dataset_sources is not None:
+                    dataset_scan_context = resources.enter_context(
+                        stream_dataset_audit_context(
+                            baseline_train=dataset_sources[("baseline", "train")],
+                            baseline_eval=dataset_sources[("baseline", "eval")],
+                            candidate_train=dataset_sources[("candidate", "train")],
+                            candidate_eval=dataset_sources[("candidate", "eval")],
+                            scratch_root=runtime.scratch_root,
+                            limits=runtime.limits.streaming_limits,
+                            manifest_paths={
+                                ("baseline", "train"): RepositoryPath(
+                                    "baseline/train.jsonl"
+                                ),
+                                ("baseline", "eval"): RepositoryPath(
+                                    "baseline/eval.jsonl"
+                                ),
+                                ("candidate", "train"): RepositoryPath(
+                                    "candidate/train.jsonl"
+                                ),
+                                ("candidate", "eval"): RepositoryPath(
+                                    "candidate/eval.jsonl"
+                                ),
+                            },
+                        )
+                    )
+            manifest = (
+                None
+                if benchmark_profile
+                else _write_native_tree(
+                    plan_root,
+                    plan,
+                    captured,
+                    bound,
+                    dataset_scan_context=dataset_scan_context,
+                )
             )
-        )
-        if plan.profiled_policy is None:
-            assert manifest is not None
-            result = (
-                audit_research(manifest, artifact_root=plan_root)
-                if measurement_context is None and metric_identity_context is None
-                else audit_research(
-                    manifest,
+            measurement_context = (
+                None
+                if plan.scientific_claim is None
+                else measurement_audit_context_from_materialization(
+                    plan,
+                    bound,
+                    captured,
+                )
+            )
+            if plan.profiled_policy is None:
+                assert manifest is not None
+                result = (
+                    audit_research(manifest, artifact_root=plan_root)
+                    if measurement_context is None
+                    and metric_identity_context is None
+                    and dataset_scan_context is None
+                    else audit_research(
+                        manifest,
+                        artifact_root=plan_root,
+                        measurement_context=measurement_context,
+                        metric_identity_context=metric_identity_context,
+                        dataset_scan_context=dataset_scan_context,
+                    )
+                )
+            else:
+                by_role = {
+                    role: tuple(
+                        evidence
+                        for evidence, binding in bound
+                        if binding.role is role
+                    )
+                    for role in (
+                        ExperimentRole.BASELINE,
+                        ExperimentRole.CANDIDATE,
+                        ExperimentRole.REFERENCE,
+                    )
+                }
+                result = audit_profiled(
+                    plan.profiled_policy,
+                    training_manifest=manifest,
                     artifact_root=plan_root,
+                    audit_claim=plan.audit_claim,
+                    baseline_evidence=by_role[ExperimentRole.BASELINE],
+                    candidate_evidence=by_role[ExperimentRole.CANDIDATE],
+                    reference_evidence=by_role[ExperimentRole.REFERENCE],
                     measurement_context=measurement_context,
                     metric_identity_context=metric_identity_context,
+                    dataset_scan_context=dataset_scan_context,
                 )
-            )
-        else:
-            by_role = {
-                role: tuple(
-                    evidence
-                    for evidence, binding in bound
-                    if binding.role is role
+            if type(result) is not AuditResult:
+                raise MaterializationUnavailable(
+                    "native Audit did not return an actual AuditResult"
                 )
-                for role in (
-                    ExperimentRole.BASELINE,
-                    ExperimentRole.CANDIDATE,
-                    ExperimentRole.REFERENCE,
+            reports = _execution_scan_reports(bound, dataset_scan_context)
+            try:
+                trace = _build_evidence_trace(
+                    plan,
+                    result,
+                    bound,
+                    captured,
+                    dataset_scan_context=dataset_scan_context,
                 )
-            }
-            result = audit_profiled(
-                plan.profiled_policy,
-                training_manifest=manifest,
-                artifact_root=plan_root,
-                audit_claim=plan.audit_claim,
-                baseline_evidence=by_role[ExperimentRole.BASELINE],
-                candidate_evidence=by_role[ExperimentRole.CANDIDATE],
-                reference_evidence=by_role[ExperimentRole.REFERENCE],
-                measurement_context=measurement_context,
-                metric_identity_context=metric_identity_context,
-            )
-        if type(result) is not AuditResult:
-            raise MaterializationUnavailable(
-                "native Audit did not return an actual AuditResult"
-            )
-        try:
-            trace = _build_evidence_trace(plan, result, bound, captured)
-        except Exception:
-            trace = EvidenceTraceBundle.unavailable(
-                head_sha=plan.head_sha,
-                result=result,
-            )
-        return EphemeralAuditExecution(result, trace)
+            except Exception:
+                trace = EvidenceTraceBundle.unavailable(
+                    head_sha=plan.head_sha,
+                    result=result,
+                )
+            return EphemeralAuditExecution(result, trace, reports)
     except (MaterializationPartial, MaterializationUnavailable):
         raise
     except Exception as error:
