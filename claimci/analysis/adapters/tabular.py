@@ -37,6 +37,7 @@ from .core import (
     AdapterLimitError,
     AdapterParseError,
     AdapterSelectorError,
+    _ArtifactEnvelope,
     _adapter_provenance,
     _evidence_id,
     _mapping,
@@ -166,19 +167,41 @@ def _unique_named_header(header: tuple[str, ...], names: frozenset[str]) -> str 
 
 
 def _generated_mappings(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     header: tuple[str, ...],
     rows: tuple[tuple[str, ...], ...],
     *,
     adapter_id: str,
 ) -> tuple[FieldMapping, ...]:
+    numeric = tuple(
+        _numeric_column(rows, index) for index in range(len(header))
+    )
+    return _generated_mappings_from_numeric(
+        artifact,
+        header,
+        numeric,
+        adapter_id=adapter_id,
+    )
+
+
+def _generated_mappings_from_numeric(
+    artifact: _ArtifactEnvelope,
+    header: tuple[str, ...],
+    numeric: tuple[bool, ...],
+    *,
+    adapter_id: str,
+) -> tuple[FieldMapping, ...]:
+    if len(numeric) != len(header):
+        raise AnalysisContractError(
+            "numeric column state must match the delimited header"
+        )
     run_header = _unique_named_header(header, _RUN_NAMES)
     seed_header = _unique_named_header(header, _SEED_NAMES)
     excluded = {item for item in (run_header, seed_header) if item is not None}
     metric_headers = tuple(
         item
         for index, item in enumerate(header)
-        if item not in excluded and _numeric_column(rows, index)
+        if item not in excluded and numeric[index]
     )
 
     selected: list[tuple[str, str]] = []
@@ -278,7 +301,7 @@ def _selected_row_indices(
 
 
 def _canonical_table_match(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     match: AdapterMatch,
 ) -> AdapterMatch:
     table_mappings = tuple(

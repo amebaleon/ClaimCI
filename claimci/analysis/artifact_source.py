@@ -65,6 +65,7 @@ class ScanReason(str, Enum):
     SIZE_MISMATCH = "size_mismatch"
     SHA_MISMATCH = "sha_mismatch"
     SOURCE_CHANGED = "source_changed"
+    SELECTOR_MISMATCH = "selector_mismatch"
 
 
 def _positive_int(value: object, label: str, maximum: int) -> int:

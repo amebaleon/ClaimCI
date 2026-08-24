@@ -20,8 +20,11 @@ from .registry import ADAPTERS, extract_registered_artifact, get_adapter
 from .structured import JsonAdapter, JsonLinesAdapter
 from .streaming import (
     StreamingExtraction,
+    StreamingDelimitedSchemaScan,
     StreamingSchemaScan,
     extract_registered_source,
+    scan_delimited_observations,
+    scan_delimited_schema,
     scan_jsonl_observations,
     scan_jsonl_schema,
 )
@@ -48,6 +51,7 @@ __all__ = [
     "NativeResultsAdapter",
     "PassiveJsonLinesDatasetAdapter",
     "StreamingExtraction",
+    "StreamingDelimitedSchemaScan",
     "StreamingSchemaScan",
     "TomlConfigAdapter",
     "TsvAdapter",
@@ -55,6 +59,8 @@ __all__ = [
     "extract_registered_artifact",
     "extract_registered_source",
     "get_adapter",
+    "scan_delimited_observations",
+    "scan_delimited_schema",
     "scan_jsonl_observations",
     "scan_jsonl_schema",
 ]
