@@ -213,18 +213,36 @@ def _canonical_relative(value: str) -> PurePosixPath:
 
 
 def _resolved_root(value: Path) -> tuple[Path, tuple[int, int, int]]:
+    raw = Path(value)
+    candidate = raw if raw.is_absolute() else Path.cwd() / raw
     try:
-        root = Path(value).resolve(strict=True)
+        current = Path(candidate.anchor)
+        for component in candidate.parts[1:]:
+            current = current / component
+            observed = os.lstat(current)
+            if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(
+                observed.st_mode
+            ):
+                raise StreamingIntegrityError(
+                    "artifact source root is not trusted"
+                )
+        root = candidate.resolve(strict=True)
         observed = os.lstat(root)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise StreamingIntegrityError("artifact source root is unavailable") from error
-    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+    if (
+        root != candidate
+        or stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+    ):
         raise StreamingIntegrityError("artifact source root is not trusted")
     return root, _path_identity(observed)
 
 
 def _open_descriptor(
     source: "ArtifactSource",
+    *,
+    enforce_issued_identity: bool = True,
 ) -> tuple[
     int,
     Path,
@@ -268,6 +286,12 @@ def _open_descriptor(
         ) != _file_open_identity(before):
             os.close(descriptor)
             raise StreamingIntegrityError("artifact source identity changed during open")
+        if (
+            enforce_issued_identity
+            and _path_identity(opened) != source._artifact_identity
+        ):
+            os.close(descriptor)
+            raise StreamingIntegrityError("artifact source identity changed")
         return descriptor, current, opened, tuple(components)
     except StreamingIntegrityError:
         raise
@@ -284,6 +308,10 @@ class ArtifactSource:
     candidate: ArtifactCandidate
     _root: Path = field(repr=False, compare=False)
     _root_identity: tuple[int, int, int] = field(repr=False, compare=False)
+    _artifact_identity: tuple[int, int, int] = field(
+        repr=False,
+        compare=False,
+    )
 
     def __init__(self) -> None:
         raise TypeError("ArtifactSource values require the trusted snapshot factory")
@@ -303,7 +331,15 @@ class ArtifactSource:
         object.__setattr__(instance, "candidate", candidate)
         object.__setattr__(instance, "_root", resolved)
         object.__setattr__(instance, "_root_identity", identity)
-        descriptor, _path, _opened, _components = _open_descriptor(instance)
+        descriptor, _path, opened, _components = _open_descriptor(
+            instance,
+            enforce_issued_identity=False,
+        )
+        object.__setattr__(
+            instance,
+            "_artifact_identity",
+            _path_identity(opened),
+        )
         os.close(descriptor)
         return instance
 
