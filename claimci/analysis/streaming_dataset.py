@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 import stat
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -149,6 +149,7 @@ class DatasetSplitScan:
     path: RepositoryPath
     artifact_sha256: Sha256Digest
     artifact_size: int
+    source_trace_sha256: Sha256Digest
     completeness: ScanCompleteness
     indexed_records: int
 
@@ -159,6 +160,8 @@ class DatasetSplitScan:
             raise TypeError("dataset scan path must be RepositoryPath")
         if not isinstance(self.artifact_sha256, Sha256Digest):
             raise TypeError("dataset scan sha256 must be Sha256Digest")
+        if not isinstance(self.source_trace_sha256, Sha256Digest):
+            raise TypeError("dataset scan trace sha256 must be Sha256Digest")
         if type(self.completeness) is not ScanCompleteness:
             raise TypeError("dataset scan completeness is invalid")
         if (
@@ -452,6 +455,10 @@ class DatasetScanAuditContext:
     _store: _DatasetSpill = field(repr=False, compare=False)
     _active: bool = field(repr=False, compare=False)
     _preview_limit: int = field(repr=False, compare=False)
+    _manifest_paths: tuple[tuple[str, str, RepositoryPath], ...] = field(
+        repr=False,
+        compare=False,
+    )
 
     def __init__(self) -> None:
         raise TypeError(
@@ -467,6 +474,7 @@ class DatasetScanAuditContext:
         scans: tuple[DatasetSplitScan, ...],
         store: _DatasetSpill,
         preview_limit: int,
+        manifest_paths: tuple[tuple[str, str, RepositoryPath], ...],
     ) -> DatasetScanAuditContext:
         instance = object.__new__(cls)
         object.__setattr__(instance, "repository", repository)
@@ -475,6 +483,7 @@ class DatasetScanAuditContext:
         object.__setattr__(instance, "_store", store)
         object.__setattr__(instance, "_active", True)
         object.__setattr__(instance, "_preview_limit", preview_limit)
+        object.__setattr__(instance, "_manifest_paths", manifest_paths)
         return instance
 
     def _require_active(self) -> None:
@@ -530,16 +539,24 @@ class DatasetScanAuditContext:
     ) -> None:
         self._require_active()
         resolved_root = Path(root).resolve(strict=True)
+        expected = {
+            (experiment, split): path
+            for experiment, split, path in self._manifest_paths
+        }
+        if set(paths) != set(expected):
+            raise ClaimCIError(
+                "dataset scan context does not match the confined manifest"
+            )
         for key, path in paths.items():
             try:
-                relative = Path(path).resolve(strict=True).relative_to(
+                relative = Path(path).resolve(strict=False).relative_to(
                     resolved_root
                 ).as_posix()
             except (OSError, RuntimeError, ValueError) as error:
                 raise ClaimCIError(
                     "dataset scan context does not match the confined manifest"
                 ) from error
-            if self.scan(*key).path != RepositoryPath(relative):
+            if expected[key] != RepositoryPath(relative):
                 raise ClaimCIError(
                     "dataset scan context does not match the confined manifest"
                 )
@@ -684,6 +701,7 @@ def _scan_dataset(
         path=source.candidate.path,
         artifact_sha256=source.candidate.sha256,
         artifact_size=source.candidate.size,
+        source_trace_sha256=Sha256Digest(scan.trace_sha256),
         completeness=report,
         indexed_records=indexed,
     )
@@ -698,6 +716,7 @@ def stream_dataset_audit_context(
     candidate_eval: ArtifactSource,
     scratch_root: Path,
     limits: StreamingLimits = StreamingLimits(),
+    manifest_paths: Mapping[tuple[str, str], RepositoryPath] | None = None,
 ) -> Iterator[DatasetScanAuditContext]:
     """Yield a live factory-only Audit context and always remove its spill."""
 
@@ -717,6 +736,29 @@ def stream_dataset_audit_context(
         raise AnalysisContractError(
             "streaming dataset sources must share one repository and exact head"
         )
+    source_paths = {
+        (experiment, split): source.candidate.path
+        for experiment, split, source in keyed
+    }
+    if manifest_paths is None:
+        fixed_manifest_paths = source_paths
+    else:
+        if not isinstance(manifest_paths, Mapping) or set(manifest_paths) != set(
+            source_paths
+        ):
+            raise AnalysisContractError(
+                "dataset manifest aliases must cover every exact scan source"
+            )
+        fixed_manifest_paths = {
+            key: (
+                value
+                if isinstance(value, RepositoryPath)
+                else RepositoryPath(value)
+            )
+            for key, value in manifest_paths.items()
+        }
+        if len(set(fixed_manifest_paths.values())) != len(fixed_manifest_paths):
+            raise AnalysisContractError("dataset manifest aliases must be unique")
     store = _DatasetSpill(Path(scratch_root), limits.max_scratch_bytes)
     context: DatasetScanAuditContext | None = None
     try:
@@ -736,6 +778,10 @@ def stream_dataset_audit_context(
             scans=scans,
             store=store,
             preview_limit=limits.max_hash_previews,
+            manifest_paths=tuple(
+                (experiment, split, fixed_manifest_paths[(experiment, split)])
+                for experiment, split, _source in keyed
+            ),
         )
         yield context
     finally:

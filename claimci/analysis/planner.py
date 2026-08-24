@@ -1528,6 +1528,27 @@ def _plan_id_from_components(
             ),
         ),
     }
+    streaming_scans = tuple(
+        {
+            "evidence_id": item.evidence_id,
+            "path": str(item.artifact.path),
+            "source_trace_sha256": str(item.source_trace_sha256),
+            "purpose": item.scan_completeness.purpose.value,
+            "state": item.scan_completeness.state.value,
+            "reason": item.scan_completeness.reason.value,
+            "records_scanned": item.scan_completeness.records_scanned,
+            "semantic_bytes": item.scan_completeness.semantic_bytes,
+            "integrity_bytes": item.scan_completeness.integrity_bytes,
+            "expected_bytes": item.scan_completeness.expected_bytes,
+            "integrity_verified": item.scan_completeness.integrity_verified,
+            "peak_buffer_bytes": item.scan_completeness.peak_buffer_bytes,
+            "scratch_bytes": item.scan_completeness.scratch_bytes,
+        }
+        for item in sorted(evidence, key=lambda value: value.evidence_id)
+        if item.scan_completeness is not None
+    )
+    if streaming_scans:
+        projection["streaming_scans"] = streaming_scans
     if metric_binding is not None:
         projection["metric_binding"] = metric_binding_material(metric_binding)
     if profiled_policy is not None:
