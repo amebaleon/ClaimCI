@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
@@ -170,6 +171,33 @@ def determine_verdict(findings: list[Finding] | tuple[Finding, ...]) -> Verdict:
     return Verdict.SUPPORTED
 
 
+def _metric_identity_finding(context: object, metric: str) -> Finding:
+    from .analysis.metric_identity import (
+        MetricIdentityAuditContext,
+        metric_binding_material,
+    )
+
+    if type(context) is not MetricIdentityAuditContext:
+        raise TypeError(
+            "metric_identity_context must be a trusted exact-head context or null"
+        )
+    if context.binding.canonical_metric != metric:
+        raise ClaimCIError(
+            "exact-head metric binding does not match the audited metric"
+        )
+    return Finding(
+        rule_id="RESULT.METRIC_IDENTITY_VERIFIED",
+        severity=Severity.VERIFIED,
+        title="Exact baseline and candidate metric identities verified",
+        explanation=(
+            "ClaimCI independently revalidated both bound raw metric selectors "
+            "against the exact-head passive artifacts."
+        ),
+        evidence=metric_binding_material(context.binding),
+        impact=Impact.NONE,
+    )
+
+
 def _artifact_failure(
     category: str,
     experiment: str,
@@ -192,6 +220,7 @@ def audit_research(
     *,
     artifact_root: Path | None = None,
     measurement_context: MeasurementAuditContext | None = None,
+    metric_identity_context: object | None = None,
 ) -> AuditResult:
     if measurement_context is not None and type(
         measurement_context
@@ -199,6 +228,13 @@ def audit_research(
         raise TypeError(
             "measurement_context must be a trusted MeasurementAuditContext or null"
         )
+    if metric_identity_context is not None:
+        from .analysis.metric_identity import MetricIdentityAuditContext
+
+        if type(metric_identity_context) is not MetricIdentityAuditContext:
+            raise TypeError(
+                "metric_identity_context must be a trusted exact-head context or null"
+            )
     spec = load_research_spec(path, artifact_root=artifact_root)
     findings: list[Finding] = []
     overlaps = []
@@ -297,6 +333,8 @@ def audit_research(
             )
         )
 
+    if metric_identity_context is not None:
+        findings.append(_metric_identity_finding(metric_identity_context, spec.metric))
     verdict = determine_verdict(findings)
     measurement_drift = None
     if measurement_context is not None:
@@ -344,6 +382,7 @@ def audit_profiled(
     candidate_evidence: object,
     reference_evidence: object = (),
     measurement_context: MeasurementAuditContext | None = None,
+    metric_identity_context: object | None = None,
 ) -> AuditResult:
     """Dispatch one evidence profile into the single native Audit authority."""
 
@@ -359,6 +398,7 @@ def audit_profiled(
             training_manifest,
             artifact_root=artifact_root,
             measurement_context=measurement_context,
+            metric_identity_context=metric_identity_context,
         )
     if type(audit_claim) is not AuditClaimSpec:
         raise TypeError("Benchmark profile requires AuditClaimSpec")
@@ -373,11 +413,20 @@ def audit_profiled(
             raise TypeError(f"profiled Audit {label} evidence is invalid")
     from .benchmark_audit import audit_benchmark
 
-    return audit_benchmark(
+    result = audit_benchmark(
         audit_claim=audit_claim,
         selection=profiled_policy.profile_selection,
         baseline_evidence=baseline_evidence,
         candidate_evidence=candidate_evidence,
         reference_evidence=reference_evidence,
         measurement_context=measurement_context,
+    )
+    if metric_identity_context is None:
+        return result
+    finding = _metric_identity_finding(metric_identity_context, audit_claim.metric)
+    findings = (*result.findings, finding)
+    return replace(
+        result,
+        findings=findings,
+        verdict=determine_verdict(findings),
     )
