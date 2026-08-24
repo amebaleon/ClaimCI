@@ -18,12 +18,15 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from claimci.models import AuditResult, Direction, Verdict
 from claimci.report import render_json
 
 from .confidence import Confidence
+
+if TYPE_CHECKING:
+    from .artifact_source import ScanCompleteness
 
 
 class AnalysisContractError(ValueError):
@@ -665,6 +668,7 @@ class NormalizedEvidence:
     artifact: ArtifactCandidate
     adapter_match: AdapterMatch
     observations: tuple[NormalizedObservation, ...]
+    scan_completeness: ScanCompleteness | None = None
 
     def __post_init__(self) -> None:
         _bounded_id(self.evidence_id, "evidence_id", maximum=128)
@@ -682,6 +686,17 @@ class NormalizedEvidence:
             raise TypeError(
                 "normalized evidence observations must be a non-empty tuple"
             )
+        if self.scan_completeness is not None:
+            from .artifact_source import ScanCompleteness
+
+            if type(self.scan_completeness) is not ScanCompleteness:
+                raise TypeError(
+                    "normalized evidence scan_completeness must be ScanCompleteness"
+                )
+            if not self.scan_completeness.integrity_verified:
+                raise AnalysisContractError(
+                    "normalized evidence requires verified streaming integrity"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1714,6 +1729,18 @@ def to_jsonable(value: object) -> object:
         from .trace import trace_to_jsonable
 
         return trace_to_jsonable(value)
+    if type(value) is NormalizedEvidence:
+        serialized = {
+            "evidence_id": to_jsonable(value.evidence_id),
+            "artifact": to_jsonable(value.artifact),
+            "adapter_match": to_jsonable(value.adapter_match),
+            "observations": to_jsonable(value.observations),
+        }
+        if value.scan_completeness is not None:
+            serialized["scan_completeness"] = to_jsonable(
+                value.scan_completeness
+            )
+        return serialized
     if isinstance(value, Confidence):
         return value.value
     if isinstance(value, Enum):

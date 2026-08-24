@@ -13,10 +13,12 @@ import math
 import re
 from collections.abc import Mapping
 from pathlib import PurePosixPath
+from typing import Protocol
 
 from claimci.analysis import (
     AdapterMatch,
     AnalysisContractError,
+    ArtifactCandidate,
     ArtifactKind,
     EvidenceSelector,
     FieldMapping,
@@ -37,6 +39,10 @@ MAX_LOGICAL_RECORD_BYTES = 1024 * 1024
 
 _DOTTED_SEGMENT = re.compile(r"[A-Za-z0-9_-]+\Z")
 _CANONICAL_ARRAY_INDEX = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+
+
+class _ArtifactEnvelope(Protocol):
+    candidate: ArtifactCandidate
 
 
 class AdapterError(AnalysisContractError):
@@ -274,7 +280,7 @@ def _finite_number(value: object, *, label: str) -> float:
 
 
 def _adapter_provenance(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     *,
     adapter_id: str,
     selector: str,
@@ -296,7 +302,7 @@ def _adapter_provenance(
 
 
 def _mapping(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     *,
     adapter_id: str,
     target_field: str,
@@ -325,7 +331,7 @@ def _config_target(selector: str) -> str:
 
 
 def _supports(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     *,
     kinds: frozenset[ArtifactKind],
     suffixes: frozenset[str],
@@ -335,7 +341,7 @@ def _supports(
 
 
 def _validate_match(
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     match: AdapterMatch,
     *,
     adapter_id: str,
@@ -384,7 +390,7 @@ def _validate_match(
 
 def _evidence_id(
     adapter_id: str,
-    artifact: PassiveArtifact,
+    artifact: _ArtifactEnvelope,
     *,
     adapter_semantic_version: str | None = None,
     selector_identity: object | None = None,

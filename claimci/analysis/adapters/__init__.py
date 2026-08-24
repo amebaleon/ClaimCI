@@ -18,6 +18,13 @@ from .dataset import PassiveJsonLinesDatasetAdapter
 from .native import NativeConfigAdapter, NativeManifestAdapter, NativeResultsAdapter
 from .registry import ADAPTERS, extract_registered_artifact, get_adapter
 from .structured import JsonAdapter, JsonLinesAdapter
+from .streaming import (
+    StreamingExtraction,
+    StreamingSchemaScan,
+    extract_registered_source,
+    scan_jsonl_observations,
+    scan_jsonl_schema,
+)
 from .tabular import CsvAdapter, TsvAdapter
 
 __all__ = [
@@ -40,9 +47,14 @@ __all__ = [
     "NativeManifestAdapter",
     "NativeResultsAdapter",
     "PassiveJsonLinesDatasetAdapter",
+    "StreamingExtraction",
+    "StreamingSchemaScan",
     "TomlConfigAdapter",
     "TsvAdapter",
     "YamlConfigAdapter",
     "extract_registered_artifact",
+    "extract_registered_source",
     "get_adapter",
+    "scan_jsonl_observations",
+    "scan_jsonl_schema",
 ]
