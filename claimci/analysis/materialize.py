@@ -619,6 +619,73 @@ def _capture_plan_artifacts(
     return captured
 
 
+def _revalidate_metric_binding(
+    plan: EphemeralAuditPlan,
+    bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
+    captured: Mapping[str, PassiveArtifact],
+) -> object | None:
+    metric_binding = plan.metric_binding
+    if metric_binding is None:
+        return None
+    if plan.audit_claim is None:
+        raise MaterializationUnavailable(
+            "entire metric pair binding is invalid; re-approval is required"
+        )
+    failures: list[Exception | str] = []
+    from . import metric_identity
+
+    if (
+        metric_binding.repository != plan.repository
+        or metric_binding.head_sha != plan.head_sha
+        or metric_binding.canonical_metric != plan.audit_claim.metric
+    ):
+        failures.append("binding scope changed")
+    for role, endpoint in (
+        (ExperimentRole.BASELINE, metric_binding.baseline_candidate),
+        (ExperimentRole.CANDIDATE, metric_binding.candidate_candidate),
+    ):
+        try:
+            passive = captured.get(str(endpoint.artifact_path))
+            if passive is None:
+                raise AnalysisContractError("bound artifact was not captured")
+            planned = tuple(
+                evidence
+                for evidence, artifact_binding in bound
+                if artifact_binding.role is role
+                and evidence.artifact.path == endpoint.artifact_path
+                and evidence.artifact.sha256 == endpoint.artifact_sha256
+            )
+            if len(planned) != 1:
+                raise AnalysisContractError(
+                    "bound endpoint has no unique planned evidence"
+                )
+            current = metric_identity.extract_metric_candidates(
+                passive,
+                role=role,
+                adapter_match=planned[0].adapter_match,
+            )
+            if endpoint not in current:
+                raise AnalysisContractError("bound candidate identity is stale")
+            fresh = metric_identity.extract_bound_metric_evidence(
+                passive,
+                metric_binding,
+                role=role,
+            )
+            if fresh != planned[0]:
+                raise AnalysisContractError(
+                    "bound normalized evidence changed at materialization"
+                )
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        raise MaterializationUnavailable(
+            "entire metric pair binding is stale; re-approval is required"
+        )
+    return metric_identity.MetricIdentityAuditContext._from_revalidation(
+        metric_binding
+    )
+
+
 def _revalidate_fixed_adapter(
     evidence: NormalizedEvidence,
     binding: ArtifactBinding,
@@ -1476,6 +1543,7 @@ def execute_ephemeral_audit_with_trace(
             bound,
             revalidate_fixed_adapters=benchmark_profile,
         )
+        metric_identity_context = _revalidate_metric_binding(plan, bound, captured)
         _revalidate_profile_selection(plan, bound)
         try:
             plan_root.mkdir(exist_ok=False)
@@ -1504,11 +1572,12 @@ def execute_ephemeral_audit_with_trace(
             assert manifest is not None
             result = (
                 audit_research(manifest, artifact_root=plan_root)
-                if measurement_context is None
+                if measurement_context is None and metric_identity_context is None
                 else audit_research(
                     manifest,
                     artifact_root=plan_root,
                     measurement_context=measurement_context,
+                    metric_identity_context=metric_identity_context,
                 )
             )
         else:
@@ -1533,6 +1602,7 @@ def execute_ephemeral_audit_with_trace(
                 candidate_evidence=by_role[ExperimentRole.CANDIDATE],
                 reference_evidence=by_role[ExperimentRole.REFERENCE],
                 measurement_context=measurement_context,
+                metric_identity_context=metric_identity_context,
             )
         if type(result) is not AuditResult:
             raise MaterializationUnavailable(
