@@ -193,3 +193,206 @@ def check_evaluation_alignment(
             impact=Impact.INVALIDATES,
         )
     ]
+
+
+def check_streaming_dataset_context(
+    context: object,
+) -> tuple[tuple[OverlapSummary, ...], list[Finding]]:
+    """Translate trusted scan facts into existing native dataset findings."""
+
+    from .analysis.streaming_dataset import DatasetScanAuditContext
+
+    if type(context) is not DatasetScanAuditContext:
+        raise TypeError(
+            "streaming dataset checks require DatasetScanAuditContext"
+        )
+    overlaps: list[OverlapSummary] = []
+    findings: list[Finding] = []
+    for experiment in ("baseline", "candidate"):
+        fact = context.overlap_fact(experiment)
+        overlap_rate = (
+            fact.overlap_count / fact.eval_count if fact.eval_count else 0.0
+        )
+        summary = OverlapSummary(
+            experiment=experiment,
+            train_count=fact.train_count,
+            eval_count=fact.eval_count,
+            overlap_count=fact.overlap_count,
+            overlap_rate=overlap_rate,
+            overlapping_hashes=fact.overlapping_hashes,
+        )
+        overlaps.append(summary)
+        preview_truncated = (
+            fact.overlapping_distinct_count > len(fact.overlapping_hashes)
+        )
+        if fact.overlap_count:
+            evidence = {
+                "experiment": experiment,
+                "train_count": fact.train_count,
+                "eval_count": fact.eval_count,
+                "overlap_count": fact.overlap_count,
+                "hashes": list(fact.overlapping_hashes),
+                "hash_preview_truncated": preview_truncated,
+                "train_artifact_path": str(fact.train_scan.path),
+                "train_artifact_sha256": str(fact.train_scan.artifact_sha256),
+                "eval_artifact_path": str(fact.eval_scan.path),
+                "eval_artifact_sha256": str(fact.eval_scan.artifact_sha256),
+                "train_scan_state": fact.train_scan.completeness.state.value,
+                "eval_scan_state": fact.eval_scan.completeness.state.value,
+                "integrity_verified": True,
+            }
+            if fact.complete:
+                evidence["overlap_rate"] = overlap_rate
+                explanation = (
+                    f"Found {fact.overlap_count} exact canonical overlap(s), "
+                    f"covering {overlap_rate:.1%} of evaluation records."
+                )
+            else:
+                evidence.update(
+                    {
+                        "scope": "inspected_exact_records_only",
+                        "train_records_scanned": (
+                            fact.train_scan.completeness.records_scanned
+                        ),
+                        "eval_records_scanned": (
+                            fact.eval_scan.completeness.records_scanned
+                        ),
+                    }
+                )
+                explanation = (
+                    f"Found {fact.overlap_count} exact canonical overlap(s) "
+                    "among inspected records bound to integrity-verified artifacts. "
+                    "No claim is made about unscanned records."
+                )
+            findings.append(
+                Finding(
+                    rule_id="DATASET.EXACT_LEAKAGE",
+                    severity=Severity.CRITICAL,
+                    title=(
+                        f"{experiment.title()} evaluation data appears in "
+                        "training data"
+                    ),
+                    explanation=explanation,
+                    evidence=evidence,
+                    impact=Impact.INVALIDATES,
+                )
+            )
+        elif fact.complete:
+            findings.append(
+                Finding(
+                    rule_id="DATASET.NO_LEAKAGE",
+                    severity=Severity.VERIFIED,
+                    title=f"{experiment.title()} has no exact train/eval leakage",
+                    explanation=(
+                        "No canonical evaluation record hash appears in the "
+                        "training split."
+                    ),
+                    evidence={
+                        "experiment": experiment,
+                        "train_count": fact.train_count,
+                        "eval_count": fact.eval_count,
+                        "overlap_count": 0,
+                        "overlap_rate": 0.0,
+                        "train_artifact_path": str(fact.train_scan.path),
+                        "train_artifact_sha256": str(
+                            fact.train_scan.artifact_sha256
+                        ),
+                        "eval_artifact_path": str(fact.eval_scan.path),
+                        "eval_artifact_sha256": str(
+                            fact.eval_scan.artifact_sha256
+                        ),
+                        "train_scan_state": (
+                            fact.train_scan.completeness.state.value
+                        ),
+                        "eval_scan_state": fact.eval_scan.completeness.state.value,
+                        "integrity_verified": True,
+                    },
+                    impact=Impact.NONE,
+                )
+            )
+        if not fact.complete:
+            findings.append(
+                Finding(
+                    rule_id="DATASET.SCAN_INCOMPLETE",
+                    severity=Severity.WARNING,
+                    title=f"{experiment.title()} dataset scan is incomplete",
+                    explanation=(
+                        "Exact artifact integrity was verified, but bounded "
+                        "semantic scanning did not establish complete dataset facts."
+                    ),
+                    evidence={
+                        "experiment": experiment,
+                        "train_scan_state": fact.train_scan.completeness.state.value,
+                        "train_scan_reason": fact.train_scan.completeness.reason.value,
+                        "train_records_scanned": (
+                            fact.train_scan.completeness.records_scanned
+                        ),
+                        "eval_scan_state": fact.eval_scan.completeness.state.value,
+                        "eval_scan_reason": fact.eval_scan.completeness.reason.value,
+                        "eval_records_scanned": (
+                            fact.eval_scan.completeness.records_scanned
+                        ),
+                        "integrity_verified": True,
+                        "train_artifact_sha256": str(
+                            fact.train_scan.artifact_sha256
+                        ),
+                        "eval_artifact_sha256": str(
+                            fact.eval_scan.artifact_sha256
+                        ),
+                    },
+                    impact=Impact.INSUFFICIENT,
+                )
+            )
+
+    alignment = context.evaluation_alignment_fact()
+    if alignment is not None:
+        baseline_eval_scan = context.scan("baseline", "eval")
+        candidate_eval_scan = context.scan("candidate", "eval")
+        evidence = {
+            "baseline_eval_count": alignment.baseline.record_count,
+            "candidate_eval_count": alignment.candidate.record_count,
+            "matching_count": alignment.matching_count,
+            "baseline_only_count": alignment.baseline_only_count,
+            "candidate_only_count": alignment.candidate_only_count,
+            "baseline_only": [
+                {"hash": digest, "count": count}
+                for digest, count in alignment.baseline_only
+            ],
+            "candidate_only": [
+                {"hash": digest, "count": count}
+                for digest, count in alignment.candidate_only
+            ],
+            "baseline_eval_sha256": str(baseline_eval_scan.artifact_sha256),
+            "candidate_eval_sha256": str(candidate_eval_scan.artifact_sha256),
+            "scan_state": "complete",
+            "integrity_verified": True,
+        }
+        if alignment.baseline == alignment.candidate:
+            findings.append(
+                Finding(
+                    rule_id="DATASET.EVALUATION_ALIGNED",
+                    severity=Severity.VERIFIED,
+                    title="Baseline and candidate evaluation records are aligned",
+                    explanation=(
+                        "Both evaluation datasets contain the same canonical "
+                        "record hash multiset."
+                    ),
+                    evidence=evidence,
+                    impact=Impact.NONE,
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    rule_id="DATASET.EVALUATION_MISMATCH",
+                    severity=Severity.CRITICAL,
+                    title="Baseline and candidate evaluation records differ",
+                    explanation=(
+                        "A valid comparison requires both experiments to use "
+                        "the same canonical evaluation-record multiset."
+                    ),
+                    evidence=evidence,
+                    impact=Impact.INVALIDATES,
+                )
+            )
+    return tuple(overlaps), findings
