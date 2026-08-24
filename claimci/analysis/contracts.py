@@ -672,6 +672,7 @@ class NormalizedEvidence:
     adapter_match: AdapterMatch
     observations: tuple[NormalizedObservation, ...]
     scan_completeness: ScanCompleteness | None = None
+    source_trace_sha256: Sha256Digest | None = None
 
     def __post_init__(self) -> None:
         _bounded_id(self.evidence_id, "evidence_id", maximum=128)
@@ -700,6 +701,20 @@ class NormalizedEvidence:
                 raise AnalysisContractError(
                     "normalized evidence requires verified streaming integrity"
                 )
+        if self.source_trace_sha256 is not None and not isinstance(
+            self.source_trace_sha256, Sha256Digest
+        ):
+            object.__setattr__(
+                self,
+                "source_trace_sha256",
+                Sha256Digest(self.source_trace_sha256),
+            )
+        if (self.scan_completeness is None) != (
+            self.source_trace_sha256 is None
+        ):
+            raise AnalysisContractError(
+                "streaming completeness and source trace digest must appear together"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1846,6 +1861,9 @@ def to_jsonable(value: object) -> object:
         if value.scan_completeness is not None:
             serialized["scan_completeness"] = to_jsonable(
                 value.scan_completeness
+            )
+            serialized["source_trace_sha256"] = to_jsonable(
+                value.source_trace_sha256
             )
         return serialized
     if isinstance(value, Confidence):

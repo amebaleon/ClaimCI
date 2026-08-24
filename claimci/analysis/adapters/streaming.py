@@ -553,6 +553,7 @@ def scan_jsonl_observations(
             adapter_match=match,
             observations=tuple(observations),
             scan_completeness=report,
+            source_trace_sha256=scan.trace_sha256,
         )
         return StreamingExtraction(evidence, report)
 
@@ -970,6 +971,7 @@ def scan_delimited_observations(
                 adapter_match=canonical_match,
                 observations=tuple(observations),
                 scan_completeness=report,
+                source_trace_sha256=scan.trace_sha256,
             )
             return StreamingExtraction(evidence, report)
         except _ScanStop as stop:
@@ -1025,6 +1027,7 @@ def _extract_dataset_identity(
             ),
         ),
         scan_completeness=report,
+        source_trace_sha256=scan.trace_sha256,
     )
     return StreamingExtraction(evidence, report)
 

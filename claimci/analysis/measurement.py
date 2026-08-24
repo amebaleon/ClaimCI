@@ -17,6 +17,7 @@ from claimci.measurement import (
 )
 
 from .claim_types import CanonicalScientificClaim, recover_scientific_claim
+from .artifact_source import ArtifactSource
 from .contracts import (
     AnalysisContractError,
     ArtifactBinding,
@@ -162,9 +163,9 @@ def _measurement_source_selector(mapping: FieldMapping) -> MeasurementSourceSele
 def measurement_audit_context_from_materialization(
     plan: EphemeralAuditPlan,
     bound: tuple[tuple[NormalizedEvidence, ArtifactBinding], ...],
-    captured: Mapping[str, PassiveArtifact],
+    captured: Mapping[str, PassiveArtifact | ArtifactSource],
 ) -> MeasurementAuditContext:
-    """Commit exact passive bindings after runtime revalidation, before Audit."""
+    """Commit exact source bindings after runtime revalidation, before Audit."""
 
     if type(plan) is not EphemeralAuditPlan:
         raise TypeError("measurement source context requires EphemeralAuditPlan")
@@ -183,15 +184,18 @@ def measurement_audit_context_from_materialization(
     ):
         raise AnalysisContractError("measurement bound evidence exceeds its limit")
     if not isinstance(captured, Mapping):
-        raise TypeError("measurement source context requires captured passive artifacts")
+        raise TypeError("measurement source context requires captured artifacts")
     by_role: dict[ExperimentRole, list[MeasurementSourceBinding]] = {
         ExperimentRole.BASELINE: [],
         ExperimentRole.CANDIDATE: [],
         ExperimentRole.REFERENCE: [],
     }
     for evidence, binding in bound:
-        passive = captured.get(str(binding.path))
-        if type(passive) is not PassiveArtifact or passive.candidate != evidence.artifact:
+        source = captured.get(str(binding.path))
+        if (
+            type(source) not in {PassiveArtifact, ArtifactSource}
+            or source.candidate != evidence.artifact
+        ):
             raise AnalysisContractError(
                 "measurement source binding is not the exact captured artifact"
             )

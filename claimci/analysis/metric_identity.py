@@ -848,6 +848,7 @@ def extract_bound_metric_evidence(
     binding: MetricBinding,
     *,
     role: ExperimentRole,
+    limits: StreamingLimits = StreamingLimits(),
 ) -> NormalizedEvidence:
     """Rerun a fixed adapter and project one exact raw metric to its claim name."""
 
@@ -855,6 +856,8 @@ def extract_bound_metric_evidence(
         raise TypeError(
             "bound metric extraction requires PassiveArtifact or ArtifactSource"
         )
+    if type(limits) is not StreamingLimits:
+        raise TypeError("bound metric streaming limits must be StreamingLimits")
     endpoint = _endpoint(binding, role)
     if (
         passive.candidate.path != endpoint.artifact_path
@@ -864,7 +867,7 @@ def extract_bound_metric_evidence(
             "artifact is not the exact bound metric candidate"
     )
     if type(passive) is ArtifactSource:
-        scan = extract_metric_candidate_scan(passive, role=role)
+        scan = extract_metric_candidate_scan(passive, role=role, limits=limits)
         if not scan.completeness.complete:
             raise AnalysisContractError(
                 "exact bound metric candidate is stale and requires pair re-approval"
@@ -906,6 +909,7 @@ def extract_bound_metric_evidence(
         current = extract_metric_candidate_scan(
             passive,
             role=role,
+            limits=limits,
             adapter_match=selected_match,
         )
         if endpoint not in current.candidates:
@@ -913,9 +917,17 @@ def extract_bound_metric_evidence(
                 "exact bound metric candidate is stale and requires pair re-approval"
             )
         if endpoint.adapter_id == "claimci-jsonl-v1":
-            outcome = scan_jsonl_observations(passive, selected_match)
+            outcome = scan_jsonl_observations(
+                passive,
+                selected_match,
+                limits=limits,
+            )
         elif endpoint.adapter_id in {"claimci-csv-v1", "claimci-tsv-v1"}:
-            outcome = scan_delimited_observations(passive, selected_match)
+            outcome = scan_delimited_observations(
+                passive,
+                selected_match,
+                limits=limits,
+            )
         else:
             raise AnalysisContractError(
                 "bound metric adapter has no trusted streaming implementation"
