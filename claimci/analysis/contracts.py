@@ -1177,6 +1177,7 @@ class EphemeralAuditPlan:
     evidence_obligations: "EvidenceObligationBundle | None" = None
     profiled_policy: "ProfiledEvidencePolicy | None" = None
     reference_evidence: tuple[NormalizedEvidence, ...] = ()
+    metric_binding: "MetricBinding | None" = None
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1359,6 +1360,32 @@ class EphemeralAuditPlan:
                 and self.reference_evidence
             ):
                 raise AnalysisContractError("Training profile cannot carry reference evidence")
+        if self.metric_binding is not None:
+            from .metric_identity import (
+                MetricBinding,
+                validate_metric_binding_inputs,
+            )
+
+            if type(self.metric_binding) is not MetricBinding:
+                raise TypeError("plan metric_binding must be MetricBinding or null")
+            if self.audit_claim is None or self.selected_mapping is None:
+                raise AnalysisContractError(
+                    "plan metric binding requires an executable claim and mapping"
+                )
+            all_evidence = (
+                *self.baseline_evidence,
+                *self.candidate_evidence,
+                *self.reference_evidence,
+            )
+            validate_metric_binding_inputs(
+                self.metric_binding,
+                repository=self.repository,
+                head_sha=self.head_sha,
+                canonical_metric=self.audit_claim.metric,
+                artifacts=tuple(item.artifact for item in all_evidence),
+                normalized_evidence=all_evidence,
+                selected_mapping=self.selected_mapping,
+            )
 
 
 def _deep_freeze(value: object) -> object:
