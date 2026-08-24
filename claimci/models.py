@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from .measurement import MeasurementDriftReport
 
 
 class Severity(str, Enum):
@@ -130,3 +133,5 @@ class AuditResult:
     overlaps: tuple[OverlapSummary, ...] = ()
     # Keep this field at the end to preserve the Day 1 positional shape.
     direction: Direction = Direction.HIGHER
+    # Additive protocol companion. Legacy/direct Audit omits it completely.
+    measurement_drift: "MeasurementDriftReport | None" = None

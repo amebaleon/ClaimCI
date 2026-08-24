@@ -377,9 +377,12 @@ def test_repository_discovery_can_isolate_one_adapter_error_and_continue() -> No
 
 
 def test_fixed_registry_contains_one_identity_only_dataset_adapter_and_no_execution_adapter() -> None:
-    assert len(ADAPTERS) == 9
+    assert len(ADAPTERS) == 10
     assert tuple(
         item.adapter_id for item in ADAPTERS if "dataset" in item.adapter_id
     ) == ("claimci-jsonl-dataset-v1",)
+    assert tuple(
+        item.adapter_id for item in ADAPTERS if "tsv" in item.adapter_id
+    ) == ("claimci-tsv-v1",)
     assert all("pickle" not in item.adapter_id for item in ADAPTERS)
     assert all("plugin" not in item.adapter_id for item in ADAPTERS)

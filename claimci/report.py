@@ -10,6 +10,7 @@ from dataclasses import asdict
 from typing import Any
 
 from .models import AuditResult, Direction, Finding, MetricSummary, Severity
+from .measurement import measurement_report_to_jsonable
 
 
 SEVERITY_ORDER = (
@@ -211,6 +212,10 @@ def render_json(result: AuditResult) -> str:
             for finding in result.findings
         ],
     }
+    if result.measurement_drift is not None:
+        payload["measurement_drift"] = measurement_report_to_jsonable(
+            result.measurement_drift
+        )
     return (
         json.dumps(
             _json_safe(payload),

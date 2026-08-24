@@ -20,8 +20,9 @@ from .materialize import (
     MaterializationPartial,
     MaterializationUnavailable,
     RuntimeExecutionContext,
-    execute_ephemeral_audit,
+    execute_ephemeral_audit_with_trace,
 )
+from .obligations import _with_native_representation_failure, legacy_missing_evidence
 from .planner import PlanningRequest, PlanningState, plan_ephemeral_audit
 
 
@@ -88,14 +89,18 @@ def run_unified_analysis(
         return UnifiedAnalysisResult(
             state=AnalysisState.MAPPING_NEEDED,
             mapping_question=planning.mapping_question,
+            evidence_obligations=planning.evidence_obligations,
         )
     if planning.state is PlanningState.PARTIAL:
         return UnifiedAnalysisResult(
             state=AnalysisState.PARTIAL,
             unavailable_reason=(
-                None if planning.missing_evidence else _REPRESENTATION_PARTIAL
+                None
+                if planning.missing_evidence
+                else planning.reason or _REPRESENTATION_PARTIAL
             ),
             missing_evidence=planning.missing_evidence,
+            evidence_obligations=planning.evidence_obligations,
         )
     if planning.state is PlanningState.UNAVAILABLE:
         return _unavailable(_PLANNING_UNAVAILABLE)
@@ -104,9 +109,36 @@ def run_unified_analysis(
     plan = planning.plan
 
     try:
-        audit_result = execute_ephemeral_audit(plan, runtime)
+        execution = execute_ephemeral_audit_with_trace(plan, runtime)
+        audit_result = execution.audit_result
+        evidence_trace = execution.trace
         deterministic = DeterministicAuditOutcome.from_audit_result(audit_result)
-    except MaterializationPartial:
+    except MaterializationPartial as error:
+        if (
+            plan.evidence_obligations is not None
+            and plan.claim_policy is not None
+            and error.kind is not None
+            and error.role is not None
+        ):
+            try:
+                obligations = _with_native_representation_failure(
+                    plan.evidence_obligations,
+                    plan.claim_policy,
+                    kind=error.kind,
+                    role=error.role,
+                    dataset_split=error.dataset_split,
+                )
+                missing = legacy_missing_evidence(obligations)
+            except (TypeError, ValueError):
+                return _unavailable(_EXECUTION_UNAVAILABLE)
+            return UnifiedAnalysisResult(
+                state=AnalysisState.PARTIAL,
+                missing_evidence=missing,
+                unavailable_reason=None if missing else _REPRESENTATION_PARTIAL,
+                evidence_obligations=obligations,
+            )
+        if plan.evidence_obligations is not None:
+            return _unavailable(_EXECUTION_UNAVAILABLE)
         return UnifiedAnalysisResult(
             state=AnalysisState.PARTIAL,
             missing_evidence=(
@@ -129,6 +161,8 @@ def run_unified_analysis(
                 state=AnalysisState.PARTIAL,
                 deterministic=deterministic,
                 unavailable_reason=_REVIEW_PARTIAL,
+                evidence_trace=evidence_trace,
+                evidence_obligations=plan.evidence_obligations,
             )
         review_context = AnalysisReviewContext(
             claim=plan.claim,
@@ -148,6 +182,19 @@ def run_unified_analysis(
             deterministic=deterministic,
             unavailable_reason=_REVIEW_PARTIAL,
             missing_evidence=plan.missing_evidence,
+            evidence_trace=evidence_trace,
+            evidence_obligations=plan.evidence_obligations,
+        )
+
+    try:
+        evidence_trace = evidence_trace.with_advisory(interpretation)
+    except Exception:
+        from .trace import EvidenceTraceBundle
+
+        evidence_trace = EvidenceTraceBundle.unavailable(
+            head_sha=plan.head_sha,
+            result=audit_result,
+            interpretation=interpretation,
         )
 
     return UnifiedAnalysisResult(
@@ -155,6 +202,8 @@ def run_unified_analysis(
         deterministic=deterministic,
         research_interpretation=interpretation,
         missing_evidence=plan.missing_evidence,
+        evidence_trace=evidence_trace,
+        evidence_obligations=plan.evidence_obligations,
     )
 
 

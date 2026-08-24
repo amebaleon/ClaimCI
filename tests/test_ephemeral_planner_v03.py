@@ -10,16 +10,22 @@ from types import SimpleNamespace
 import pytest
 
 from claimci.analysis import (
+    AbsoluteMetricClaim,
     AdapterMatch,
     AnalysisContractError,
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactEvidenceSlot,
     Confidence,
     ConfigValue,
     DatasetSplit,
     DatasetReference,
     EvidenceSelector,
+    EvidenceObligationDecision,
+    EvidenceObligationReason,
+    EvidenceObligationState,
+    ClaimFieldTarget,
     ExperimentRole,
     FieldMapping,
     FieldProvenance,
@@ -30,6 +36,7 @@ from claimci.analysis import (
     MappingTrust,
     NormalizedEvidence,
     NormalizedObservation,
+    PassiveArtifact,
     PlanningRequest,
     PlanningState,
     ProvenanceKind,
@@ -38,11 +45,16 @@ from claimci.analysis import (
     RepositoryPath,
     SelectorKind,
     Sha256Digest,
+    TablePredicate,
+    TableScalarType,
+    TableSelector,
+    UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
     audit_relevant_claim_projection,
     plan_ephemeral_audit,
     planning_request_from_discovery,
     to_jsonable,
 )
+from claimci.analysis.adapters import CsvAdapter
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 from claimci.analysis.discovery import ClaimedValue, DiscoveredClaim, DiscoveryResult
 
@@ -186,7 +198,7 @@ def _binding(evidence: NormalizedEvidence, role: ExperimentRole) -> ArtifactBind
 
 
 def _claim(
-    text: str = "Accuracy improved by at least 0.05.",
+    text: str = "Accuracy improved from 0.71 to 0.79 by at least 0.05.",
     *,
     minimum: float | None = 0.05,
     provenance_kind: ProvenanceKind = ProvenanceKind.DETERMINISTIC_DISCOVERY,
@@ -274,6 +286,124 @@ def test_discovery_boundary_preserves_reference_values_and_explicit_threshold() 
         "metric": "accuracy",
         "direction": "higher",
         "minimum_absolute_improvement": 0.05,
+    }
+    assert request.scientific_claim is claim.scientific_claim
+    assert request.claim_policy is not None
+    assert request.claim_policy.deterministic_compiler_id == "metric-improvement-v0"
+
+
+def test_recognized_unsupported_claim_is_partial_before_evidence_or_mapping() -> None:
+    claim = _claim(
+        "Candidate accuracy is at least 0.90.",
+        minimum=0.90,
+        provenance_kind=ProvenanceKind.PROVIDER_PROPOSAL,
+    )
+    request = _request(claim=claim, mappings=())
+
+    assert request.scientific_claim is not None
+    assert type(request.scientific_claim.primary) is AbsoluteMetricClaim
+    assert request.audit_claim is None
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.reason == UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER
+    assert outcome.missing_evidence == ()
+    assert outcome.mapping_question is None
+    assert outcome.plan is None
+    assert outcome.evidence_obligations is not None
+    assert (
+        outcome.evidence_obligations.compiler_state
+        is EvidenceObligationState.UNSUPPORTED
+    )
+    assert outcome.evidence_obligations.obligations
+    assert not any(
+        isinstance(item.target, ArtifactEvidenceSlot)
+        for item in outcome.evidence_obligations.obligations
+    )
+
+
+def test_unrepresentable_metric_threshold_is_exact_compiler_partial() -> None:
+    request = _request(
+        claim=_claim(
+            "Accuracy improved by at least 5 percentage points.",
+            minimum=5.0,
+        ),
+        mappings=(),
+    )
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.reason == UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER
+    assert outcome.mapping_question is None
+    assert outcome.plan is None
+
+
+def test_held_out_constraint_does_not_change_audit_claim_or_plan_identity() -> None:
+    plain = _request(
+        claim=_claim(
+            "Accuracy improved from 0.71 to 0.79 by at least 0.05."
+        )
+    )
+    held_out = _request(
+        claim=_claim(
+            "On held-out data, accuracy improved from 0.71 to 0.79 "
+            "by at least 0.05."
+        )
+    )
+
+    assert plain.audit_claim == held_out.audit_claim
+    assert json.dumps(
+        to_jsonable(plain.audit_claim),
+        sort_keys=True,
+        separators=(",", ":"),
+    ) == json.dumps(
+        to_jsonable(held_out.audit_claim),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert plain.scientific_claim is not None
+    assert held_out.scientific_claim is not None
+    assert plain.scientific_claim.constraints == ()
+    assert [item.kind.value for item in held_out.scientific_claim.constraints] == [
+        "held_out"
+    ]
+
+    plain_outcome = plan_ephemeral_audit(plain)
+    held_out_outcome = plan_ephemeral_audit(held_out)
+
+    assert plain_outcome.plan is not None
+    assert held_out_outcome.plan is not None
+    assert plain_outcome.plan.plan_id == held_out_outcome.plan.plan_id
+    assert held_out_outcome.plan.evidence_obligations is not None
+    assert any(
+        item.obligation_id == "claim.constraint.held_out"
+        and item.state is EvidenceObligationState.SATISFIED
+        for item in held_out_outcome.plan.evidence_obligations.obligations
+    )
+    artifact_obligations = tuple(
+        item
+        for item in held_out_outcome.plan.evidence_obligations.obligations
+        if isinstance(item.target, ArtifactEvidenceSlot)
+    )
+    assert len(artifact_obligations) == 8
+    assert all(
+        support.kind is item.target.kind
+        and support.role is item.target.role
+        and support.dataset_split is item.target.dataset_split
+        for item in artifact_obligations
+        for support in item.support_references
+    )
+    assert {
+        (item.target.role, item.target.dataset_split)
+        for item in artifact_obligations
+        if item.target.kind is ArtifactKind.DATASET
+    } == {
+        (ExperimentRole.BASELINE, DatasetSplit.TRAIN),
+        (ExperimentRole.BASELINE, DatasetSplit.EVAL),
+        (ExperimentRole.CANDIDATE, DatasetSplit.TRAIN),
+        (ExperimentRole.CANDIDATE, DatasetSplit.EVAL),
     }
 
 
@@ -380,6 +510,7 @@ def test_discovery_boundary_scopes_repository_wide_inputs_to_selected_claim() ->
             None,
             selected_claim.reference.provenance,
         ),
+        scientific_claim=None,
     )
     selected_evidence = (
         _evidence("accuracy/baseline_results.json", ArtifactKind.RESULTS, ExperimentRole.BASELINE),
@@ -610,6 +741,137 @@ def _request(
     )
 
 
+def test_shared_benchmark_table_selectors_bind_baseline_and_candidate_independently() -> None:
+    content = b"commit,accuracy\nbaseline,0.70\ncandidate,0.80\n"
+    artifact = _artifact(
+        "benchmarks/shared.csv",
+        ArtifactKind.RESULTS,
+        content,
+    )
+    passive = PassiveArtifact(artifact, content)
+    adapter = CsvAdapter()
+
+    def selected(role: ExperimentRole, key: str) -> tuple[NormalizedEvidence, ArtifactBinding]:
+        provenance = FieldProvenance(
+            ProvenanceKind.ADAPTER_EXTRACTION,
+            f"exact table selector; sha256={artifact.sha256}",
+            artifact.path,
+            f"selector:{key}",
+        )
+        mapping = FieldMapping(
+            "metric_value",
+            TableSelector(
+                "accuracy",
+                (TablePredicate("commit", TableScalarType.STRING, key),),
+                1,
+                provenance,
+            ),
+            provenance,
+        )
+        evidence = adapter.extract(
+            passive,
+            AdapterMatch(
+                adapter.adapter_id,
+                artifact.path,
+                Confidence(0.95),
+                (mapping,),
+                (provenance,),
+            ),
+        )
+        return evidence, ArtifactBinding(
+            artifact.path,
+            artifact.kind,
+            role,
+            adapter.adapter_id,
+            evidence.adapter_match.mappings,
+            evidence.adapter_match.match_evidence[0],
+        )
+
+    baseline_result, baseline_binding = selected(
+        ExperimentRole.BASELINE,
+        "baseline",
+    )
+    candidate_result, candidate_binding = selected(
+        ExperimentRole.CANDIDATE,
+        "candidate",
+    )
+    ordinary = tuple(
+        item
+        for item in _complete_evidence()
+        if item.artifact.kind is not ArtifactKind.RESULTS
+    )
+    evidence = (baseline_result, candidate_result, *ordinary)
+    mapping_provenance = _provenance(
+        ProvenanceKind.DETERMINISTIC_DISCOVERY,
+        source_path=str(artifact.path),
+        source_id="shared-table-mapping",
+    )
+    mapping = MappingCandidate(
+        "mapping-shared-table",
+        (
+            baseline_binding,
+            candidate_binding,
+            *(
+                _binding(item, role)
+                for role in (ExperimentRole.BASELINE, ExperimentRole.CANDIDATE)
+                for item in ordinary
+                if any(
+                    observation.experiment_role is role
+                    for observation in item.observations
+                )
+            ),
+        ),
+        Confidence(0.95),
+        MappingTrust.INFERRED,
+        mapping_provenance,
+    )
+    base = _request()
+    request = dataclasses.replace(
+        base,
+        artifacts=(artifact, *(item.artifact for item in ordinary)),
+        normalized_evidence=evidence,
+        mapping_candidates=(mapping,),
+    )
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert tuple(item.evidence_id for item in outcome.plan.baseline_evidence).count(
+        baseline_result.evidence_id
+    ) == 1
+    assert tuple(item.evidence_id for item in outcome.plan.candidate_evidence).count(
+        candidate_result.evidence_id
+    ) == 1
+
+    alternative = dataclasses.replace(
+        mapping,
+        mapping_id="mapping-shared-table-swapped",
+        bindings=(
+            dataclasses.replace(
+                baseline_binding,
+                mappings=candidate_binding.mappings,
+            ),
+            dataclasses.replace(
+                candidate_binding,
+                mappings=baseline_binding.mappings,
+            ),
+            *mapping.bindings[2:],
+        ),
+    )
+    ambiguous = plan_ephemeral_audit(
+        dataclasses.replace(
+            request,
+            mapping_candidates=(mapping, alternative),
+        )
+    )
+
+    assert ambiguous.state is PlanningState.MAPPING_NEEDED
+    assert ambiguous.mapping_question is not None
+    assert len(ambiguous.mapping_question.choices) == 2
+    assert ambiguous.plan is None
+
+
 def _identity_only_dataset_evidence(
     evidence: tuple[NormalizedEvidence, ...],
 ) -> tuple[NormalizedEvidence, ...]:
@@ -633,6 +895,50 @@ def _identity_only_dataset_evidence(
     return tuple(values)
 
 
+def _with_aggregation(
+    evidence: tuple[NormalizedEvidence, ...],
+    *,
+    procedure: str = "arithmetic_mean_v1",
+) -> tuple[NormalizedEvidence, ...]:
+    values: list[NormalizedEvidence] = []
+    for item in evidence:
+        if item.artifact.kind is not ArtifactKind.CONFIG:
+            values.append(item)
+            continue
+        provenance = item.adapter_match.match_evidence[0]
+        mapping = FieldMapping(
+            "config.evaluation.aggregation",
+            EvidenceSelector(
+                SelectorKind.DOTTED_PATH,
+                "evaluation.aggregation",
+                provenance,
+            ),
+            provenance,
+        )
+        match = dataclasses.replace(
+            item.adapter_match,
+            mappings=(*item.adapter_match.mappings, mapping),
+        )
+        observations = tuple(
+            dataclasses.replace(
+                observation,
+                config_values=(
+                    *observation.config_values,
+                    ConfigValue(
+                        "evaluation.aggregation",
+                        procedure,
+                        provenance,
+                    ),
+                ),
+            )
+            for observation in item.observations
+        )
+        values.append(
+            dataclasses.replace(item, adapter_match=match, observations=observations)
+        )
+    return tuple(values)
+
+
 def test_split_bearing_mapping_makes_identity_only_dataset_evidence_ready() -> None:
     evidence_with_splits = _complete_evidence()
     mapping = _mapping("mapping-split-identity", evidence_with_splits)
@@ -649,6 +955,198 @@ def test_split_bearing_mapping_makes_identity_only_dataset_evidence_ready() -> N
         for binding in outcome.plan.selected_mapping.bindings
         if binding.kind is ArtifactKind.DATASET
     } == {DatasetSplit.TRAIN, DatasetSplit.EVAL}
+
+
+def test_explicit_arithmetic_mean_is_ready_only_with_both_recovered_procedures() -> None:
+    evidence = _with_aggregation(_complete_evidence())
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=evidence,
+            mappings=(_mapping("mapping-mean", evidence),),
+        )
+    )
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.evidence_obligations is not None
+    procedure = next(
+        item
+        for item in outcome.evidence_obligations.obligations
+        if item.obligation_id == "measurement.retry_aggregation"
+    )
+    assert procedure.state is EvidenceObligationState.SATISFIED
+
+
+def test_missing_required_upstream_procedure_is_partial_not_mean_fallback() -> None:
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(_request(claim=claim))
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.plan is None
+    assert outcome.mapping_question is None
+    assert outcome.reason == "required_measurement_procedure_not_recovered"
+
+
+@pytest.mark.parametrize(
+    "procedure",
+    [
+        "median",
+        "weighted mean",
+        "best-of-N",
+        "retry filtering",
+        "adjudication",
+        "geometric mean",
+    ],
+)
+def test_explicit_unsupported_upstream_procedure_is_pre_audit_partial(
+    procedure: str,
+) -> None:
+    claim = _claim(
+        f"Using {procedure} across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(_request(claim=claim))
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.plan is None
+    assert outcome.mapping_question is None
+    assert outcome.reason == "measurement_procedure_not_supported"
+
+
+def test_required_procedure_ambiguity_uses_one_bounded_mapping_question() -> None:
+    evidence = _with_aggregation(_complete_evidence())
+    original_candidate = next(
+        item
+        for item in evidence
+        if item.artifact.kind is ArtifactKind.CONFIG
+        and item.observations[0].experiment_role is ExperimentRole.CANDIDATE
+    )
+    alternative = _with_aggregation(
+        (
+            _evidence(
+                "configs/candidate-alternative.yaml",
+                ArtifactKind.CONFIG,
+                ExperimentRole.CANDIDATE,
+            ),
+        )
+    )[0]
+    second_evidence = tuple(
+        alternative if item is original_candidate else item for item in evidence
+    )
+    all_evidence = (*evidence, alternative)
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+    first_mapping = _mapping("mapping-mean-first", evidence)
+    second_mapping = _mapping("mapping-mean-second", second_evidence)
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=all_evidence,
+            mappings=(first_mapping, second_mapping),
+        )
+    )
+
+    assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.plan is None
+    assert outcome.mapping_question is not None
+    assert len(outcome.mapping_question.choices) == 2
+    assert "measurement.retry_aggregation" in (
+        outcome.mapping_question.blocking_obligation_ids
+    )
+
+    approved = RepoMapping.approve(
+        REPOSITORY,
+        first_mapping,
+        approved_by="pilot-owner",
+    )
+    resumed = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=all_evidence,
+            mappings=(first_mapping, second_mapping),
+            approved=approved,
+        )
+    )
+    assert resumed.state is PlanningState.READY
+    assert resumed.plan is not None
+    assert type(resumed.plan.selected_mapping) is RepoMapping
+
+
+def test_missing_required_procedure_dominates_otherwise_resolvable_mapping() -> None:
+    evidence = _complete_evidence()
+    alternative = _evidence(
+        "configs/candidate-alternative.yaml",
+        ArtifactKind.CONFIG,
+        ExperimentRole.CANDIDATE,
+    )
+    original_candidate = next(
+        item
+        for item in evidence
+        if item.artifact.kind is ArtifactKind.CONFIG
+        and item.observations[0].experiment_role is ExperimentRole.CANDIDATE
+    )
+    second_evidence = tuple(
+        alternative if item is original_candidate else item for item in evidence
+    )
+    claim = _claim(
+        "Using the arithmetic mean across supplied runs, accuracy improved "
+        "from 0.71 to 0.79 by at least 0.05."
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(
+            claim=claim,
+            evidence=(*evidence, alternative),
+            mappings=(
+                _mapping("mapping-missing-procedure-first", evidence),
+                _mapping("mapping-missing-procedure-second", second_evidence),
+            ),
+        )
+    )
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.mapping_question is None
+    assert outcome.reason == "required_measurement_procedure_not_recovered"
+
+
+def test_non_authoritative_semantic_proposal_is_carried_to_the_plan_only() -> None:
+    request = dataclasses.replace(
+        _request(),
+        semantic_proposal_provenance=_provenance(
+            ProvenanceKind.PROVIDER_PROPOSAL,
+            source_path=None,
+            source_id="semantic-call-1",
+        ),
+    )
+
+    outcome = plan_ephemeral_audit(request)
+
+    assert outcome.state is PlanningState.READY
+    assert outcome.plan is not None
+    assert outcome.plan.semantic_proposal_provenance is request.semantic_proposal_provenance
+    assert outcome.plan.selected_mapping is request.mapping_candidates[0]
+
+    with pytest.raises(AnalysisContractError, match="provider provenance"):
+        dataclasses.replace(
+            request,
+            semantic_proposal_provenance=_provenance(
+                ProvenanceKind.DETERMINISTIC_DISCOVERY,
+                source_id="not-a-provider-call",
+            ),
+        )
 
 
 def test_resolvable_upstream_dataset_question_precedes_splitless_partial() -> None:
@@ -751,7 +1249,20 @@ def test_threshold_free_claim_is_partial_before_mapping_resolution() -> None:
     assert outcome.state is PlanningState.PARTIAL
     assert outcome.plan is None
     assert outcome.mapping_question is None
-    assert any("threshold" in item.description for item in outcome.missing_evidence)
+    assert outcome.missing_evidence == ()
+    assert outcome.reason == "required_threshold_not_recovered"
+    assert outcome.evidence_obligations is not None
+    threshold = next(
+        item
+        for item in outcome.evidence_obligations.obligations
+        if item.obligation_id == "claim.threshold"
+    )
+    assert isinstance(threshold.target, ClaimFieldTarget)
+    assert threshold.state is EvidenceObligationState.MISSING
+    assert (
+        threshold.reason
+        is EvidenceObligationReason.REQUIRED_THRESHOLD_NOT_RECOVERED
+    )
 
 
 def test_missing_dataset_is_partial_without_a_mapping_question() -> None:
@@ -771,6 +1282,25 @@ def test_missing_dataset_is_partial_without_a_mapping_question() -> None:
         (ArtifactKind.DATASET, ExperimentRole.BASELINE),
         (ArtifactKind.DATASET, ExperimentRole.CANDIDATE),
     }
+    assert outcome.evidence_obligations is not None
+    assert outcome.evidence_obligations.decision is EvidenceObligationDecision.PARTIAL
+    assert {
+        item.obligation_id
+        for item in outcome.evidence_obligations.obligations
+        if item.state is EvidenceObligationState.MISSING
+        and isinstance(item.target, ArtifactEvidenceSlot)
+    } == {
+        "artifact.baseline.dataset.train",
+        "artifact.baseline.dataset.eval",
+        "artifact.candidate.dataset.train",
+        "artifact.candidate.dataset.eval",
+    }
+    comparison = next(
+        item
+        for item in outcome.evidence_obligations.obligations
+        if item.obligation_id == "comparison.readiness"
+    )
+    assert comparison.state is EvidenceObligationState.MISSING
 
 
 def test_missing_one_roles_identity_only_datasets_is_typed_partial_not_question() -> None:
@@ -923,10 +1453,13 @@ def test_incomplete_mapping_candidates_cannot_union_into_fake_dataset_coverage()
 
     assert outcome.state is PlanningState.PARTIAL
     assert outcome.mapping_question is None
-    assert {
-        (item.kind, item.role)
-        for item in outcome.missing_evidence
-    } == {(ArtifactKind.DATASET, ExperimentRole.UNSPECIFIED)}
+    assert outcome.missing_evidence == ()
+    assert outcome.evidence_obligations is not None
+    assert any(
+        item.state is EvidenceObligationState.AMBIGUOUS
+        and item.reason is EvidenceObligationReason.CLARIFICATION_NOT_BOUNDED
+        for item in outcome.evidence_obligations.obligations
+    )
 
 
 @pytest.mark.parametrize("missing_split", [DatasetSplit.TRAIN, DatasetSplit.EVAL])
@@ -1038,6 +1571,9 @@ def test_applicable_explicit_repo_mapping_is_selected() -> None:
     assert outcome.state is PlanningState.READY
     assert outcome.plan is not None
     assert outcome.plan.selected_mapping is approved
+    assert outcome.evidence_obligations is not None
+    assert outcome.evidence_obligations.decision is EvidenceObligationDecision.READY
+    assert not hasattr(outcome.evidence_obligations, "verdict")
 
 
 def test_ambiguous_strong_mappings_return_bounded_question_without_verdict() -> None:
@@ -1068,6 +1604,13 @@ def test_ambiguous_strong_mappings_return_bounded_question_without_verdict() -> 
     assert outcome.plan is None
     assert outcome.mapping_question is not None
     assert 2 <= len(outcome.mapping_question.choices) <= 8
+    assert outcome.evidence_obligations is not None
+    assert outcome.evidence_obligations.blocking_obligation_ids == (
+        "artifact.candidate.results.metric",
+    )
+    assert outcome.mapping_question.blocking_obligation_ids == (
+        "artifact.candidate.results.metric",
+    )
 
 
 def test_provider_mapping_at_full_confidence_never_auto_executes() -> None:
@@ -1086,6 +1629,12 @@ def test_provider_mapping_at_full_confidence_never_auto_executes() -> None:
     assert outcome.state is PlanningState.MAPPING_NEEDED
     assert outcome.plan is None
     assert outcome.mapping_question is not None
+    assert outcome.evidence_obligations is not None
+    assert all(
+        item.state is EvidenceObligationState.AMBIGUOUS
+        for item in outcome.evidence_obligations.obligations
+        if isinstance(item.target, ArtifactEvidenceSlot)
+    )
 
 
 def test_low_confidence_inferred_mapping_requires_clarification() -> None:
@@ -1102,6 +1651,37 @@ def test_low_confidence_inferred_mapping_requires_clarification() -> None:
 
     assert outcome.state is PlanningState.MAPPING_NEEDED
     assert outcome.mapping_question is not None
+    assert outcome.evidence_obligations is not None
+    assert (
+        outcome.evidence_obligations.decision
+        is EvidenceObligationDecision.MAPPING_NEEDED
+    )
+    assert outcome.mapping_question.blocking_obligation_ids
+    assert outcome.mapping_question.blocking_obligation_ids == (
+        outcome.evidence_obligations.blocking_obligation_ids
+    )
+
+
+def test_unissued_selector_is_partial_and_cannot_be_made_executable_by_approval() -> None:
+    evidence = _complete_evidence()
+    valid = _mapping("mapping-primary", evidence)
+    invalid = dataclasses.replace(
+        valid,
+        bindings=(
+            dataclasses.replace(valid.bindings[0], adapter_id="different.adapter"),
+            *valid.bindings[1:],
+        ),
+    )
+
+    outcome = plan_ephemeral_audit(_request(evidence=evidence, mappings=(invalid,)))
+
+    assert outcome.state is PlanningState.PARTIAL
+    assert outcome.mapping_question is None
+    assert outcome.evidence_obligations is not None
+    assert any(
+        item.reason is EvidenceObligationReason.SELECTOR_NOT_RECOVERABLE
+        for item in outcome.evidence_obligations.obligations
+    )
 
 
 def test_manifest_hint_conflicting_with_strong_candidate_requires_question() -> None:
@@ -1202,6 +1782,49 @@ def test_invalid_approved_mapping_blocks_automatic_fallback() -> None:
     assert outcome.mapping_question is not None
 
 
+def test_approved_mapping_with_unissued_exact_head_path_is_unavailable() -> None:
+    evidence = _complete_evidence()
+    valid = _mapping("valid-inferred", evidence)
+    stale_source = dataclasses.replace(
+        valid,
+        mapping_id="stale-head-source",
+        bindings=(
+            dataclasses.replace(
+                valid.bindings[0],
+                path=RepositoryPath("results/removed-at-head.json"),
+            ),
+            *valid.bindings[1:],
+        ),
+    )
+    approved = RepoMapping.approve(
+        REPOSITORY,
+        stale_source,
+        approved_by="owner:amebaleon",
+    )
+
+    outcome = plan_ephemeral_audit(
+        _request(evidence=evidence, mappings=(valid,), approved=approved)
+    )
+
+    assert outcome.state is PlanningState.UNAVAILABLE
+    assert outcome.plan is None
+    assert outcome.mapping_question is None
+    assert outcome.evidence_obligations is None
+    assert outcome.reason == "approved mapping is stale for the exact-head snapshot"
+
+
+def test_planning_request_rejects_provider_modified_obligation_policy() -> None:
+    request = _request()
+    assert request.claim_policy is not None
+    hostile_policy = dataclasses.replace(
+        request.claim_policy,
+        obligation_template_ids=("claim.metric",),
+    )
+
+    with pytest.raises(ValueError, match="policy|scientific claim"):
+        dataclasses.replace(request, claim_policy=hostile_policy)
+
+
 def test_generic_unspecified_evidence_uses_only_explicit_mapping_roles() -> None:
     role_by_path = {
         item.artifact.path: (
@@ -1246,7 +1869,7 @@ def test_generic_unspecified_evidence_uses_only_explicit_mapping_roles() -> None
     } == {ExperimentRole.UNSPECIFIED}
 
 
-def test_mapping_with_unissued_selector_or_binding_cannot_auto_execute() -> None:
+def test_mapping_with_unissued_selector_or_binding_cannot_reach_approval_or_audit() -> None:
     evidence = _complete_evidence()
     valid = _mapping("mapping-primary", evidence)
     invalid_binding = dataclasses.replace(
@@ -1260,9 +1883,9 @@ def test_mapping_with_unissued_selector_or_binding_cannot_auto_execute() -> None
 
     outcome = plan_ephemeral_audit(_request(evidence=evidence, mappings=(invalid,)))
 
-    assert outcome.state is PlanningState.MAPPING_NEEDED
+    assert outcome.state is PlanningState.PARTIAL
     assert outcome.plan is None
-    assert outcome.mapping_question is not None
+    assert outcome.mapping_question is None
 
 
 def test_planning_outcome_enforces_exactly_one_state_payload() -> None:
@@ -1385,6 +2008,8 @@ def test_plan_id_ignores_descriptive_claim_and_discovery_prose() -> None:
         claim=changed_claim,
         audit_claim=changed_audit_claim,
         mapping_candidates=(changed_mapping,),
+        scientific_claim=None,
+        claim_policy=None,
     )
 
     first = plan_ephemeral_audit(original)
@@ -1413,6 +2038,8 @@ def test_plan_id_changes_for_deterministic_inputs(change: str) -> None:
         changed = dataclasses.replace(
             original,
             audit_claim=dataclasses.replace(original.audit_claim, metric="f1"),
+            scientific_claim=None,
+            claim_policy=None,
         )
     elif change == "direction":
         from claimci.models import Direction
@@ -1423,6 +2050,8 @@ def test_plan_id_changes_for_deterministic_inputs(change: str) -> None:
                 original.audit_claim,
                 direction=Direction.LOWER,
             ),
+            scientific_claim=None,
+            claim_policy=None,
         )
     elif change == "threshold":
         changed = dataclasses.replace(
@@ -1431,6 +2060,8 @@ def test_plan_id_changes_for_deterministic_inputs(change: str) -> None:
                 original.audit_claim,
                 minimum_absolute_improvement=0.06,
             ),
+            scientific_claim=None,
+            claim_policy=None,
         )
     else:
         changed_mapping = dataclasses.replace(

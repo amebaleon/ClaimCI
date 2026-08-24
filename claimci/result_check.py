@@ -307,42 +307,19 @@ def check_results(
     minimum_improvement: float,
     direction: Direction | str = Direction.HIGHER,
 ) -> ResultCheck:
-    normalized_direction = coerce_direction(direction)
     baseline_summary = summarize_runs(baseline.values)
     candidate_summary = summarize_runs(candidate.values)
-    baseline_decimal = _decimal_number(baseline_summary.mean, label="baseline mean")
-    candidate_decimal = _decimal_number(candidate_summary.mean, label="candidate mean")
-    threshold_number = _finite_number(minimum_improvement)
-    if threshold_number is None or threshold_number < 0:
-        raise ClaimCIError(
-            "minimum improvement must be a finite non-negative number"
-        )
-    threshold_decimal = _decimal_number(
-        threshold_number, label="minimum improvement"
+    (
+        absolute_improvement,
+        relative_improvement,
+        claim_finding,
+    ) = _metric_summary_comparison(
+        baseline_summary,
+        candidate_summary,
+        metric=metric,
+        minimum_improvement=minimum_improvement,
+        direction=direction,
     )
-
-    try:
-        if normalized_direction is Direction.HIGHER:
-            absolute_decimal = candidate_decimal - baseline_decimal
-        else:
-            absolute_decimal = baseline_decimal - candidate_decimal
-    except (DecimalException, ValueError, TypeError) as exc:
-        raise ClaimCIError("absolute improvement must be finite") from exc
-    absolute_improvement = _finite_float(
-        absolute_decimal, label="absolute improvement"
-    )
-
-    if baseline_decimal == 0:
-        relative_improvement = None
-    else:
-        try:
-            relative_decimal = absolute_decimal / abs(baseline_decimal)
-            relative_improvement = float(relative_decimal)
-        except (DecimalException, OverflowError, ValueError, TypeError, ZeroDivisionError):
-            relative_improvement = None
-        else:
-            if not math.isfinite(relative_improvement):
-                relative_improvement = None
 
     findings: list[Finding] = [
         Finding(
@@ -405,6 +382,59 @@ def check_results(
                 impact=Impact.NONE,
             )
         )
+    findings.append(claim_finding)
+
+    return ResultCheck(
+        baseline_summary=baseline_summary,
+        candidate_summary=candidate_summary,
+        absolute_improvement=absolute_improvement,
+        relative_improvement=relative_improvement,
+        findings=tuple(findings),
+    )
+
+
+def _metric_summary_comparison(
+    baseline_summary: MetricSummary,
+    candidate_summary: MetricSummary,
+    *,
+    metric: str,
+    minimum_improvement: float,
+    direction: Direction | str,
+) -> tuple[float, float | None, Finding]:
+    normalized_direction = coerce_direction(direction)
+    baseline_decimal = _decimal_number(baseline_summary.mean, label="baseline mean")
+    candidate_decimal = _decimal_number(candidate_summary.mean, label="candidate mean")
+    threshold_number = _finite_number(minimum_improvement)
+    if threshold_number is None or threshold_number < 0:
+        raise ClaimCIError(
+            "minimum improvement must be a finite non-negative number"
+        )
+    threshold_decimal = _decimal_number(
+        threshold_number, label="minimum improvement"
+    )
+
+    try:
+        if normalized_direction is Direction.HIGHER:
+            absolute_decimal = candidate_decimal - baseline_decimal
+        else:
+            absolute_decimal = baseline_decimal - candidate_decimal
+    except (DecimalException, ValueError, TypeError) as exc:
+        raise ClaimCIError("absolute improvement must be finite") from exc
+    absolute_improvement = _finite_float(
+        absolute_decimal, label="absolute improvement"
+    )
+
+    if baseline_decimal == 0:
+        relative_improvement = None
+    else:
+        try:
+            relative_decimal = absolute_decimal / abs(baseline_decimal)
+            relative_improvement = float(relative_decimal)
+        except (DecimalException, OverflowError, ValueError, TypeError, ZeroDivisionError):
+            relative_improvement = None
+        else:
+            if not math.isfinite(relative_improvement):
+                relative_improvement = None
 
     claim_evidence: dict[str, Any] = {
         "minimum_improvement": threshold_number,
@@ -418,38 +448,102 @@ def check_results(
         else f"Baseline minus candidate {metric} is {absolute_improvement:.6g}, "
     )
     if absolute_decimal >= threshold_decimal:
-        findings.append(
-            Finding(
-                rule_id="RESULT.CLAIM_SUPPORTED",
-                severity=Severity.VERIFIED,
-                title="Recomputed improvement meets the claim threshold",
-                explanation=(
-                    f"{directional_prefix}meeting the required "
-                    f"{minimum_improvement:.6g}."
-                ),
-                evidence=claim_evidence,
-                impact=Impact.NONE,
-            )
+        finding = Finding(
+            rule_id="RESULT.CLAIM_SUPPORTED",
+            severity=Severity.VERIFIED,
+            title="Recomputed improvement meets the claim threshold",
+            explanation=(
+                f"{directional_prefix}meeting the required "
+                f"{minimum_improvement:.6g}."
+            ),
+            evidence=claim_evidence,
+            impact=Impact.NONE,
         )
     else:
-        findings.append(
-            Finding(
-                rule_id="RESULT.CLAIM_NOT_SUPPORTED",
-                severity=Severity.CRITICAL,
-                title="Recomputed improvement is below the claim threshold",
-                explanation=(
-                    f"{directional_prefix}below the required "
-                    f"{minimum_improvement:.6g}."
-                ),
-                evidence=claim_evidence,
-                impact=Impact.INVALIDATES,
-            )
+        finding = Finding(
+            rule_id="RESULT.CLAIM_NOT_SUPPORTED",
+            severity=Severity.CRITICAL,
+            title="Recomputed improvement is below the claim threshold",
+            explanation=(
+                f"{directional_prefix}below the required "
+                f"{minimum_improvement:.6g}."
+            ),
+            evidence=claim_evidence,
+            impact=Impact.INVALIDATES,
         )
+    return absolute_improvement, relative_improvement, finding
 
+
+def check_reported_aggregates(
+    *,
+    baseline_value: float,
+    candidate_value: float,
+    baseline_sample_count: int,
+    candidate_sample_count: int,
+    statistic: str,
+    aggregation: str,
+    metric: str,
+    minimum_improvement: float,
+    direction: Direction | str = Direction.HIGHER,
+) -> ResultCheck:
+    """Compare represented aggregate scalars without treating them as raw runs."""
+
+    for label, count in (
+        ("baseline", baseline_sample_count),
+        ("candidate", candidate_sample_count),
+    ):
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or count > 2**63 - 1
+        ):
+            raise ClaimCIError(f"{label} aggregate sample count must be positive")
+    for label, identity in (
+        ("statistic", statistic),
+        ("aggregation", aggregation),
+    ):
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or identity != identity.strip()
+            or len(identity) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in identity)
+        ):
+            raise ClaimCIError(f"aggregate {label} identity is invalid")
+    baseline_number = _finite_number(baseline_value)
+    candidate_number = _finite_number(candidate_value)
+    if baseline_number is None or candidate_number is None:
+        raise ClaimCIError("reported aggregate values must be finite")
+    baseline_summary = MetricSummary(baseline_sample_count, baseline_number, None)
+    candidate_summary = MetricSummary(candidate_sample_count, candidate_number, None)
+    absolute, relative, claim_finding = _metric_summary_comparison(
+        baseline_summary,
+        candidate_summary,
+        metric=metric,
+        minimum_improvement=minimum_improvement,
+        direction=direction,
+    )
+    verified = Finding(
+        rule_id="RESULT.AGGREGATE_VERIFIED",
+        severity=Severity.VERIFIED,
+        title=f"Reported {metric} aggregate loaded successfully",
+        explanation=(
+            "ClaimCI compared the exact represented aggregate values without "
+            "reinterpreting them as raw runs."
+        ),
+        evidence={
+            "statistic": statistic,
+            "aggregation": aggregation,
+            "baseline": _summary_evidence(baseline_summary),
+            "candidate": _summary_evidence(candidate_summary),
+        },
+        impact=Impact.NONE,
+    )
     return ResultCheck(
         baseline_summary=baseline_summary,
         candidate_summary=candidate_summary,
-        absolute_improvement=absolute_improvement,
-        relative_improvement=relative_improvement,
-        findings=tuple(findings),
+        absolute_improvement=absolute,
+        relative_improvement=relative,
+        findings=(verified, claim_finding),
     )

@@ -9,6 +9,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from claimci.analysis.confidence import Confidence
+from claimci.analysis.claim_types import (
+    PrimaryClaimKind,
+    recover_scientific_claim,
+)
 from claimci.analysis.contracts import (
     ClaimReference,
     FieldProvenance,
@@ -199,6 +203,74 @@ def _classify_line(text: str) -> _ClaimMatch | None:
     return None
 
 
+def _canonical_fallback_match(
+    text: str,
+    record: SourceRecord,
+) -> _ClaimMatch | None:
+    """Recognize new canonical primaries that lack a legacy Review category."""
+
+    provisional_provenance = _provenance(
+        record,
+        kind=ProvenanceKind.DETERMINISTIC_DISCOVERY,
+        detail="deterministic canonical claim recognition",
+    )
+    provisional = ClaimReference(
+        claim_id="claim-provisional",
+        text=text,
+        source_path=None if record.path is None else RepositoryPath(record.path),
+        confidence=Confidence(0.75),
+        provenance=provisional_provenance,
+    )
+    canonical = recover_scientific_claim(provisional)
+    if canonical is None:
+        return None
+    primary = canonical.primary
+    if primary.kind is PrimaryClaimKind.METRIC_IMPROVEMENT:
+        confidence = (
+            0.95
+            if primary.baseline_value is not None
+            else 0.90
+            if primary.minimum_improvement is not None
+            else 0.70
+        )
+        return _ClaimMatch(
+            ClaimType.METRIC_IMPROVEMENT,
+            "candidate",
+            primary.metric,
+            ClaimDirection(primary.direction.value),
+            confidence,
+            "canonical_metric_improvement",
+        )
+    if primary.kind is PrimaryClaimKind.ABSOLUTE_METRIC:
+        return _ClaimMatch(
+            ClaimType.OTHER_SCIENTIFIC,
+            "candidate",
+            primary.metric,
+            ClaimDirection.NOT_APPLICABLE,
+            0.84,
+            "absolute_metric",
+        )
+    if primary.kind is PrimaryClaimKind.GENERALIZATION:
+        return _ClaimMatch(
+            ClaimType.OTHER_SCIENTIFIC,
+            "candidate",
+            None,
+            ClaimDirection.NOT_APPLICABLE,
+            0.74,
+            "generalization",
+        )
+    if primary.kind is PrimaryClaimKind.GENERIC_QUANTITATIVE:
+        return _ClaimMatch(
+            ClaimType.OTHER_SCIENTIFIC,
+            "quantitative claim",
+            None,
+            ClaimDirection.NOT_APPLICABLE,
+            0.72,
+            "generic_quantitative",
+        )
+    return None
+
+
 def _provenance(
     record: SourceRecord,
     *,
@@ -274,6 +346,8 @@ def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
             if not source_text.strip():
                 continue
             matched = _classify_line(source_text)
+            if matched is None:
+                matched = _canonical_fallback_match(source_text, record)
             if matched is None:
                 continue
             provenance = _provenance(
@@ -396,10 +470,13 @@ def _provider_claims(
     return discovered
 
 
-def _dedupe_key(claim: DiscoveredClaim) -> tuple[str, ClaimType, str, int]:
+def _dedupe_key(claim: DiscoveredClaim) -> tuple[str, object, str, int]:
+    semantic_kind: object = claim.claim_type
+    if claim.scientific_claim is not None:
+        semantic_kind = claim.scientific_claim.primary.kind
     return (
         _WHITESPACE.sub(" ", claim.reference.text.strip().casefold()),
-        claim.claim_type,
+        semantic_kind,
         claim.source.source_id,
         claim.source.start_line,
     )
@@ -425,7 +502,7 @@ def discover_claims(
         source.source_id: index
         for index, source in enumerate(context.source_bundle.sources)
     }
-    unique: dict[tuple[str, ClaimType, str, int], DiscoveredClaim] = {}
+    unique: dict[tuple[str, object, str, int], DiscoveredClaim] = {}
     for claim in candidates:
         unique.setdefault(_dedupe_key(claim), claim)
     return tuple(

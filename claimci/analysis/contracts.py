@@ -11,8 +11,10 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
@@ -34,6 +36,9 @@ _ADAPTER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _TARGET_FIELD = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\Z")
 _DOTTED_SEGMENT = re.compile(r"[A-Za-z0-9_-]+\Z")
 _COLUMN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. -]{0,255}\Z")
+_TABLE_NUMBER = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
 _INVALID_JSON_POINTER_ESCAPE = re.compile(r"~(?:[^01]|$)")
 _WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"|?*')
 _WINDOWS_RESERVED_BASENAMES = frozenset(
@@ -180,6 +185,15 @@ class SelectorKind(str, Enum):
     COLUMN = "column"
 
 
+class TableScalarType(str, Enum):
+    """One explicitly declared scalar grammar for a table predicate cell."""
+
+    STRING = "string"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    NULL = "null"
+
+
 class AnalysisState(str, Enum):
     COMPLETE = "complete"
     MAPPING_NEEDED = "mapping_needed"
@@ -246,10 +260,135 @@ class EvidenceSelector:
             raise TypeError("selector provenance must be FieldProvenance")
 
 
+def _canonical_table_number(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("table number predicate value must be an integer or float")
+    try:
+        if not math.isfinite(float(value)):
+            raise AnalysisContractError("table number predicate must be finite")
+        normalized = Decimal(str(value)).normalize()
+    except (InvalidOperation, OverflowError, ValueError) as error:
+        raise AnalysisContractError("table number predicate must be finite") from error
+    canonical = "0" if normalized == 0 else str(normalized)
+    if len(canonical) > 128:
+        raise AnalysisContractError("table number predicate exceeds its canonical bound")
+    return canonical
+
+
+@dataclass(frozen=True, slots=True)
+class TablePredicate:
+    """One exact typed equality predicate over a table column."""
+
+    column: str
+    scalar_type: TableScalarType
+    value: JsonScalar
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.column, str) or not _COLUMN_NAME.fullmatch(self.column):
+            raise AnalysisContractError("table predicate column is invalid")
+        if not isinstance(self.scalar_type, TableScalarType):
+            raise TypeError("table predicate scalar_type must be TableScalarType")
+        if self.scalar_type is TableScalarType.STRING:
+            if type(self.value) is not str:
+                raise TypeError("table string predicate requires a string value")
+            if len(self.value) > 1_024 or any(
+                unicodedata.category(character).startswith("C")
+                for character in self.value
+            ):
+                raise AnalysisContractError("table string predicate value is invalid")
+        elif self.scalar_type is TableScalarType.NUMBER:
+            _canonical_table_number(self.value)
+        elif self.scalar_type is TableScalarType.BOOLEAN:
+            if type(self.value) is not bool:
+                raise TypeError("table boolean predicate requires a boolean value")
+        elif self.value is not None:
+            raise TypeError("table null predicate requires a null value")
+
+    @property
+    def canonical_value(self) -> str:
+        if self.scalar_type is TableScalarType.STRING:
+            assert isinstance(self.value, str)
+            return self.value
+        if self.scalar_type is TableScalarType.NUMBER:
+            return _canonical_table_number(self.value)
+        if self.scalar_type is TableScalarType.BOOLEAN:
+            return "true" if self.value else "false"
+        return "null"
+
+
+@dataclass(frozen=True, slots=True)
+class TableSelector:
+    """An exact target column plus a bounded canonical row predicate set."""
+
+    column: str
+    predicates: tuple[TablePredicate, ...]
+    expected_cardinality: int
+    provenance: FieldProvenance
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.column, str) or not _COLUMN_NAME.fullmatch(self.column):
+            raise AnalysisContractError("table target column is invalid")
+        if (
+            not isinstance(self.predicates, tuple)
+            or not 1 <= len(self.predicates) <= 8
+            or not all(type(item) is TablePredicate for item in self.predicates)
+        ):
+            raise AnalysisContractError(
+                "table selector requires one through eight exact predicates"
+            )
+        ordered = tuple(sorted(self.predicates, key=lambda item: item.column))
+        columns = tuple(item.column for item in ordered)
+        if len(set(columns)) != len(columns):
+            raise AnalysisContractError("table selector predicate columns must be unique")
+        object.__setattr__(self, "predicates", ordered)
+        if (
+            isinstance(self.expected_cardinality, bool)
+            or not isinstance(self.expected_cardinality, int)
+            or not 1 <= self.expected_cardinality <= 32
+        ):
+            raise AnalysisContractError(
+                "table selector expected_cardinality must be between one and 32"
+            )
+        if not isinstance(self.provenance, FieldProvenance):
+            raise TypeError("table selector provenance must be FieldProvenance")
+
+    @property
+    def kind(self) -> SelectorKind:
+        return SelectorKind.COLUMN
+
+    @property
+    def expression(self) -> str:
+        return self.column
+
+
+def selector_identity(
+    selector: EvidenceSelector | TableSelector,
+) -> tuple[object, ...]:
+    """Return one canonical selector identity without provenance metadata."""
+
+    if type(selector) is EvidenceSelector:
+        return ("field", selector.kind.value, selector.expression)
+    if type(selector) is TableSelector:
+        return (
+            "table",
+            selector.column,
+            selector.expected_cardinality,
+            tuple(
+                (
+                    item.column,
+                    item.scalar_type.value,
+                    item.canonical_value,
+                )
+                for item in selector.predicates
+            ),
+        )
+    raise TypeError("selector identity requires an approved selector contract")
+
+
 @dataclass(frozen=True, slots=True)
 class FieldMapping:
     target_field: str
-    selector: EvidenceSelector
+    selector: EvidenceSelector | TableSelector
     provenance: FieldProvenance
 
     def __post_init__(self) -> None:
@@ -259,10 +398,29 @@ class FieldMapping:
             or not _TARGET_FIELD.fullmatch(self.target_field)
         ):
             raise AnalysisContractError("mapping target_field is invalid")
-        if not isinstance(self.selector, EvidenceSelector):
-            raise TypeError("mapping selector must be EvidenceSelector")
+        if type(self.selector) not in {EvidenceSelector, TableSelector}:
+            raise TypeError("mapping selector must be an approved selector contract")
         if not isinstance(self.provenance, FieldProvenance):
             raise TypeError("mapping provenance must be FieldProvenance")
+
+
+def field_mapping_identity(mapping: FieldMapping) -> tuple[object, ...]:
+    """Return the canonical selector-bearing identity for one field mapping.
+
+    Legacy selectors deliberately retain their historical three-part identity.
+    Table selectors add their exact predicates and cardinality without including
+    untrusted or head-specific provenance text.
+    """
+
+    if type(mapping) is not FieldMapping:
+        raise TypeError("field mapping identity requires FieldMapping")
+    if type(mapping.selector) is EvidenceSelector:
+        return (
+            mapping.target_field,
+            mapping.selector.kind.value,
+            mapping.selector.expression,
+        )
+    return (mapping.target_field, *selector_identity(mapping.selector))
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,32 +742,149 @@ def _validate_bindings(bindings: object, label: str) -> tuple[ArtifactBinding, .
     )
     if len(set(keys)) != len(keys):
         raise AnalysisContractError(f"{label} must not contain duplicate bindings")
-    roles_by_path: dict[RepositoryPath, set[ExperimentRole]] = {}
+    bindings_by_path: dict[RepositoryPath, list[ArtifactBinding]] = {}
     for binding in bindings:
-        roles_by_path.setdefault(binding.path, set()).add(binding.role)
-    if any(
-        {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}.issubset(roles)
-        for roles in roles_by_path.values()
-    ):
-        raise AnalysisContractError(
-            f"{label} cannot assign one path to conflicting baseline and candidate roles"
+        bindings_by_path.setdefault(binding.path, []).append(binding)
+    for path_bindings in bindings_by_path.values():
+        roles = {item.role for item in path_bindings}
+        if not {
+            ExperimentRole.BASELINE,
+            ExperimentRole.CANDIDATE,
+        }.issubset(roles):
+            continue
+        role_bindings = tuple(
+            item
+            for item in path_bindings
+            if item.role in {ExperimentRole.BASELINE, ExperimentRole.CANDIDATE}
         )
+        exact_table_identities = tuple(
+            tuple(
+                sorted(
+                    field_mapping_identity(mapping)
+                    for mapping in item.mappings
+                    if type(mapping.selector) is TableSelector
+                )
+            )
+            for item in role_bindings
+        )
+        baseline_table_selectors = tuple(
+            mapping.selector
+            for item in role_bindings
+            if item.role is ExperimentRole.BASELINE
+            for mapping in item.mappings
+            if type(mapping.selector) is TableSelector
+        )
+        candidate_table_selectors = tuple(
+            mapping.selector
+            for item in role_bindings
+            if item.role is ExperimentRole.CANDIDATE
+            for mapping in item.mappings
+            if type(mapping.selector) is TableSelector
+        )
+        overlapping_physical_cells = any(
+            baseline_selector.column == candidate_selector.column
+            and not _table_selectors_are_row_disjoint(
+                baseline_selector,
+                candidate_selector,
+            )
+            for baseline_selector in baseline_table_selectors
+            for candidate_selector in candidate_table_selectors
+        )
+        if (
+            any(not identity for identity in exact_table_identities)
+            or len(set(exact_table_identities)) != len(exact_table_identities)
+            or overlapping_physical_cells
+        ):
+            raise AnalysisContractError(
+                f"{label} cannot assign one path to conflicting baseline and candidate roles"
+            )
     return bindings
+
+
+def _table_number_text(value: str) -> Decimal | None:
+    if not _TABLE_NUMBER.fullmatch(value):
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _table_predicates_may_match_same_cell(
+    left: TablePredicate,
+    right: TablePredicate,
+) -> bool:
+    """Return whether two typed predicates can match one physical table cell.
+
+    Table adapters compare raw cell text with the fixed scalar grammar.  Keep
+    this proof local to the immutable contracts layer so role bindings cannot
+    rely on syntactically different selectors to share a physical measurement.
+    """
+
+    if left.column != right.column:
+        raise ValueError("table predicate overlap requires one shared column")
+    if left.scalar_type is TableScalarType.NULL:
+        return right.scalar_type is TableScalarType.NULL
+    if right.scalar_type is TableScalarType.NULL:
+        return False
+    if (
+        left.scalar_type is TableScalarType.STRING
+        and right.scalar_type is TableScalarType.STRING
+    ):
+        return left.value == right.value
+    if (
+        left.scalar_type is TableScalarType.BOOLEAN
+        and right.scalar_type is TableScalarType.BOOLEAN
+    ):
+        return left.value == right.value
+    if (
+        left.scalar_type is TableScalarType.NUMBER
+        and right.scalar_type is TableScalarType.NUMBER
+    ):
+        return left.canonical_value == right.canonical_value
+
+    if left.scalar_type is TableScalarType.STRING:
+        string_value = left.value
+        other = right
+    elif right.scalar_type is TableScalarType.STRING:
+        string_value = right.value
+        other = left
+    else:
+        return False
+
+    if other.scalar_type is TableScalarType.BOOLEAN:
+        return string_value == ("true" if other.value else "false")
+    if other.scalar_type is TableScalarType.NUMBER:
+        parsed = _table_number_text(string_value)
+        if parsed is None:
+            return False
+        return parsed == Decimal(other.canonical_value)
+    return False
+
+
+def _table_selectors_are_row_disjoint(
+    left: TableSelector,
+    right: TableSelector,
+) -> bool:
+    """Return whether shared predicates prove two selectors select disjoint rows."""
+
+    left_by_column = {item.column: item for item in left.predicates}
+    right_by_column = {item.column: item for item in right.predicates}
+    shared_columns = left_by_column.keys() & right_by_column.keys()
+    return any(
+        not _table_predicates_may_match_same_cell(
+            left_by_column[column],
+            right_by_column[column],
+        )
+        for column in shared_columns
+    )
 
 
 def _field_mapping_projection(
     mappings: tuple[FieldMapping, ...],
-) -> tuple[tuple[str, str, str], ...]:
-    return tuple(
-        sorted(
-            (
-                item.target_field,
-                item.selector.kind.value,
-                item.selector.expression,
-            )
-            for item in mappings
-        )
-    )
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(sorted(field_mapping_identity(item) for item in mappings))
 
 
 @dataclass(frozen=True, slots=True)
@@ -670,6 +945,7 @@ class MappingQuestion:
     prompt: str
     choices: tuple[MappingChoice, ...]
     relevant_claim_id: str | None = None
+    blocking_obligation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _bounded_id(self.question_id, "mapping question_id", maximum=128)
@@ -690,6 +966,25 @@ class MappingQuestion:
                 self.relevant_claim_id,
                 "mapping question relevant_claim_id",
                 maximum=128,
+            )
+        if (
+            not isinstance(self.blocking_obligation_ids, tuple)
+            or len(self.blocking_obligation_ids) > 16
+        ):
+            raise AnalysisContractError(
+                "mapping question obligation linkage exceeds its bound"
+            )
+        for obligation_id in self.blocking_obligation_ids:
+            _bounded_id(
+                obligation_id,
+                "mapping question blocking obligation_id",
+                maximum=128,
+            )
+        if len(set(self.blocking_obligation_ids)) != len(
+            self.blocking_obligation_ids
+        ):
+            raise AnalysisContractError(
+                "mapping question blocking obligation IDs must be unique"
             )
 
 
@@ -983,6 +1278,12 @@ class EphemeralAuditPlan:
     confidence: Confidence
     audit_claim: AuditClaimSpec | None = None
     selected_mapping: MappingCandidate | RepoMapping | None = None
+    semantic_proposal_provenance: FieldProvenance | None = None
+    scientific_claim: "CanonicalScientificClaim | None" = None
+    claim_policy: "ClaimEvidencePolicy | None" = None
+    evidence_obligations: "EvidenceObligationBundle | None" = None
+    profiled_policy: "ProfiledEvidencePolicy | None" = None
+    reference_evidence: tuple[NormalizedEvidence, ...] = ()
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1011,9 +1312,24 @@ class EphemeralAuditPlan:
                 raise AnalysisContractError(
                     f"plan {label} evidence has a conflicting experiment role"
                 )
+        if not isinstance(self.reference_evidence, tuple) or not all(
+            isinstance(item, NormalizedEvidence) for item in self.reference_evidence
+        ):
+            raise TypeError("plan reference_evidence must be a tuple")
+        if not all(
+            _evidence_role_matches(item, ExperimentRole.REFERENCE)
+            for item in self.reference_evidence
+        ):
+            raise AnalysisContractError(
+                "plan reference evidence has a conflicting experiment role"
+            )
         evidence_ids = tuple(
             item.evidence_id
-            for item in (*self.baseline_evidence, *self.candidate_evidence)
+            for item in (
+                *self.baseline_evidence,
+                *self.candidate_evidence,
+                *self.reference_evidence,
+            )
         )
         if len(set(evidence_ids)) != len(evidence_ids):
             raise AnalysisContractError("plan evidence IDs must be unique")
@@ -1049,6 +1365,107 @@ class EphemeralAuditPlan:
             raise AnalysisContractError(
                 "plan audit claim ID must match its claim reference"
             )
+        if self.semantic_proposal_provenance is not None:
+            if type(self.semantic_proposal_provenance) is not FieldProvenance:
+                raise TypeError(
+                    "plan semantic proposal provenance must be FieldProvenance or null"
+                )
+            if (
+                self.semantic_proposal_provenance.kind
+                is not ProvenanceKind.PROVIDER_PROPOSAL
+            ):
+                raise AnalysisContractError(
+                    "plan semantic proposal must remain provider provenance"
+                )
+        if (self.scientific_claim is None) != (self.claim_policy is None):
+            raise AnalysisContractError(
+                "plan scientific claim and claim policy must appear together"
+            )
+        if self.scientific_claim is not None:
+            from .claim_types import (
+                CanonicalScientificClaim,
+                ClaimEvidencePolicy,
+                MetricImprovementClaim,
+                claim_evidence_policy,
+                compile_audit_claim,
+            )
+
+            if type(self.scientific_claim) is not CanonicalScientificClaim:
+                raise TypeError(
+                    "plan scientific_claim must be CanonicalScientificClaim or null"
+                )
+            if type(self.claim_policy) is not ClaimEvidencePolicy:
+                raise TypeError("plan claim_policy must be ClaimEvidencePolicy or null")
+            if self.scientific_claim.reference != self.claim:
+                raise AnalysisContractError(
+                    "plan scientific claim reference must match its claim"
+                )
+            if self.claim_policy != claim_evidence_policy(self.scientific_claim):
+                raise AnalysisContractError(
+                    "plan claim policy must match canonical claim semantics"
+                )
+            if type(self.scientific_claim.primary) is not MetricImprovementClaim:
+                raise AnalysisContractError(
+                    "executable plan requires a metric improvement primary claim"
+                )
+            if self.audit_claim != compile_audit_claim(self.scientific_claim):
+                raise AnalysisContractError(
+                    "plan audit claim must match the deterministic compiler"
+                )
+        if self.evidence_obligations is not None:
+            from .obligations import (
+                EvidenceObligationBundle,
+                EvidenceObligationDecision,
+            )
+
+            if type(self.evidence_obligations) is not EvidenceObligationBundle:
+                raise TypeError(
+                    "plan evidence_obligations must be EvidenceObligationBundle or null"
+                )
+            if (
+                self.evidence_obligations.decision
+                is not EvidenceObligationDecision.READY
+            ):
+                raise AnalysisContractError(
+                    "an executable plan requires satisfied evidence obligations"
+                )
+            if self.evidence_obligations.claim_id != self.claim.claim_id:
+                raise AnalysisContractError(
+                    "plan evidence obligations must match the selected claim"
+                )
+            expected_policy_id = (
+                self.claim_policy.policy_id
+                if self.profiled_policy is None
+                else self.profiled_policy.policy_id
+            )
+            if self.claim_policy is not None and (
+                self.evidence_obligations.policy_id != expected_policy_id
+            ):
+                raise AnalysisContractError(
+                    "plan evidence obligations must match the claim policy"
+                )
+        if self.profiled_policy is not None:
+            from .profiles import (
+                EvidenceProfileId,
+                ProfiledEvidencePolicy,
+                profiled_evidence_policy,
+            )
+
+            if type(self.profiled_policy) is not ProfiledEvidencePolicy:
+                raise TypeError("plan profiled_policy must be ProfiledEvidencePolicy or null")
+            if self.scientific_claim is None:
+                raise AnalysisContractError("profiled plan requires canonical claim semantics")
+            if self.profiled_policy != profiled_evidence_policy(
+                self.scientific_claim,
+                self.profiled_policy.profile_selection,
+            ):
+                raise AnalysisContractError("plan profiled policy is not canonical")
+            if (
+                self.profiled_policy.profile_id
+                is EvidenceProfileId.TRAINING_EXPERIMENT_V0
+                and self.reference_evidence
+            ):
+                raise AnalysisContractError("Training profile cannot carry reference evidence")
 
 
 def _deep_freeze(value: object) -> object:
@@ -1176,6 +1593,8 @@ class UnifiedAnalysisResult:
     mapping_question: MappingQuestion | None = None
     unavailable_reason: str | None = None
     missing_evidence: tuple[MissingEvidence, ...] = ()
+    evidence_trace: "EvidenceTraceBundle | None" = None
+    evidence_obligations: "EvidenceObligationBundle | None" = None
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("UnifiedAnalysisResult is final to preserve authority")
@@ -1212,6 +1631,62 @@ class UnifiedAnalysisResult:
             raise TypeError(
                 "unified missing_evidence must be a tuple of MissingEvidence values"
             )
+        if self.evidence_trace is not None:
+            from .trace import EvidenceTraceBundle
+
+            if type(self.evidence_trace) is not EvidenceTraceBundle:
+                raise TypeError("unified evidence_trace must be EvidenceTraceBundle")
+            if self.deterministic is None:
+                raise AnalysisContractError(
+                    "evidence trace requires a deterministic outcome"
+                )
+            if (
+                self.evidence_trace.deterministic_authority.verdict
+                is not self.deterministic.verdict
+            ):
+                raise AnalysisContractError(
+                    "evidence trace verdict does not match deterministic authority"
+                )
+            if (
+                self.evidence_trace.advisory_interpretation is None
+            ) != (self.research_interpretation is None):
+                raise AnalysisContractError(
+                    "evidence trace advisory state does not match Research Review"
+                )
+        if self.evidence_obligations is not None:
+            from .obligations import (
+                EvidenceObligationBundle,
+                EvidenceObligationDecision,
+            )
+
+            if type(self.evidence_obligations) is not EvidenceObligationBundle:
+                raise TypeError(
+                    "unified evidence_obligations must be EvidenceObligationBundle"
+                )
+            if self.state is AnalysisState.MAPPING_NEEDED:
+                expected_decisions = {EvidenceObligationDecision.MAPPING_NEEDED}
+            elif self.deterministic is None and self.state is AnalysisState.PARTIAL:
+                expected_decisions = {EvidenceObligationDecision.PARTIAL}
+            else:
+                expected_decisions = {EvidenceObligationDecision.READY}
+            if self.evidence_obligations.decision not in expected_decisions:
+                raise AnalysisContractError(
+                    "unified evidence obligations do not match analysis lifecycle"
+                )
+            if self.state is AnalysisState.MAPPING_NEEDED and (
+                self.mapping_question is None
+                or self.evidence_obligations.mapping_question_id
+                != self.mapping_question.question_id
+                or self.evidence_obligations.blocking_obligation_ids
+                != self.mapping_question.blocking_obligation_ids
+            ):
+                raise AnalysisContractError(
+                    "mapping question linkage does not match evidence obligations"
+                )
+            if self.state is AnalysisState.UNAVAILABLE:
+                raise AnalysisContractError(
+                    "operationally unavailable analysis cannot carry evidence obligations"
+                )
 
         if self.state is AnalysisState.COMPLETE:
             if self.deterministic is None:
@@ -1239,6 +1714,10 @@ class UnifiedAnalysisResult:
                 raise AnalysisContractError(
                     "mapping-needed analysis cannot carry an unavailable reason"
                 )
+            if self.evidence_trace is not None:
+                raise AnalysisContractError(
+                    "mapping-needed analysis cannot carry deterministic evidence trace"
+                )
         elif self.state is AnalysisState.UNAVAILABLE:
             if self.unavailable_reason is None:
                 raise AnalysisContractError(
@@ -1254,6 +1733,10 @@ class UnifiedAnalysisResult:
             ):
                 raise AnalysisContractError(
                     "unavailable analysis cannot carry an available result"
+                )
+            if self.evidence_trace is not None:
+                raise AnalysisContractError(
+                    "unavailable analysis cannot carry deterministic evidence trace"
                 )
         elif not any(
             value is not None
@@ -1278,6 +1761,39 @@ class UnifiedAnalysisResult:
 def to_jsonable(value: object) -> object:
     """Return a detached JSON-compatible view of approved analysis values."""
 
+    if type(value).__module__ == "claimci.analysis.obligations":
+        from .obligations import (
+            ArtifactEvidenceSupport,
+            MeasurementProcedureSupport,
+            ProfileEvidenceSupport,
+        )
+
+        if type(value) is ArtifactEvidenceSupport:
+            return {
+                "support_id": value.support_id,
+                "evidence_id": value.evidence_id,
+                "binding_id": value.binding_id,
+            }
+        if type(value) is MeasurementProcedureSupport:
+            return {
+                "support_id": value.support_id,
+                "procedure": value.procedure.value,
+                "evidence_ids": list(value.evidence_ids),
+                "binding_ids": list(value.binding_ids),
+            }
+        if type(value) is ProfileEvidenceSupport:
+            return {
+                "support_id": value.support_id,
+                "profile_id": value.profile_id.value,
+                "slot_id": value.slot_id,
+                "role_mode": value.role_mode.value,
+                "support_kind": value.support_kind.value,
+                "source_binding_ids": list(value.source_binding_ids),
+            }
+    if type(value).__module__ == "claimci.analysis.trace":
+        from .trace import trace_to_jsonable
+
+        return trace_to_jsonable(value)
     if isinstance(value, Confidence):
         return value.value
     if isinstance(value, Enum):
@@ -1352,6 +1868,11 @@ __all__ = [
     "RepositoryPath",
     "SelectorKind",
     "Sha256Digest",
+    "TablePredicate",
+    "TableScalarType",
+    "TableSelector",
     "UnifiedAnalysisResult",
+    "field_mapping_identity",
+    "selector_identity",
     "to_jsonable",
 ]

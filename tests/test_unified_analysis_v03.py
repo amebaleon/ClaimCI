@@ -14,7 +14,15 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactKind,
     Confidence,
+    ClaimFieldTarget,
+    ConfigValue,
+    EvidenceObligationDecision,
+    EvidenceObligationReason,
+    EvidenceObligationState,
+    EvidenceSelector,
+    EvidenceTraceBundle,
     ExperimentRole,
+    FieldMapping,
     GitCommitSha,
     MappingCandidate,
     PassiveArtifact,
@@ -22,12 +30,19 @@ from claimci.analysis import (
     ProvenanceKind,
     RepositoryPath,
     RepositoryIdentity,
+    SelectorKind,
     Sha256Digest,
+    TraceCompleteness,
+    UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER,
     UnifiedAnalysisResult,
+    claim_evidence_policy,
+    compile_audit_claim,
     plan_ephemeral_audit,
+    recover_scientific_claim,
     run_unified_analysis,
 )
 from claimci.analysis.adapters import extract_registered_artifact
+from claimci.analysis.materialize import MaterializationPartial
 from claimci.audit import audit_research
 from claimci.models import Verdict
 from claimci.report import render_json
@@ -75,6 +90,8 @@ class IntegrationProvider:
 def _request_from_plan(plan: object) -> PlanningRequest:
     evidence = (*plan.baseline_evidence, *plan.candidate_evidence)
     assert isinstance(plan.selected_mapping, MappingCandidate)
+    scientific_claim = plan.scientific_claim or recover_scientific_claim(plan.claim)
+    assert scientific_claim is not None
     return PlanningRequest(
         repository=plan.repository,
         pr_number=plan.pr_number,
@@ -84,6 +101,8 @@ def _request_from_plan(plan: object) -> PlanningRequest:
         artifacts=tuple(item.artifact for item in evidence),
         normalized_evidence=evidence,
         mapping_candidates=(plan.selected_mapping,),
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
     )
 
 
@@ -177,6 +196,71 @@ def _provider_mapping(request: PlanningRequest) -> PlanningRequest:
     return dataclasses.replace(request, mapping_candidates=(hostile,))
 
 
+def _with_explicit_aggregation(
+    request: PlanningRequest,
+    *,
+    procedure: str,
+) -> PlanningRequest:
+    changed_evidence = []
+    mappings_by_path: dict[RepositoryPath, tuple[object, ...]] = {}
+    for evidence in request.normalized_evidence:
+        if evidence.artifact.kind is not ArtifactKind.CONFIG:
+            changed_evidence.append(evidence)
+            continue
+        provenance = evidence.adapter_match.match_evidence[0]
+        field_mapping = FieldMapping(
+            "config.evaluation.aggregation",
+            EvidenceSelector(
+                SelectorKind.DOTTED_PATH,
+                "evaluation.aggregation",
+                provenance,
+            ),
+            provenance,
+        )
+        mappings = (*evidence.adapter_match.mappings, field_mapping)
+        changed = dataclasses.replace(
+            evidence,
+            adapter_match=dataclasses.replace(
+                evidence.adapter_match,
+                mappings=mappings,
+            ),
+            observations=tuple(
+                dataclasses.replace(
+                    observation,
+                    config_values=(
+                        *observation.config_values,
+                        ConfigValue(
+                            "evaluation.aggregation",
+                            procedure,
+                            provenance,
+                        ),
+                    ),
+                )
+                for observation in evidence.observations
+            ),
+        )
+        mappings_by_path[evidence.artifact.path] = mappings
+        changed_evidence.append(changed)
+    mapping = request.mapping_candidates[0]
+    changed_mapping = dataclasses.replace(
+        mapping,
+        bindings=tuple(
+            dataclasses.replace(
+                binding,
+                mappings=mappings_by_path[binding.path],  # type: ignore[arg-type]
+            )
+            if binding.path in mappings_by_path
+            else binding
+            for binding in mapping.bindings
+        ),
+    )
+    return dataclasses.replace(
+        request,
+        normalized_evidence=tuple(changed_evidence),
+        mapping_candidates=(changed_mapping,),
+    )
+
+
 def _update_artifact_bytes(
     request: PlanningRequest,
     checkout: Path,
@@ -229,6 +313,11 @@ def test_state_successful_audit_with_disabled_review_is_partial_with_authority(
     assert result.state is AnalysisState.PARTIAL
     assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
     assert result.research_interpretation is None
+    assert result.evidence_trace is not None
+    assert result.evidence_trace.completeness is TraceCompleteness.COMPLETE
+    assert result.evidence_trace.advisory_interpretation is None
+    assert result.evidence_obligations is not None
+    assert result.evidence_obligations.decision is EvidenceObligationDecision.READY
 
 
 def test_state_review_failure_is_partial_without_provider_error_leak(
@@ -264,6 +353,7 @@ def test_state_runtime_integrity_failure_is_unavailable(tmp_path: Path) -> None:
 
     assert result.state is AnalysisState.UNAVAILABLE
     assert result.authoritative_verdict is None
+    assert result.evidence_obligations is None
 
 
 def test_state_unexpected_executor_failure_is_fail_closed_unavailable(
@@ -275,7 +365,7 @@ def test_state_unexpected_executor_failure_is_fail_closed_unavailable(
     request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
     monkeypatch.setattr(
         integration,
-        "execute_ephemeral_audit",
+        "execute_ephemeral_audit_with_trace",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("private executor failure detail")
         ),
@@ -291,6 +381,33 @@ def test_state_unexpected_executor_failure_is_fail_closed_unavailable(
     assert result.state is AnalysisState.UNAVAILABLE
     assert result.authoritative_verdict is None
     assert "private executor" not in (result.unavailable_reason or "")
+
+
+def test_untyped_materialization_partial_is_fail_closed_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+
+    def fail_without_a_validated_slot(*_args: object, **_kwargs: object) -> object:
+        raise MaterializationPartial("private untyped representation detail")
+
+    monkeypatch.setattr(
+        "claimci.analysis.integration.execute_ephemeral_audit_with_trace",
+        fail_without_a_validated_slot,
+    )
+
+    result = run_unified_analysis(
+        request,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=IntegrationProvider(),
+    )
+
+    assert result.state is AnalysisState.UNAVAILABLE
+    assert result.authoritative_verdict is None
+    assert result.evidence_obligations is None
+    assert "private" not in (result.unavailable_reason or "")
 
 
 def test_scenario_a_zero_manifest_normalized_evidence_runs_full_analysis(
@@ -309,7 +426,39 @@ def test_scenario_a_zero_manifest_normalized_evidence_runs_full_analysis(
     assert result.state is AnalysisState.COMPLETE
     assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
     assert result.research_interpretation is not None
+    assert result.evidence_trace is not None
+    assert result.evidence_trace.completeness is TraceCompleteness.COMPLETE
+    assert result.evidence_trace.advisory_interpretation is not None
+    assert not hasattr(result.evidence_trace.advisory_interpretation, "verdict")
     assert len(provider.calls) == 1
+
+
+def test_advisory_trace_failure_preserves_the_real_verdict_and_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+
+    def fail_advisory_trace(
+        self: EvidenceTraceBundle,
+        _interpretation: object,
+    ) -> EvidenceTraceBundle:
+        raise RuntimeError("trace-only advisory failure")
+
+    monkeypatch.setattr(EvidenceTraceBundle, "with_advisory", fail_advisory_trace)
+    result = run_unified_analysis(
+        request,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=IntegrationProvider(),
+    )
+
+    assert result.state is AnalysisState.COMPLETE
+    assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
+    assert result.research_interpretation is not None
+    assert result.evidence_trace is not None
+    assert result.evidence_trace.completeness is TraceCompleteness.UNAVAILABLE
+    assert result.evidence_trace.advisory_interpretation is not None
 
 
 def test_scenario_b_native_manifest_preserves_audit_bytes(study_factory) -> None:
@@ -336,6 +485,35 @@ def test_scenario_c_ambiguous_candidate_mapping_asks_without_verdict(
     assert result.state is AnalysisState.MAPPING_NEEDED
     assert result.mapping_question is not None
     assert result.authoritative_verdict is None
+    assert result.evidence_trace is None
+    assert result.evidence_obligations is not None
+    assert (
+        result.evidence_obligations.decision
+        is EvidenceObligationDecision.MAPPING_NEEDED
+    )
+    assert result.mapping_question.blocking_obligation_ids == (
+        result.evidence_obligations.blocking_obligation_ids
+    )
+
+
+def test_mapping_question_cannot_be_relinked_to_an_unrelated_obligation_bundle(
+    tmp_path: Path,
+) -> None:
+    request, _runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    planning = plan_ephemeral_audit(_ambiguous(request))
+    assert planning.mapping_question is not None
+    assert planning.evidence_obligations is not None
+    unrelated = dataclasses.replace(
+        planning.mapping_question,
+        question_id="mapping-unrelated-question",
+    )
+
+    with pytest.raises(ValueError, match="obligation|question|link"):
+        UnifiedAnalysisResult(
+            state=AnalysisState.MAPPING_NEEDED,
+            mapping_question=unrelated,
+            evidence_obligations=planning.evidence_obligations,
+        )
 
 
 def test_scenario_d_missing_dataset_is_pre_audit_partial(tmp_path: Path) -> None:
@@ -351,6 +529,212 @@ def test_scenario_d_missing_dataset_is_pre_audit_partial(tmp_path: Path) -> None
     assert result.state is AnalysisState.PARTIAL
     assert result.authoritative_verdict is None
     assert {item.kind for item in result.missing_evidence} == {ArtifactKind.DATASET}
+    assert result.evidence_obligations is not None
+    assert result.evidence_obligations.decision is EvidenceObligationDecision.PARTIAL
+
+
+def test_native_config_representation_failure_is_a_specific_artifact_obligation(
+    tmp_path: Path,
+) -> None:
+    request, runtime, checkout, _scratch = _fixture_request(tmp_path)
+
+    def conflicting_config(evidence):
+        observation = evidence.observations[0]
+        provenance = observation.config_values[0].provenance
+        return dataclasses.replace(
+            evidence,
+            observations=(
+                dataclasses.replace(
+                    observation,
+                    config_values=(
+                        ConfigValue("training_steps", 100, provenance),
+                        ConfigValue("training_steps.value", 100, provenance),
+                    ),
+                ),
+            ),
+        )
+
+    request = _update_artifact_bytes(
+        request,
+        checkout,
+        path="configs/candidate.json",
+        content=b'{"training_steps":100,"training_steps.value":100}\n',
+        evidence_transform=conflicting_config,
+    )
+    provider = IntegrationProvider()
+
+    result = run_unified_analysis(
+        request,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=provider,
+    )
+
+    assert result.state is AnalysisState.PARTIAL
+    assert result.authoritative_verdict is None
+    assert result.mapping_question is None
+    assert provider.calls == []
+    assert result.evidence_obligations is not None
+    assert result.evidence_obligations.decision is EvidenceObligationDecision.PARTIAL
+    blocker = next(
+        item
+        for item in result.evidence_obligations.obligations
+        if item.obligation_id == "artifact.candidate.config"
+    )
+    assert blocker.state is EvidenceObligationState.UNSUPPORTED
+    assert (
+        blocker.reason
+        is EvidenceObligationReason.NATIVE_REPRESENTATION_NOT_SUPPORTED
+    )
+    assert {item.kind for item in result.missing_evidence} == {ArtifactKind.CONFIG}
+    assert ArtifactKind.MANIFEST not in {item.kind for item in result.missing_evidence}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Candidate accuracy is at least 0.90.",
+        "The candidate generalizes across unseen domains.",
+        "The candidate uses 40% less memory.",
+    ],
+)
+def test_each_unsupported_primary_is_exact_partial_and_never_reaches_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    reference = dataclasses.replace(
+        request.claim,
+        text=text,
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    unsupported = dataclasses.replace(
+        request,
+        claim=reference,
+        audit_claim=None,
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+
+    def fail_if_executed(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsupported claim reached deterministic Audit")
+
+    monkeypatch.setattr(
+        "claimci.analysis.integration.execute_ephemeral_audit_with_trace",
+        fail_if_executed,
+    )
+
+    result = run_unified_analysis(
+        unsupported,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=IntegrationProvider(),
+    )
+
+    assert result.state is AnalysisState.PARTIAL
+    assert result.unavailable_reason == UNSUPPORTED_DETERMINISTIC_CLAIM_COMPILER
+    assert result.authoritative_verdict is None
+    assert result.deterministic is None
+    assert result.mapping_question is None
+    assert result.evidence_obligations is not None
+    assert (
+        result.evidence_obligations.compiler_state
+        is EvidenceObligationState.UNSUPPORTED
+    )
+
+
+def test_unsupported_upstream_procedure_never_reaches_audit_or_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    reference = dataclasses.replace(
+        request.claim,
+        text=(
+            "Using median across supplied runs, accuracy improved from 0.60 "
+            "to 0.90 by at least 0.05."
+        ),
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    blocked = dataclasses.replace(
+        request,
+        claim=reference,
+        audit_claim=compile_audit_claim(scientific_claim),
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+    provider = IntegrationProvider()
+
+    def fail_if_executed(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsupported upstream procedure reached Audit")
+
+    monkeypatch.setattr(
+        "claimci.analysis.integration.execute_ephemeral_audit_with_trace",
+        fail_if_executed,
+    )
+
+    result = run_unified_analysis(
+        blocked,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=provider,
+    )
+
+    assert result.state is AnalysisState.PARTIAL
+    assert result.unavailable_reason == "measurement_procedure_not_supported"
+    assert result.authoritative_verdict is None
+    assert result.mapping_question is None
+    assert provider.calls == []
+
+
+def test_supported_upstream_reduction_reaches_real_audit_with_one_review_call(
+    tmp_path: Path,
+) -> None:
+    request, runtime, _checkout, _scratch = _fixture_request(tmp_path)
+    request = _with_explicit_aggregation(
+        request,
+        procedure="arithmetic_mean_v1",
+    )
+    reference = dataclasses.replace(
+        request.claim,
+        text=(
+            "Using the arithmetic mean across supplied runs, accuracy improved "
+            "from 0.60 to 0.90 by at least 0.05."
+        ),
+    )
+    scientific_claim = recover_scientific_claim(reference)
+    assert scientific_claim is not None
+    request = dataclasses.replace(
+        request,
+        claim=reference,
+        audit_claim=compile_audit_claim(scientific_claim),
+        scientific_claim=scientific_claim,
+        claim_policy=claim_evidence_policy(scientific_claim),
+    )
+    provider = IntegrationProvider()
+
+    result = run_unified_analysis(
+        request,
+        runtime,
+        ReviewConfig(enabled=True),
+        provider=provider,
+    )
+
+    assert result.state is AnalysisState.COMPLETE
+    assert result.authoritative_verdict is Verdict.NOT_SUPPORTED
+    assert result.deterministic is not None
+    measurement = result.deterministic.payload["measurement_drift"]
+    assert measurement["claimci_verification_reduction"] == "arithmetic_mean_v1"
+    retry = next(
+        item
+        for item in measurement["findings"]
+        if item["component_kind"] == "retry_aggregation"
+    )
+    assert retry["state"] == "verified"
+    assert len(provider.calls) == 1
 
 
 def test_scenario_e_advisory_disagreement_cannot_override_audit(
@@ -397,6 +781,15 @@ def test_scenario_g_vague_improvement_never_invents_threshold(
             minimum_absolute_improvement=None,
             threshold_provenance=None,
         ),
+        scientific_claim=None,
+        claim_policy=None,
+    )
+    vague_scientific = recover_scientific_claim(vague.claim)
+    assert vague_scientific is not None
+    vague = dataclasses.replace(
+        vague,
+        scientific_claim=vague_scientific,
+        claim_policy=claim_evidence_policy(vague_scientific),
     )
 
     result = run_unified_analysis(
@@ -408,7 +801,17 @@ def test_scenario_g_vague_improvement_never_invents_threshold(
 
     assert result.state is AnalysisState.PARTIAL
     assert result.authoritative_verdict is None
-    assert any("threshold" in item.description for item in result.missing_evidence)
+    assert result.missing_evidence == ()
+    assert result.unavailable_reason == "required_threshold_not_recovered"
+    assert result.evidence_obligations is not None
+    threshold = next(
+        item
+        for item in result.evidence_obligations.obligations
+        if item.obligation_id == "claim.threshold"
+    )
+    assert isinstance(threshold.target, ClaimFieldTarget)
+    assert threshold.state is EvidenceObligationState.MISSING
+    assert threshold.reason is EvidenceObligationReason.REQUIRED_THRESHOLD_NOT_RECOVERED
 
 
 def test_scenario_h_identical_inputs_produce_stable_plan_and_result(
@@ -453,6 +856,7 @@ def test_scenario_i_hostile_provider_mapping_never_executes(tmp_path: Path) -> N
     assert result.state is AnalysisState.MAPPING_NEEDED
     assert result.authoritative_verdict is None
     assert provider.calls == []
+    assert result.evidence_obligations is not None
 
 
 def test_completed_insufficient_audit_plus_review_is_pipeline_complete(
@@ -497,3 +901,5 @@ def test_completed_insufficient_audit_plus_review_is_pipeline_complete(
     assert result.state is AnalysisState.COMPLETE
     assert result.authoritative_verdict is Verdict.INSUFFICIENT_EVIDENCE
     assert result.research_interpretation is not None
+    assert result.evidence_obligations is not None
+    assert result.evidence_obligations.decision is EvidenceObligationDecision.READY

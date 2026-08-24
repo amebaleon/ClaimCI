@@ -6,6 +6,10 @@ import math
 from dataclasses import dataclass
 
 from claimci.analysis.confidence import Confidence
+from claimci.analysis.claim_types import (
+    CanonicalScientificClaim,
+    recover_scientific_claim,
+)
 from claimci.analysis.contracts import (
     ArtifactCandidate,
     ClaimReference,
@@ -127,6 +131,7 @@ class DiscoveredClaim:
     minimum_improvement: ClaimedValue | None = None
     qualifiers: tuple[str, ...] = ()
     evidence_hints: tuple[RepositoryPath, ...] = ()
+    scientific_claim: CanonicalScientificClaim | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, ClaimReference):
@@ -173,6 +178,17 @@ class DiscoveredClaim:
                 )
         elif self.reference.source_path is not None:
             raise DiscoveryError("pull-request claim reference cannot carry a path")
+        recovered = recover_scientific_claim(self.reference)
+        if self.scientific_claim is None:
+            object.__setattr__(self, "scientific_claim", recovered)
+        elif type(self.scientific_claim) is not CanonicalScientificClaim:
+            raise TypeError(
+                "discovered scientific_claim must be CanonicalScientificClaim or null"
+            )
+        elif self.scientific_claim != recovered:
+            raise DiscoveryError(
+                "discovered scientific claim conflicts with source recovery"
+            )
 
 
 @dataclass(frozen=True, slots=True)
