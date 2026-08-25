@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
@@ -12,6 +13,7 @@ from .config_check import check_configs, load_config
 from .dataset_check import (
     check_dataset_leakage,
     check_evaluation_alignment,
+    check_streaming_dataset_context,
     load_dataset,
 )
 from .models import (
@@ -170,6 +172,33 @@ def determine_verdict(findings: list[Finding] | tuple[Finding, ...]) -> Verdict:
     return Verdict.SUPPORTED
 
 
+def _metric_identity_finding(context: object, metric: str) -> Finding:
+    from .analysis.metric_identity import (
+        MetricIdentityAuditContext,
+        metric_binding_material,
+    )
+
+    if type(context) is not MetricIdentityAuditContext:
+        raise TypeError(
+            "metric_identity_context must be a trusted exact-head context or null"
+        )
+    if context.binding.canonical_metric != metric:
+        raise ClaimCIError(
+            "exact-head metric binding does not match the audited metric"
+        )
+    return Finding(
+        rule_id="RESULT.METRIC_IDENTITY_VERIFIED",
+        severity=Severity.VERIFIED,
+        title="Exact baseline and candidate metric identities verified",
+        explanation=(
+            "ClaimCI independently revalidated both bound raw metric selectors "
+            "against the exact-head passive artifacts."
+        ),
+        evidence=metric_binding_material(context.binding),
+        impact=Impact.NONE,
+    )
+
+
 def _artifact_failure(
     category: str,
     experiment: str,
@@ -192,6 +221,8 @@ def audit_research(
     *,
     artifact_root: Path | None = None,
     measurement_context: MeasurementAuditContext | None = None,
+    metric_identity_context: object | None = None,
+    dataset_scan_context: object | None = None,
 ) -> AuditResult:
     if measurement_context is not None and type(
         measurement_context
@@ -199,6 +230,20 @@ def audit_research(
         raise TypeError(
             "measurement_context must be a trusted MeasurementAuditContext or null"
         )
+    if metric_identity_context is not None:
+        from .analysis.metric_identity import MetricIdentityAuditContext
+
+        if type(metric_identity_context) is not MetricIdentityAuditContext:
+            raise TypeError(
+                "metric_identity_context must be a trusted exact-head context or null"
+            )
+    if dataset_scan_context is not None:
+        from .analysis.streaming_dataset import DatasetScanAuditContext
+
+        if type(dataset_scan_context) is not DatasetScanAuditContext:
+            raise TypeError(
+                "dataset_scan_context must be a trusted streaming context or null"
+            )
     spec = load_research_spec(path, artifact_root=artifact_root)
     findings: list[Finding] = []
     overlaps = []
@@ -267,36 +312,68 @@ def audit_research(
             relative_improvement = checked.relative_improvement
             findings.extend(checked.findings)
 
-    loaded_datasets = {}
-    for experiment, paths in (("baseline", spec.baseline), ("candidate", spec.candidate)):
-        datasets = {}
-        for split, dataset_path in (
-            ("train", paths.train_dataset),
-            ("eval", paths.eval_dataset),
-        ):
-            try:
-                datasets[split] = load_dataset(dataset_path)
-            except ClaimCIError as exc:
-                findings.append(_artifact_failure("DATASET", experiment, dataset_path, exc))
-        if len(datasets) == 2:
-            overlap, leakage_findings = check_dataset_leakage(
-                experiment, datasets["train"], datasets["eval"]
-            )
-            overlaps.append(overlap)
-            findings.extend(leakage_findings)
-        loaded_datasets[experiment] = datasets
-
-    if all(
-        "eval" in loaded_datasets[experiment]
-        for experiment in ("baseline", "candidate")
-    ):
-        findings.extend(
-            check_evaluation_alignment(
-                loaded_datasets["baseline"]["eval"],
-                loaded_datasets["candidate"]["eval"],
-            )
+    loaded_datasets: dict[str, dict[str, object]] = {}
+    baseline_eval_identity = None
+    candidate_eval_identity = None
+    if dataset_scan_context is not None:
+        dataset_root = (
+            Path(artifact_root)
+            if artifact_root is not None
+            else spec.manifest_path.parent
         )
+        dataset_scan_context.validate_paths(
+            dataset_root,
+            {
+                ("baseline", "train"): spec.baseline.train_dataset,
+                ("baseline", "eval"): spec.baseline.eval_dataset,
+                ("candidate", "train"): spec.candidate.train_dataset,
+                ("candidate", "eval"): spec.candidate.eval_dataset,
+            },
+        )
+        streamed_overlaps, streamed_findings = check_streaming_dataset_context(
+            dataset_scan_context
+        )
+        overlaps.extend(streamed_overlaps)
+        findings.extend(streamed_findings)
+        baseline_eval_identity = dataset_scan_context.evaluation_identity("baseline")
+        candidate_eval_identity = dataset_scan_context.evaluation_identity("candidate")
+    else:
+        for experiment, paths in (
+            ("baseline", spec.baseline),
+            ("candidate", spec.candidate),
+        ):
+            datasets = {}
+            for split, dataset_path in (
+                ("train", paths.train_dataset),
+                ("eval", paths.eval_dataset),
+            ):
+                try:
+                    datasets[split] = load_dataset(dataset_path)
+                except ClaimCIError as exc:
+                    findings.append(
+                        _artifact_failure("DATASET", experiment, dataset_path, exc)
+                    )
+            if len(datasets) == 2:
+                overlap, leakage_findings = check_dataset_leakage(
+                    experiment, datasets["train"], datasets["eval"]
+                )
+                overlaps.append(overlap)
+                findings.extend(leakage_findings)
+            loaded_datasets[experiment] = datasets
 
+        if all(
+            "eval" in loaded_datasets[experiment]
+            for experiment in ("baseline", "candidate")
+        ):
+            findings.extend(
+                check_evaluation_alignment(
+                    loaded_datasets["baseline"]["eval"],
+                    loaded_datasets["candidate"]["eval"],
+                )
+            )
+
+    if metric_identity_context is not None:
+        findings.append(_metric_identity_finding(metric_identity_context, spec.metric))
     verdict = determine_verdict(findings)
     measurement_drift = None
     if measurement_context is not None:
@@ -313,6 +390,8 @@ def audit_research(
             candidate_evaluation_hashes=(
                 None if candidate_eval is None else candidate_eval.hashes
             ),
+            baseline_evaluation_identity=baseline_eval_identity,
+            candidate_evaluation_identity=candidate_eval_identity,
         )
         measurement_drift = compare_measurement_protocols(
             protocols,
@@ -344,6 +423,8 @@ def audit_profiled(
     candidate_evidence: object,
     reference_evidence: object = (),
     measurement_context: MeasurementAuditContext | None = None,
+    metric_identity_context: object | None = None,
+    dataset_scan_context: object | None = None,
 ) -> AuditResult:
     """Dispatch one evidence profile into the single native Audit authority."""
 
@@ -359,9 +440,15 @@ def audit_profiled(
             training_manifest,
             artifact_root=artifact_root,
             measurement_context=measurement_context,
+            metric_identity_context=metric_identity_context,
+            dataset_scan_context=dataset_scan_context,
         )
     if type(audit_claim) is not AuditClaimSpec:
         raise TypeError("Benchmark profile requires AuditClaimSpec")
+    if dataset_scan_context is not None:
+        raise TypeError(
+            "dataset_scan_context is supported only by the training profile"
+        )
     for label, values in (
         ("baseline", baseline_evidence),
         ("candidate", candidate_evidence),
@@ -373,11 +460,20 @@ def audit_profiled(
             raise TypeError(f"profiled Audit {label} evidence is invalid")
     from .benchmark_audit import audit_benchmark
 
-    return audit_benchmark(
+    result = audit_benchmark(
         audit_claim=audit_claim,
         selection=profiled_policy.profile_selection,
         baseline_evidence=baseline_evidence,
         candidate_evidence=candidate_evidence,
         reference_evidence=reference_evidence,
         measurement_context=measurement_context,
+    )
+    if metric_identity_context is None:
+        return result
+    finding = _metric_identity_finding(metric_identity_context, audit_claim.metric)
+    findings = (*result.findings, finding)
+    return replace(
+        result,
+        findings=findings,
+        verdict=determine_verdict(findings),
     )

@@ -16,6 +16,7 @@ from typing import Mapping
 from claimci.models import AuditResult, Verdict
 from claimci.report import render_json
 
+from .artifact_source import ScanCompleteness
 from .contracts import (
     AdvisoryResearchInterpretation,
     AnalysisAuthority,
@@ -274,6 +275,34 @@ class BoundedValueRepresentation:
             byte_count=len(value),
         )
 
+    @classmethod
+    def from_verified_stream(
+        cls,
+        digest: Sha256Digest,
+        size: int,
+        completeness: object,
+    ) -> "BoundedValueRepresentation":
+        """Commit an already-verified domain-separated streaming digest."""
+
+        if type(completeness) is not ScanCompleteness:
+            raise TypeError("stream trace requires ScanCompleteness")
+        if (
+            not completeness.integrity_verified
+            or completeness.integrity_bytes != size
+            or completeness.expected_bytes != size
+        ):
+            raise TraceContractError(
+                "stream trace requires exact verified integrity"
+            )
+        if not isinstance(digest, Sha256Digest):
+            digest = Sha256Digest(digest)
+        return cls(
+            value_type=TraceValueType.BYTES,
+            count=size,
+            canonical_sha256=digest,
+            byte_count=size,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class TraceTablePredicate:
@@ -382,6 +411,7 @@ class EvidenceTraceEntry:
     dataset_split: DatasetSplit | None = None
     source_value: BoundedValueRepresentation | None = None
     normalized_value: BoundedValueRepresentation | None = None
+    scan_completeness: object | None = None
     consumer_rule_ids: tuple[str, ...] = ()
     source_trace_ids: tuple[str, ...] = ()
 
@@ -476,6 +506,17 @@ class EvidenceTraceEntry:
         ):
             if value is not None and type(value) is not BoundedValueRepresentation:
                 raise TypeError(f"trace {label} must be BoundedValueRepresentation or null")
+        if self.scan_completeness is not None:
+            if type(self.scan_completeness) is not ScanCompleteness:
+                raise TypeError("trace scan_completeness must be ScanCompleteness")
+            if (
+                self.record_kind is not TraceRecordKind.PASSIVE_SOURCE_EVIDENCE
+                or not self.scan_completeness.integrity_verified
+                or self.artifact_size != self.scan_completeness.expected_bytes
+            ):
+                raise TraceContractError(
+                    "trace scan completeness requires exact passive source integrity"
+                )
         _validate_text_tuple(
             self.consumer_rule_ids,
             "consumer_rule_ids",
@@ -898,12 +939,24 @@ class EvidenceTraceBundle:
 class EphemeralAuditExecution:
     audit_result: AuditResult
     trace: EvidenceTraceBundle
+    scan_completeness: tuple[ScanCompleteness, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.audit_result) is not AuditResult:
             raise TypeError("ephemeral audit execution requires an actual AuditResult")
         if type(self.trace) is not EvidenceTraceBundle:
             raise TypeError("ephemeral audit execution requires EvidenceTraceBundle")
+        if (
+            not isinstance(self.scan_completeness, tuple)
+            or len(self.scan_completeness) > 32
+            or not all(
+                type(item) is ScanCompleteness and item.integrity_verified
+                for item in self.scan_completeness
+            )
+        ):
+            raise TraceContractError(
+                "ephemeral scan completeness requires bounded verified reports"
+            )
         expected = DeterministicAuditTrace.from_audit_result(self.audit_result)
         if self.trace.deterministic_authority != expected:
             raise TraceContractError(

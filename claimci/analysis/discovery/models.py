@@ -52,6 +52,8 @@ class DiscoveryLimits:
     max_artifact_candidates: int = 64
     max_mapping_candidates: int = 16
     max_artifact_bytes: int = 16 * 1024 * 1024
+    max_stream_artifact_bytes: int = 1024 * 1024 * 1024
+    max_stream_total_bytes: int = 4 * 1024 * 1024 * 1024
     max_change_comparison_files: int = 128
     max_change_comparison_bytes: int = 16 * 1024 * 1024
     max_provider_claims: int = 64
@@ -73,6 +75,24 @@ class DiscoveryLimits:
             "max_artifact_bytes",
             16 * 1024 * 1024,
         )
+        _bounded_positive_int(
+            self.max_stream_artifact_bytes,
+            "max_stream_artifact_bytes",
+            16 * 1024 * 1024 * 1024,
+        )
+        _bounded_positive_int(
+            self.max_stream_total_bytes,
+            "max_stream_total_bytes",
+            64 * 1024 * 1024 * 1024,
+        )
+        if self.max_stream_artifact_bytes < self.max_artifact_bytes:
+            raise DiscoveryError(
+                "max_stream_artifact_bytes must be at least max_artifact_bytes"
+            )
+        if self.max_stream_total_bytes < self.max_stream_artifact_bytes:
+            raise DiscoveryError(
+                "max_stream_total_bytes must be at least max_stream_artifact_bytes"
+            )
         _bounded_positive_int(
             self.max_change_comparison_files,
             "max_change_comparison_files",

@@ -50,6 +50,11 @@ from .evidence_identity import (
     field_mapping_projection as _runtime_field_mapping_projection,
 )
 from .claims import audit_relevant_claim_projection
+from .metric_identity import (
+    MetricBinding,
+    metric_binding_material,
+    validate_metric_binding_inputs,
+)
 from .obligations import (
     EvidenceObligationBundle,
     EvidenceObligationDecision,
@@ -94,6 +99,7 @@ class PlanningRequest:
     semantic_proposal_provenance: FieldProvenance | None = None
     scientific_claim: CanonicalScientificClaim | None = None
     claim_policy: ClaimEvidencePolicy | None = None
+    metric_binding: MetricBinding | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryIdentity:
@@ -222,6 +228,21 @@ class PlanningRequest:
         elif self.audit_claim is None:
             raise AnalysisContractError(
                 "legacy planning request requires an audit claim"
+            )
+        if self.metric_binding is not None:
+            if type(self.metric_binding) is not MetricBinding:
+                raise TypeError("planning metric_binding must be MetricBinding or null")
+            if self.audit_claim is None:
+                raise AnalysisContractError(
+                    "metric binding requires one compiled audit claim"
+                )
+            validate_metric_binding_inputs(
+                self.metric_binding,
+                repository=self.repository,
+                head_sha=self.head_sha,
+                canonical_metric=self.audit_claim.metric,
+                artifacts=self.artifacts,
+                normalized_evidence=self.normalized_evidence,
             )
 
 
@@ -542,6 +563,7 @@ def planning_request_from_discovery(
     *,
     claim_id: str,
     normalized_evidence: tuple[NormalizedEvidence, ...],
+    metric_binding: MetricBinding | None = None,
 ) -> PlanningRequest:
     """Convert one issued discovery claim without elevating mapping trust."""
 
@@ -658,6 +680,7 @@ def planning_request_from_discovery(
         upstream_mapping_question=scoped_question,
         scientific_claim=scientific_claim,
         claim_policy=policy,
+        metric_binding=metric_binding,
     )
 
 
@@ -893,6 +916,7 @@ def plan_ephemeral_audit(request: PlanningRequest) -> PlanningOutcome:
         evidence_obligations=obligations,
         profiled_policy=profiled_policy,
         reference_evidence=tuple(reference),
+        metric_binding=request.metric_binding,
     )
     return PlanningOutcome(
         state=PlanningState.READY,
@@ -957,6 +981,7 @@ def _plan_legacy_request(request: PlanningRequest) -> PlanningOutcome:
         audit_claim=request.audit_claim,
         selected_mapping=selected,
         semantic_proposal_provenance=request.semantic_proposal_provenance,
+        metric_binding=request.metric_binding,
     )
     return PlanningOutcome(state=PlanningState.READY, plan=plan)
 
@@ -1441,6 +1466,7 @@ def _plan_id(
         mapping=mapping,
         evidence=evidence,
         profiled_policy=profiled_policy,
+        metric_binding=request.metric_binding,
     )
 
 
@@ -1453,6 +1479,7 @@ def _plan_id_from_components(
     mapping: MappingCandidate | RepoMapping,
     evidence: tuple[NormalizedEvidence, ...],
     profiled_policy: object | None = None,
+    metric_binding: MetricBinding | None = None,
 ) -> str:
     artifacts = {
         (item.artifact.path, item.artifact.kind): item.artifact
@@ -1501,6 +1528,29 @@ def _plan_id_from_components(
             ),
         ),
     }
+    streaming_scans = tuple(
+        {
+            "evidence_id": item.evidence_id,
+            "path": str(item.artifact.path),
+            "source_trace_sha256": str(item.source_trace_sha256),
+            "purpose": item.scan_completeness.purpose.value,
+            "state": item.scan_completeness.state.value,
+            "reason": item.scan_completeness.reason.value,
+            "records_scanned": item.scan_completeness.records_scanned,
+            "semantic_bytes": item.scan_completeness.semantic_bytes,
+            "integrity_bytes": item.scan_completeness.integrity_bytes,
+            "expected_bytes": item.scan_completeness.expected_bytes,
+            "integrity_verified": item.scan_completeness.integrity_verified,
+            "peak_buffer_bytes": item.scan_completeness.peak_buffer_bytes,
+            "scratch_bytes": item.scan_completeness.scratch_bytes,
+        }
+        for item in sorted(evidence, key=lambda value: value.evidence_id)
+        if item.scan_completeness is not None
+    )
+    if streaming_scans:
+        projection["streaming_scans"] = streaming_scans
+    if metric_binding is not None:
+        projection["metric_binding"] = metric_binding_material(metric_binding)
     if profiled_policy is not None:
         from .profiles import ProfiledEvidencePolicy
 
@@ -1546,6 +1596,7 @@ def derive_ephemeral_plan_id(plan: EphemeralAuditPlan) -> str:
             *plan.reference_evidence,
         ),
         profiled_policy=plan.profiled_policy,
+        metric_binding=plan.metric_binding,
     )
 
 

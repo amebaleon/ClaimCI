@@ -659,8 +659,9 @@ def _component_from_values(
 def _dataset_values(
     evaluation: Mapping[str, object] | None,
     hashes: tuple[str, ...] | None,
+    identity: object | None = None,
 ) -> dict[str, object] | None:
-    if evaluation is None or hashes is None or not hashes:
+    if evaluation is None or (hashes is None and identity is None):
         return None
     required = {
         "dataset_identifier": evaluation.get("dataset_identifier"),
@@ -674,19 +675,36 @@ def _dataset_values(
         for value in required.values()
     ):
         return None
-    if not all(isinstance(item, str) and _SHA256.fullmatch(item) for item in hashes):
-        return None
-    counts = Counter(hashes)
-    commitment = hashlib.sha256(
-        _canonical_bytes(
-            [{"sha256": digest, "count": counts[digest]} for digest in sorted(counts)]
-        )
-    ).hexdigest()
+    if identity is not None:
+        from .analysis.streaming_dataset import DatasetMultisetIdentity
+
+        if type(identity) is not DatasetMultisetIdentity or hashes is not None:
+            raise TypeError(
+                "measurement dataset identity must be complete and unambiguous"
+            )
+        record_count = identity.record_count
+        commitment = identity.canonical_sha256
+    else:
+        assert hashes is not None
+        if not hashes or not all(
+            isinstance(item, str) and _SHA256.fullmatch(item) for item in hashes
+        ):
+            return None
+        counts = Counter(hashes)
+        commitment = hashlib.sha256(
+            _canonical_bytes(
+                [
+                    {"sha256": digest, "count": counts[digest]}
+                    for digest in sorted(counts)
+                ]
+            )
+        ).hexdigest()
+        record_count = len(hashes)
     return {
         "declared_identifier": required["dataset_identifier"],
         "declared_version": required["dataset_version"],
         "declared_split": required["split"],
-        "record_count": len(hashes),
+        "record_count": record_count,
         "record_multiset_sha256": commitment,
     }
 
@@ -715,6 +733,7 @@ def _recover_protocol(
     metric: str,
     config: Mapping[str, object] | None,
     evaluation_hashes: tuple[str, ...] | None,
+    evaluation_identity: object | None = None,
 ) -> MeasurementProtocolIdentity:
     _bounded_text(metric, "measurement metric", maximum=256, canonical=True)
     evaluation = _flatten_evaluation(config)
@@ -743,7 +762,11 @@ def _recover_protocol(
         _component_from_values(
             kind=MeasurementComponentKind.EVALUATION_DATASET,
             schema_id="claimci.measurement.evaluation-dataset.v1",
-            values=_dataset_values(evaluation, evaluation_hashes),
+            values=_dataset_values(
+                evaluation,
+                evaluation_hashes,
+                evaluation_identity,
+            ),
             source_binding_ids=tuple(sorted((*config_ids, *eval_dataset_ids))),
             required=True,
         ),
@@ -821,6 +844,8 @@ def recover_measurement_protocol_pair(
     candidate_config: Mapping[str, object] | None,
     baseline_evaluation_hashes: tuple[str, ...] | None,
     candidate_evaluation_hashes: tuple[str, ...] | None,
+    baseline_evaluation_identity: object | None = None,
+    candidate_evaluation_identity: object | None = None,
 ) -> MeasurementProtocolPair:
     """Recover semantic identities only from confined native Audit inputs."""
 
@@ -833,6 +858,7 @@ def recover_measurement_protocol_pair(
             metric=metric,
             config=baseline_config,
             evaluation_hashes=baseline_evaluation_hashes,
+            evaluation_identity=baseline_evaluation_identity,
         ),
         candidate=_recover_protocol(
             policy_id=context.policy_id,
@@ -840,6 +866,7 @@ def recover_measurement_protocol_pair(
             metric=metric,
             config=candidate_config,
             evaluation_hashes=candidate_evaluation_hashes,
+            evaluation_identity=candidate_evaluation_identity,
         ),
     )
 

@@ -18,12 +18,16 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from claimci.models import AuditResult, Direction, Verdict
 from claimci.report import render_json
 
 from .confidence import Confidence
+
+if TYPE_CHECKING:
+    from .artifact_source import ScanCompleteness
+    from .metric_identity import MetricBinding
 
 
 class AnalysisContractError(ValueError):
@@ -668,6 +672,8 @@ class NormalizedEvidence:
     artifact: ArtifactCandidate
     adapter_match: AdapterMatch
     observations: tuple[NormalizedObservation, ...]
+    scan_completeness: ScanCompleteness | None = None
+    source_trace_sha256: Sha256Digest | None = None
 
     def __post_init__(self) -> None:
         _bounded_id(self.evidence_id, "evidence_id", maximum=128)
@@ -684,6 +690,31 @@ class NormalizedEvidence:
         ):
             raise TypeError(
                 "normalized evidence observations must be a non-empty tuple"
+            )
+        if self.scan_completeness is not None:
+            from .artifact_source import ScanCompleteness
+
+            if type(self.scan_completeness) is not ScanCompleteness:
+                raise TypeError(
+                    "normalized evidence scan_completeness must be ScanCompleteness"
+                )
+            if not self.scan_completeness.integrity_verified:
+                raise AnalysisContractError(
+                    "normalized evidence requires verified streaming integrity"
+                )
+        if self.source_trace_sha256 is not None and not isinstance(
+            self.source_trace_sha256, Sha256Digest
+        ):
+            object.__setattr__(
+                self,
+                "source_trace_sha256",
+                Sha256Digest(self.source_trace_sha256),
+            )
+        if (self.scan_completeness is None) != (
+            self.source_trace_sha256 is None
+        ):
+            raise AnalysisContractError(
+                "streaming completeness and source trace digest must appear together"
             )
 
 
@@ -1284,6 +1315,7 @@ class EphemeralAuditPlan:
     evidence_obligations: "EvidenceObligationBundle | None" = None
     profiled_policy: "ProfiledEvidencePolicy | None" = None
     reference_evidence: tuple[NormalizedEvidence, ...] = ()
+    metric_binding: "MetricBinding | None" = None
     ephemeral: bool = field(default=True, init=False)
 
     def __post_init__(self) -> None:
@@ -1466,6 +1498,32 @@ class EphemeralAuditPlan:
                 and self.reference_evidence
             ):
                 raise AnalysisContractError("Training profile cannot carry reference evidence")
+        if self.metric_binding is not None:
+            from .metric_identity import (
+                MetricBinding,
+                validate_metric_binding_inputs,
+            )
+
+            if type(self.metric_binding) is not MetricBinding:
+                raise TypeError("plan metric_binding must be MetricBinding or null")
+            if self.audit_claim is None or self.selected_mapping is None:
+                raise AnalysisContractError(
+                    "plan metric binding requires an executable claim and mapping"
+                )
+            all_evidence = (
+                *self.baseline_evidence,
+                *self.candidate_evidence,
+                *self.reference_evidence,
+            )
+            validate_metric_binding_inputs(
+                self.metric_binding,
+                repository=self.repository,
+                head_sha=self.head_sha,
+                canonical_metric=self.audit_claim.metric,
+                artifacts=tuple(item.artifact for item in all_evidence),
+                normalized_evidence=all_evidence,
+                selected_mapping=self.selected_mapping,
+            )
 
 
 def _deep_freeze(value: object) -> object:
@@ -1794,6 +1852,21 @@ def to_jsonable(value: object) -> object:
         from .trace import trace_to_jsonable
 
         return trace_to_jsonable(value)
+    if type(value) is NormalizedEvidence:
+        serialized = {
+            "evidence_id": to_jsonable(value.evidence_id),
+            "artifact": to_jsonable(value.artifact),
+            "adapter_match": to_jsonable(value.adapter_match),
+            "observations": to_jsonable(value.observations),
+        }
+        if value.scan_completeness is not None:
+            serialized["scan_completeness"] = to_jsonable(
+                value.scan_completeness
+            )
+            serialized["source_trace_sha256"] = to_jsonable(
+                value.source_trace_sha256
+            )
+        return serialized
     if isinstance(value, Confidence):
         return value.value
     if isinstance(value, Enum):
