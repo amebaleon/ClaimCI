@@ -27,6 +27,7 @@ from .confidence import Confidence
 
 if TYPE_CHECKING:
     from .artifact_source import ScanCompleteness
+    from .metric_identity import MetricBinding
 
 
 class AnalysisContractError(ValueError):
