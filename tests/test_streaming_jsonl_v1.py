@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -159,7 +161,7 @@ def test_stream_and_bytes_metric_candidates_have_exact_identity_parity(
         b'{"seed":2,"acc":0.83,"loss":0.3}\n'
     )
     source = _source(tmp_path, content)
-    passive = PassiveArtifact(source.candidate, content)
+    passive = passive_artifact(source.candidate, content)
 
     streamed = extract_metric_candidate_scan(
         source,

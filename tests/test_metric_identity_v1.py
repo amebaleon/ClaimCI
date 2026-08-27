@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     AnalysisContractError,
@@ -78,7 +80,7 @@ def _passive(
             "fixture:metric-identity",
         ),
     )
-    return PassiveArtifact(candidate, content)
+    return passive_artifact(candidate, content)
 
 
 def test_json_multi_metric_candidate_extraction_is_bounded_and_exact() -> None:
@@ -701,8 +703,8 @@ def _metric_materialization_fixture(tmp_path):
         ArtifactKind.RESULTS,
         candidate_content,
     )
-    baseline_passive = PassiveArtifact(baseline_artifact, baseline_content)
-    candidate_passive = PassiveArtifact(candidate_artifact, candidate_content)
+    baseline_passive = passive_artifact(baseline_artifact, baseline_content)
+    candidate_passive = passive_artifact(candidate_artifact, candidate_content)
     candidates = (
         *extract_metric_candidates(
             baseline_passive,

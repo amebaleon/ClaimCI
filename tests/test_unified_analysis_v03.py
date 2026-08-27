@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AnalysisState,
     ArtifactCandidate,
@@ -282,7 +284,7 @@ def _update_artifact_bytes(
         size=len(content),
     )
     if target.artifact.kind is ArtifactKind.DATASET:
-        changed = extract_registered_artifact(PassiveArtifact(artifact, content))
+        changed = extract_registered_artifact(passive_artifact(artifact, content))
         assert changed is not None
         assert evidence_transform is None
     else:

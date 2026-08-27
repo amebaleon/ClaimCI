@@ -6,6 +6,8 @@ import hashlib
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     AnalysisContractError,
@@ -50,7 +52,7 @@ def _provenance() -> FieldProvenance:
 
 
 def _artifact(content: bytes, path: str = "benchmarks/vessl.csv") -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=ArtifactKind.BENCHMARK,

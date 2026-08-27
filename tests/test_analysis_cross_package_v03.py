@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AnalysisState,
     ArtifactKind,
@@ -306,7 +308,7 @@ def _extract_evidence(root: Path, discovery) -> tuple[NormalizedEvidence, ...]:
     extracted: list[NormalizedEvidence] = []
     for artifact in discovery.artifacts:
         content = (root / Path(str(artifact.path))).read_bytes()
-        passive = PassiveArtifact(artifact, content)
+        passive = passive_artifact(artifact, content)
         if artifact.kind not in {
             ArtifactKind.RESULTS,
             ArtifactKind.CONFIG,

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactBinding,
@@ -1835,7 +1837,7 @@ def _shared_latency_table_plan(
         (CLAIM_ID,),
         _provenance(path=str(path), source_id="artifact:latency-table"),
     )
-    passive = PassiveArtifact(artifact, content)
+    passive = passive_artifact(artifact, content)
     adapter = CsvAdapter()
     fields = (
         ("metric_value", measured_metric),
@@ -1924,7 +1926,7 @@ def _shared_latency_table_plan(
                 source_id="artifact:shared-workload",
             ),
         )
-        reference_passive = PassiveArtifact(reference_artifact, reference_content)
+        reference_passive = passive_artifact(reference_artifact, reference_content)
         config_adapter = YamlConfigAdapter()
         reference_match = config_adapter.probe(reference_passive)
         assert reference_match is not None
@@ -1965,7 +1967,7 @@ def _shared_latency_table_plan(
                 source_id="artifact:reference-workload",
             ),
         )
-        dataset_passive = PassiveArtifact(dataset_artifact, dataset_content)
+        dataset_passive = passive_artifact(dataset_artifact, dataset_content)
         dataset_adapter = PassiveJsonLinesDatasetAdapter()
         dataset_match = dataset_adapter.probe(dataset_passive)
         assert dataset_match is not None
@@ -2080,7 +2082,7 @@ def test_measurement_source_snapshot_commits_exact_table_row_selector(
         if item.role is ExperimentRole.CANDIDATE
     )
     captured = {
-        str(artifact.path): PassiveArtifact(
+        str(artifact.path): passive_artifact(
             artifact,
             (runtime.checkout_root / str(artifact.path)).read_bytes(),
         )

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -146,7 +148,7 @@ def test_stream_and_bytes_table_candidates_have_exact_identity_parity(
         role=ExperimentRole.BASELINE,
     )
     bounded = extract_metric_candidates(
-        PassiveArtifact(source.candidate, content),
+        passive_artifact(source.candidate, content),
         role=ExperimentRole.BASELINE,
     )
 

@@ -12,8 +12,11 @@ from pathlib import Path, PurePosixPath
 from .contracts import (
     AnalysisContractError,
     ArtifactCandidate,
+    ArtifactOccurrence,
+    ArtifactSnapshotRole,
     GitCommitSha,
     RepositoryIdentity,
+    artifact_occurrence_from_snapshot,
 )
 
 
@@ -301,11 +304,9 @@ def _open_descriptor(
 
 @dataclass(frozen=True, slots=True, init=False)
 class ArtifactSource:
-    """One factory-issued, exact-head, reopenable confined artifact source."""
+    """One factory-issued, exact-snapshot, reopenable confined artifact source."""
 
-    repository: RepositoryIdentity
-    head_sha: GitCommitSha
-    candidate: ArtifactCandidate
+    occurrence: ArtifactOccurrence
     _root: Path = field(repr=False, compare=False)
     _root_identity: tuple[int, int, int] = field(repr=False, compare=False)
     _artifact_identity: tuple[int, int, int] = field(
@@ -319,16 +320,14 @@ class ArtifactSource:
     @classmethod
     def _from_snapshot(
         cls,
-        repository: RepositoryIdentity,
-        head_sha: GitCommitSha,
+        occurrence: ArtifactOccurrence,
         root: Path,
-        candidate: ArtifactCandidate,
     ) -> "ArtifactSource":
+        if type(occurrence) is not ArtifactOccurrence:
+            raise TypeError("artifact source occurrence must be ArtifactOccurrence")
         instance = object.__new__(cls)
         resolved, identity = _resolved_root(root)
-        object.__setattr__(instance, "repository", repository)
-        object.__setattr__(instance, "head_sha", head_sha)
-        object.__setattr__(instance, "candidate", candidate)
+        object.__setattr__(instance, "occurrence", occurrence)
         object.__setattr__(instance, "_root", resolved)
         object.__setattr__(instance, "_root_identity", identity)
         descriptor, _path, opened, _components = _open_descriptor(
@@ -342,6 +341,22 @@ class ArtifactSource:
         )
         os.close(descriptor)
         return instance
+
+    @property
+    def repository(self) -> RepositoryIdentity:
+        return self.occurrence.repository
+
+    @property
+    def snapshot_role(self) -> ArtifactSnapshotRole:
+        return self.occurrence.snapshot_role
+
+    @property
+    def head_sha(self) -> GitCommitSha:
+        return self.occurrence.commit
+
+    @property
+    def candidate(self) -> ArtifactCandidate:
+        return self.occurrence.candidate
 
     def open_scan(
         self,
@@ -360,16 +375,26 @@ def artifact_source_from_snapshot(
     head_sha: GitCommitSha,
     root: Path,
     candidate: ArtifactCandidate,
+    *,
+    snapshot_role: ArtifactSnapshotRole = ArtifactSnapshotRole.HEAD,
 ) -> ArtifactSource:
-    """Issue one source from trusted repository/head/root/candidate inputs."""
+    """Issue one source from trusted repository/snapshot/root/candidate inputs."""
 
     if type(repository) is not RepositoryIdentity:
         raise TypeError("artifact source repository must be RepositoryIdentity")
     if not isinstance(head_sha, GitCommitSha):
         head_sha = GitCommitSha(head_sha)
+    if type(snapshot_role) is not ArtifactSnapshotRole:
+        raise TypeError("artifact source snapshot_role must be ArtifactSnapshotRole")
     if type(candidate) is not ArtifactCandidate:
         raise TypeError("artifact source candidate must be ArtifactCandidate")
-    return ArtifactSource._from_snapshot(repository, head_sha, Path(root), candidate)
+    occurrence = artifact_occurrence_from_snapshot(
+        repository,
+        snapshot_role,
+        head_sha,
+        candidate,
+    )
+    return ArtifactSource._from_snapshot(occurrence, Path(root))
 
 
 @dataclass(slots=True, init=False)

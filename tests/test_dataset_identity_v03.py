@@ -7,6 +7,8 @@ import hashlib
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AnalysisContractError,
     ArtifactBinding,
@@ -155,7 +157,7 @@ def _passive_dataset(
     path: str = "data/baseline-train.jsonl",
     kind: ArtifactKind = ArtifactKind.DATASET,
 ) -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=kind,

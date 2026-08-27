@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -37,7 +39,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "adapters"
 
 
 def _passive(content: bytes, *, path: str = "results/runs.csv") -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=ArtifactKind.RESULTS,
@@ -262,4 +264,4 @@ def test_csv_rejects_unsupported_artifact_kind_without_parsing() -> None:
         relevant_claim_ids=(),
         provenance=FieldProvenance(ProvenanceKind.DETERMINISTIC_DISCOVERY, "dataset"),
     )
-    assert CsvAdapter().probe(PassiveArtifact(candidate, content)) is None
+    assert CsvAdapter().probe(passive_artifact(candidate, content)) is None

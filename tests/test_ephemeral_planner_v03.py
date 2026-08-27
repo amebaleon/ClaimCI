@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AbsoluteMetricClaim,
     AdapterMatch,
@@ -748,7 +750,7 @@ def test_shared_benchmark_table_selectors_bind_baseline_and_candidate_independen
         ArtifactKind.RESULTS,
         content,
     )
-    passive = PassiveArtifact(artifact, content)
+    passive = passive_artifact(artifact, content)
     adapter = CsvAdapter()
 
     def selected(role: ExperimentRole, key: str) -> tuple[NormalizedEvidence, ArtifactBinding]:
