@@ -381,6 +381,7 @@ git commit -m "feat: bind artifacts to trusted snapshot occurrences"
 - Modify: `claimci/analysis/adapters/structured.py`
 - Modify: `claimci/analysis/adapters/dataset.py`
 - Modify: `claimci/analysis/adapters/tabular.py`
+- Modify: `claimci/analysis/adapters/streaming.py`
 - Test: `tests/test_adapters_core_v03.py`
 - Test: `tests/test_adapters_registry_v03.py`
 - Test: `tests/test_analysis_contracts_v03.py`
@@ -397,6 +398,8 @@ git commit -m "feat: bind artifacts to trusted snapshot occurrences"
 - [ ] **Step 1: Add RED canonical-material and whole-artifact identity matrix tests**
 
 Use literal expected IDs computed independently from literal dictionaries, not the production helper. Cover same occurrence stability and separation by repository, snapshot role, commit, path, kind, full SHA/size, adapter ID/version, and mapping selector. Assert claim IDs, provenance details, and `ExperimentRole` changes do not affect the ID.
+
+Also exercise streaming JSONL with a non-empty validated mapping and assert its exact v2 ID from independently assembled material. Passive/streaming parity remains Task 4-owned; this Task 3 assertion only proves the live streaming caller supplies the fixed JSONL adapter version and its real canonical mappings to the strict helper.
 
 The expected helper in the test is limited to canonical JSON and hashlib:
 
@@ -474,16 +477,20 @@ Return `evidence-v2-` plus the full digest. Validate that the trusted adapter ID
 
 Extend the private `_ArtifactEnvelope` protocol with `occurrence: ArtifactOccurrence` as well as `candidate: ArtifactCandidate`; the v2 helper must reject envelopes without a concrete issued occurrence instead of falling back to a legacy or synthetic scope.
 
+Preserve the current CSV/TSV table algorithm temporarily under a narrowly named private `_legacy_tabular_evidence_id(adapter_id, artifact, *, adapter_semantic_version, selector_identity)` helper. It may emit only the existing selector-scoped-v1 table identity and must never emit, default, or masquerade as v2. Route only the passive and streaming CSV/TSV call sites through it until Task 4 deletes it. Do not add optional, default, or overloaded compatibility forms to `_evidence_id`.
+
 - [ ] **Step 6: Give every whole-artifact adapter a trusted fixed version and route all IDs through v2**
 
-Add `semantic_version = "1"` to every fixed built-in adapter: YAML, TOML, native manifest/results/config, JSON, JSONL, passive dataset, CSV, and TSV. During this task, retain `_dataset_evidence_id(adapter_id, artifact)` as a private compatibility delegator whose entire body is `return _evidence_id(adapter_id, "1", artifact, ())`; this keeps the streaming dataset import green until Task 4. The passive dataset adapter may call `_evidence_id(self.adapter_id, self.semantic_version, artifact, match.mappings)` directly. Update `Adapter` protocol with the read-only semantic-version attribute, update the contract-test fake adapter, and assert the fixed registry exposes version `"1"` for every entry. Do not change CSV/TSV evidence hashing until Task 4.
+Add `semantic_version = "1"` to every fixed built-in adapter: YAML, TOML, native manifest/results/config, JSON, JSONL, passive dataset, CSV, and TSV. During this task, retain `_dataset_evidence_id(adapter_id, artifact)` as a private compatibility delegator whose entire body is `return _evidence_id(adapter_id, "1", artifact, ())`; this keeps the streaming dataset import green until Task 4. The passive dataset adapter may call `_evidence_id(self.adapter_id, self.semantic_version, artifact, match.mappings)` directly.
+
+Migrate only the streaming JSONL evidence call to `_evidence_id(_JSONL_ADAPTER_ID, JsonLinesAdapter.semantic_version, source, match.mappings)`. Do not change scanning, completeness, trace fields, or parity behavior. Route the streaming CSV/TSV call through `_legacy_tabular_evidence_id` so its bytes remain legacy until Task 4. Update `Adapter` protocol with the read-only semantic-version attribute, update the contract-test fake adapter, and assert the fixed registry exposes version `"1"` for every entry. Do not otherwise change CSV/TSV evidence hashing until Task 4.
 
 - [ ] **Step 7: Run focused GREEN tests**
 
 Run:
 
 ```powershell
-python -m pytest tests/test_evidence_identity_v2.py tests/test_adapters_core_v03.py tests/test_adapters_registry_v03.py tests/test_analysis_contracts_v03.py tests/test_adapters_config_v03.py tests/test_adapters_native_v03.py tests/test_adapters_structured_v03.py tests/test_dataset_identity_v03.py -q
+python -m pytest tests/test_evidence_identity_v2.py tests/test_adapters_core_v03.py tests/test_adapters_registry_v03.py tests/test_analysis_contracts_v03.py tests/test_adapters_config_v03.py tests/test_adapters_native_v03.py tests/test_adapters_structured_v03.py tests/test_dataset_identity_v03.py tests/test_benchmark_table_adapter_v0.py::test_selector_scoped_evidence_identity_preserves_multi_match_sequence tests/test_streaming_tabular_v1.py::test_table_selector_requires_complete_exact_cardinality tests/test_streaming_jsonl_v1.py::test_selected_observations_require_a_complete_scan tests/test_streaming_jsonl_v1.py::test_registry_streams_dataset_identity_without_claiming_record_completeness -q
 ```
 
 Expected: all focused tests pass; every new extraction ID is a 76-character `evidence-v2-*` value.
@@ -491,13 +498,14 @@ Expected: all focused tests pass; every new extraction ID is a 76-character `evi
 - [ ] **Step 8: Commit Task 3**
 
 ```powershell
-git add claimci/analysis/contracts.py claimci/analysis/evidence_identity.py claimci/analysis/adapters/core.py claimci/analysis/adapters/config.py claimci/analysis/adapters/native.py claimci/analysis/adapters/structured.py claimci/analysis/adapters/dataset.py claimci/analysis/adapters/tabular.py tests/test_evidence_identity_v2.py tests/test_adapters_core_v03.py tests/test_adapters_registry_v03.py tests/test_analysis_contracts_v03.py tests/test_adapters_config_v03.py tests/test_adapters_native_v03.py tests/test_adapters_structured_v03.py tests/test_dataset_identity_v03.py
+git add claimci/analysis/contracts.py claimci/analysis/evidence_identity.py claimci/analysis/adapters/core.py claimci/analysis/adapters/config.py claimci/analysis/adapters/native.py claimci/analysis/adapters/structured.py claimci/analysis/adapters/dataset.py claimci/analysis/adapters/tabular.py claimci/analysis/adapters/streaming.py tests/test_evidence_identity_v2.py tests/test_adapters_core_v03.py tests/test_adapters_registry_v03.py tests/test_analysis_contracts_v03.py tests/test_adapters_config_v03.py tests/test_adapters_native_v03.py tests/test_adapters_structured_v03.py tests/test_dataset_identity_v03.py
 git commit -m "feat: issue evidence v2 identities"
 ```
 
 ### Task 4: Selector-scoped and streaming evidence v2
 
 **Files:**
+- Modify: `claimci/analysis/adapters/core.py`
 - Modify: `claimci/analysis/adapters/tabular.py`
 - Modify: `claimci/analysis/adapters/streaming.py`
 - Modify: `claimci/analysis/adapters/dataset.py`
@@ -528,7 +536,7 @@ Expected: streaming/selector paths either call the old signature or produce sele
 
 - [ ] **Step 3: Route tabular and streaming paths through the same v2 helper**
 
-Use the Task 3 fixed CSV/TSV `semantic_version`. Pass the full `canonical_match.mappings` to `_evidence_id`; remove the selector-scoped-v1 special branch. Streaming CSV/TSV uses the same adapter ID/version and mappings. Streaming JSONL and dataset use their matching registered adapter ID/version and empty or canonical mappings as appropriate. Replace the streaming dataset `_dataset_evidence_id` call with `_evidence_id(_DATASET_ADAPTER_ID, "1", source, match.mappings)`, remove the streaming import, and then delete the now-unused compatibility delegator from `adapters/dataset.py`.
+Use the Task 3 fixed CSV/TSV `semantic_version`. Pass the full `canonical_match.mappings` to `_evidence_id`; replace both `_legacy_tabular_evidence_id` call sites and delete that helper. Streaming CSV/TSV uses the same adapter ID/version and mappings. Streaming JSONL remains on its Task 3 strict v2 call; add the planned passive/streaming parity coverage. Replace the streaming dataset `_dataset_evidence_id` call with `_evidence_id(_DATASET_ADAPTER_ID, "1", source, match.mappings)`, remove the streaming import, and then delete the now-unused compatibility delegator from `adapters/dataset.py`.
 
 - [ ] **Step 4: Preserve streaming integrity fields outside identity**
 
@@ -547,7 +555,7 @@ Expected: all focused tests pass and passive/streaming selector identity is iden
 - [ ] **Step 6: Commit Task 4**
 
 ```powershell
-git add claimci/analysis/adapters/tabular.py claimci/analysis/adapters/streaming.py claimci/analysis/adapters/dataset.py tests/test_adapters_csv_v03.py tests/test_benchmark_table_adapter_v0.py tests/test_streaming_tabular_v1.py tests/test_streaming_jsonl_v1.py tests/test_streaming_dataset_v1.py tests/test_metric_streaming_security_integration.py
+git add claimci/analysis/adapters/core.py claimci/analysis/adapters/tabular.py claimci/analysis/adapters/streaming.py claimci/analysis/adapters/dataset.py tests/test_adapters_csv_v03.py tests/test_benchmark_table_adapter_v0.py tests/test_streaming_tabular_v1.py tests/test_streaming_jsonl_v1.py tests/test_streaming_dataset_v1.py tests/test_metric_streaming_security_integration.py
 git commit -m "feat: unify selector scoped evidence v2"
 ```
 
