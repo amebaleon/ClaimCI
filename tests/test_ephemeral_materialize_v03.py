@@ -1038,6 +1038,58 @@ def test_changed_artifact_hash_fails_unavailable_and_cleans_plan_tree(
     assert not (scratch / plan.plan_id).exists()
 
 
+def test_passive_v2_evidence_from_another_repository_fails_revalidation(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    planned = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.path == RepositoryPath("results/candidate.json")
+    )
+    foreign = extract_registered_artifact(
+        passive_artifact(
+            planned.artifact,
+            (runtime.checkout_root / Path(str(planned.artifact.path))).read_bytes(),
+            repository=RepositoryIdentity("foreign-owner", "foreign-repository"),
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=HEAD_SHA,
+        )
+    )
+    assert foreign is not None
+    assert foreign.evidence_id.startswith("evidence-v2-")
+    assert foreign.evidence_id != planned.evidence_id
+
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    selected_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            _binding(foreign, ExperimentRole.CANDIDATE)
+            if item.path == planned.artifact.path
+            and item.kind is ArtifactKind.RESULTS
+            else item
+            for item in plan.selected_mapping.bindings
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        candidate_evidence=tuple(
+            foreign if item is planned else item for item in plan.candidate_evidence
+        ),
+        selected_mapping=selected_mapping,
+        mapping_provenance=(selected_mapping.provenance,),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="adapter|identity|normalized"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / changed_plan.plan_id).exists()
+
+
 def test_symlink_substitution_is_unavailable_without_following_target(
     tmp_path: Path,
 ) -> None:

@@ -711,7 +711,11 @@ def _capture_plan_artifacts(
             revalidated_tables.add(evidence.evidence_id)
         elif (
             path not in metric_bound_paths
-            and (revalidate_fixed_adapters or type(source) is ArtifactSource)
+            and (
+                revalidate_fixed_adapters
+                or type(source) is ArtifactSource
+                or evidence.evidence_id.startswith("evidence-v2-")
+            )
             and evidence.artifact.kind is not ArtifactKind.DATASET
             and evidence.evidence_id not in revalidated_evidence
         ):
