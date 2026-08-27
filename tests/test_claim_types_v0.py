@@ -274,6 +274,92 @@ def test_subject_first_inline_threshold_remains_explicit() -> None:
     assert recovered.primary.minimum_improvement.value == 0.05
 
 
+@pytest.mark.parametrize(
+    "text",
+    (
+        "candidate improves accuracy from 0.60 to 0.70 at least 2 GPUs were used",
+        "candidate improves accuracy from 0.60 to 0.70 by at least 2 GPUs were used",
+        "candidate improves accuracy from 0.60 to 0.70 by at least 2 epochs",
+    ),
+)
+def test_subject_first_rejects_unknown_threshold_noun_suffix(text: str) -> None:
+    recovered = recover_scientific_claim(_reference(text))
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.baseline_value is not None
+    assert recovered.primary.baseline_value.value == 0.60
+    assert recovered.primary.candidate_value is not None
+    assert recovered.primary.candidate_value.value == 0.70
+    assert recovered.primary.minimum_improvement is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    tuple(
+        f"{prefix} {suffix}"
+        for prefix in (
+            "accuracy improved from 0.60 to 0.70",
+            "candidate improves accuracy from 0.60 to 0.70",
+        )
+        for suffix in (
+            "at least 2 GPUs were used",
+            "by at least 2 GPUs were used",
+            "by at least 3 widgets were used",
+            "by at least 4 GPU-hours were used",
+            "by at least 5/GPU",
+            "by at least 2,000 GPUs",
+        )
+    ),
+)
+def test_metric_improvement_rejects_numeric_prefix_unknown_suffix(text: str) -> None:
+    recovered = recover_scientific_claim(_reference(text))
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.baseline_value is not None
+    assert recovered.primary.baseline_value.value == 0.60
+    assert recovered.primary.candidate_value is not None
+    assert recovered.primary.candidate_value.value == 0.70
+    assert recovered.primary.minimum_improvement is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "accuracy improved from 0.60 to 0.70; 0.70 - 0.60 = 0.10",
+        "candidate improves accuracy from 0.60 to 0.70; 0.70 - 0.60 = 0.10",
+        "accuracy improved by at least 0.70 - 0.60 = 0.10",
+        "candidate improves accuracy by at least 0.70 - 0.60 = 0.10",
+    ),
+)
+def test_metric_improvement_does_not_derive_threshold_from_arithmetic(
+    text: str,
+) -> None:
+    recovered = recover_scientific_claim(_reference(text))
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.minimum_improvement is None
+
+
+def test_unknown_suffix_rejected_after_whitespace_normalization() -> None:
+    recovered = recover_scientific_claim(
+        _reference(
+            "candidate improves accuracy from 0.60\tto 0.70\n"
+            "by\tat least\t2\tGPUs were used"
+        )
+    )
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.baseline_value is not None
+    assert recovered.primary.baseline_value.value == 0.60
+    assert recovered.primary.candidate_value is not None
+    assert recovered.primary.candidate_value.value == 0.70
+    assert recovered.primary.minimum_improvement is None
+
+
 def test_subject_first_lower_threshold_uses_existing_explicit_continuation() -> None:
     recovered = recover_scientific_claim(
         _reference(
@@ -287,6 +373,23 @@ def test_subject_first_lower_threshold_uses_existing_explicit_continuation() -> 
     assert recovered.primary.direction is Direction.LOWER
     assert recovered.primary.minimum_improvement is not None
     assert recovered.primary.minimum_improvement.value == 0.05
+
+
+def test_inline_threshold_preserves_held_out_constraint_suffix() -> None:
+    recovered = recover_scientific_claim(
+        _reference("Accuracy improved by at least 0.05 on held-out data.")
+    )
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.minimum_improvement is not None
+    assert recovered.primary.minimum_improvement.value == 0.05
+    assert recovered.constraints == (
+        EvaluationConstraint(
+            kind=EvaluationConstraintKind.HELD_OUT,
+            provenance=recovered.reference.provenance,
+        ),
+    )
 
 
 def test_subject_first_does_not_derive_threshold_from_arithmetic() -> None:

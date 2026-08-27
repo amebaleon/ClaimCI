@@ -54,6 +54,11 @@ _MINIMUM_CONTINUATION = re.compile(
     rf"(?:\s*(?P<unit>%|percentage\s+points?|points?))?\s*\.?\s*$",
     flags=re.IGNORECASE,
 )
+_THRESHOLD_TRAILING = re.compile(
+    rf"^\s*(?:(?:across|aggregated|as|for|in|on|over|under|using|via|with)\b"
+    rf"(?:\s+(?:{_NUMBER}|[A-Za-z][A-Za-z0-9_.-]{{0,63}})){{1,16}})?\s*$",
+    flags=re.IGNORECASE,
+)
 _ABSOLUTE_METRIC = re.compile(
     rf"\b(?P<role>baseline|candidate)\s+"
     rf"(?P<metric>[A-Za-z][A-Za-z0-9_.-]{{0,63}})\s+"
@@ -419,6 +424,10 @@ def _only_whitespace(value: str) -> bool:
     return not value.strip()
 
 
+def _valid_threshold_trailing(value: str) -> bool:
+    return _THRESHOLD_TRAILING.fullmatch(value) is not None
+
+
 def _verb_direction(verb: str) -> Direction:
     return (
         Direction.LOWER
@@ -474,6 +483,12 @@ def _recover_primary(
         threshold_anchor = improvement_end if pair is None else pair.end()
         if thresholds and not _only_whitespace(
             tail[threshold_anchor : threshold.start()]
+        ):
+            threshold = None
+        if (
+            threshold is not None
+            and threshold is not continuation_threshold
+            and not _valid_threshold_trailing(tail[threshold.end() :])
         ):
             threshold = None
         direction = _verb_direction(improvement.group("verb"))
