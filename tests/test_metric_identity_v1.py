@@ -16,6 +16,7 @@ from claimci.analysis import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     Confidence,
     EvidenceSelector,
     ExperimentRole,
@@ -703,8 +704,20 @@ def _metric_materialization_fixture(tmp_path):
         ArtifactKind.RESULTS,
         candidate_content,
     )
-    baseline_passive = passive_artifact(baseline_artifact, baseline_content)
-    candidate_passive = passive_artifact(candidate_artifact, candidate_content)
+    baseline_passive = passive_artifact(
+        baseline_artifact,
+        baseline_content,
+        repository=plan.repository,
+        snapshot_role=ArtifactSnapshotRole.HEAD,
+        commit=plan.head_sha,
+    )
+    candidate_passive = passive_artifact(
+        candidate_artifact,
+        candidate_content,
+        repository=plan.repository,
+        snapshot_role=ArtifactSnapshotRole.HEAD,
+        commit=plan.head_sha,
+    )
     candidates = (
         *extract_metric_candidates(
             baseline_passive,

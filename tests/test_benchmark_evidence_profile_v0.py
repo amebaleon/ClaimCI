@@ -15,6 +15,7 @@ from claimci.analysis import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     ArtifactEvidenceSlot,
     BenchmarkResultForm,
     BenchmarkVariant,
@@ -1837,7 +1838,13 @@ def _shared_latency_table_plan(
         (CLAIM_ID,),
         _provenance(path=str(path), source_id="artifact:latency-table"),
     )
-    passive = passive_artifact(artifact, content)
+    passive = passive_artifact(
+        artifact,
+        content,
+        repository=REPOSITORY,
+        snapshot_role=ArtifactSnapshotRole.HEAD,
+        commit=GitCommitSha("a" * 40),
+    )
     adapter = CsvAdapter()
     fields = (
         ("metric_value", measured_metric),
@@ -1926,7 +1933,13 @@ def _shared_latency_table_plan(
                 source_id="artifact:shared-workload",
             ),
         )
-        reference_passive = passive_artifact(reference_artifact, reference_content)
+        reference_passive = passive_artifact(
+            reference_artifact,
+            reference_content,
+            repository=REPOSITORY,
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=GitCommitSha("a" * 40),
+        )
         config_adapter = YamlConfigAdapter()
         reference_match = config_adapter.probe(reference_passive)
         assert reference_match is not None
@@ -1967,7 +1980,13 @@ def _shared_latency_table_plan(
                 source_id="artifact:reference-workload",
             ),
         )
-        dataset_passive = passive_artifact(dataset_artifact, dataset_content)
+        dataset_passive = passive_artifact(
+            dataset_artifact,
+            dataset_content,
+            repository=REPOSITORY,
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=GitCommitSha("a" * 40),
+        )
         dataset_adapter = PassiveJsonLinesDatasetAdapter()
         dataset_match = dataset_adapter.probe(dataset_passive)
         assert dataset_match is not None
