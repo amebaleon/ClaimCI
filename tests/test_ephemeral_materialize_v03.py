@@ -17,6 +17,7 @@ from claimci.analysis import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     AuditClaimSpec,
     BoundedValueRepresentation,
     ClaimReference,
@@ -184,7 +185,15 @@ def _normalized_dataset(
     artifact: ArtifactCandidate,
     content: bytes,
 ) -> NormalizedEvidence:
-    evidence = extract_registered_artifact(passive_artifact(artifact, content))
+    evidence = extract_registered_artifact(
+        passive_artifact(
+            artifact,
+            content,
+            repository=REPOSITORY,
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=HEAD_SHA,
+        )
+    )
     assert evidence is not None
     assert evidence.adapter_match.adapter_id == "claimci-jsonl-dataset-v1"
     return evidence
@@ -444,7 +453,13 @@ def test_shared_benchmark_table_is_recaptured_once_and_each_selector_is_revalida
         ArtifactKind.RESULTS,
         content,
     )
-    passive = passive_artifact(artifact, content)
+    passive = passive_artifact(
+        artifact,
+        content,
+        repository=REPOSITORY,
+        snapshot_role=ArtifactSnapshotRole.HEAD,
+        commit=HEAD_SHA,
+    )
     adapter = CsvAdapter()
 
     def selected(key: str) -> NormalizedEvidence:
