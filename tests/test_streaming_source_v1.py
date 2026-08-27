@@ -140,6 +140,21 @@ def test_source_occurrence_explicitly_distinguishes_base_and_head(
     assert default_head.candidate == candidate
 
 
+def test_source_factory_rejects_raw_commit_text(tmp_path: Path) -> None:
+    content = b'{"run":1,"acc":0.9}\n'
+    target = tmp_path / "results" / "eval.jsonl"
+    target.parent.mkdir()
+    target.write_bytes(content)
+
+    with pytest.raises(TypeError, match="GitCommitSha"):
+        artifact_source_from_snapshot(
+            REPOSITORY,
+            "3" * 40,  # type: ignore[arg-type]
+            tmp_path,
+            _candidate(content),
+        )
+
+
 def test_confined_inspection_hashes_large_file_without_returning_content(
     tmp_path: Path,
 ) -> None:

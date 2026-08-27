@@ -1127,8 +1127,8 @@ def artifact_occurrence_from_snapshot(
         raise TypeError(
             "artifact occurrence snapshot_role must be ArtifactSnapshotRole"
         )
-    if not isinstance(commit, GitCommitSha):
-        commit = GitCommitSha(commit)
+    if type(commit) is not GitCommitSha:
+        raise TypeError("artifact occurrence commit must be GitCommitSha")
     if type(candidate) is not ArtifactCandidate:
         raise TypeError("artifact occurrence candidate must be ArtifactCandidate")
     return ArtifactOccurrence._from_snapshot(

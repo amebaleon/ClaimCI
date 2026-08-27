@@ -382,8 +382,8 @@ def artifact_source_from_snapshot(
 
     if type(repository) is not RepositoryIdentity:
         raise TypeError("artifact source repository must be RepositoryIdentity")
-    if not isinstance(head_sha, GitCommitSha):
-        head_sha = GitCommitSha(head_sha)
+    if type(head_sha) is not GitCommitSha:
+        raise TypeError("artifact source head_sha must be GitCommitSha")
     if type(snapshot_role) is not ArtifactSnapshotRole:
         raise TypeError("artifact source snapshot_role must be ArtifactSnapshotRole")
     if type(candidate) is not ArtifactCandidate:

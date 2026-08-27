@@ -416,6 +416,16 @@ def test_artifact_occurrence_factory_binds_exact_snapshot_scope() -> None:
     assert head != different_commit
 
 
+def test_artifact_occurrence_factory_rejects_raw_commit_text() -> None:
+    with pytest.raises(TypeError, match="GitCommitSha"):
+        artifact_occurrence_from_snapshot(
+            RepositoryIdentity("owner", "repo"),
+            ArtifactSnapshotRole.HEAD,
+            "a" * 40,  # type: ignore[arg-type]
+            _candidate(),
+        )
+
+
 def test_passive_artifact_carries_factory_issued_occurrence() -> None:
     artifact = passive_artifact_from_snapshot(
         RepositoryIdentity("owner", "repo"),
@@ -429,6 +439,17 @@ def test_passive_artifact_carries_factory_issued_occurrence() -> None:
     assert artifact.snapshot_role is ArtifactSnapshotRole.HEAD
     assert artifact.commit == GitCommitSha("a" * 40)
     assert artifact.candidate == _candidate()
+
+
+def test_passive_artifact_factory_rejects_raw_commit_text() -> None:
+    with pytest.raises(TypeError, match="GitCommitSha"):
+        passive_artifact_from_snapshot(
+            RepositoryIdentity("owner", "repo"),
+            ArtifactSnapshotRole.HEAD,
+            "a" * 40,  # type: ignore[arg-type]
+            _candidate(),
+            RAW_RESULTS,
+        )
 
 
 def test_passive_artifact_rejects_wrong_size_digest_and_mutable_content() -> None:
