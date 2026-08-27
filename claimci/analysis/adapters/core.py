@@ -392,41 +392,6 @@ def _validate_match(
     return validated
 
 
-def _legacy_tabular_evidence_id(
-    adapter_id: str,
-    artifact: _ArtifactEnvelope,
-    *,
-    adapter_semantic_version: str,
-    selector_identity: object,
-) -> str:
-    """Preserve the selector-scoped-v1 table identity until Task 4."""
-
-    if not isinstance(adapter_semantic_version, str) or not adapter_semantic_version:
-        raise TypeError("selector-scoped evidence requires an adapter semantic version")
-    material = json.dumps(
-        {
-            "schema": "claimci-selector-scoped-evidence-v1",
-            "artifact": {
-                "path": str(artifact.candidate.path),
-                "kind": artifact.candidate.kind.value,
-                "sha256": str(artifact.candidate.sha256),
-                "size": artifact.candidate.size,
-            },
-            "adapter_id": adapter_id,
-            "adapter_semantic_version": adapter_semantic_version,
-            "selector": selector_identity,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return (
-        f"evidence-{adapter_id}-table-"
-        + hashlib.sha256(material).hexdigest()[:16]
-    )
-
-
 def _evidence_id(
     adapter_id: str,
     adapter_semantic_version: str,

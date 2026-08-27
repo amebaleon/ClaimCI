@@ -39,7 +39,7 @@ from .core import (
     AdapterSelectorError,
     _ArtifactEnvelope,
     _adapter_provenance,
-    _legacy_tabular_evidence_id,
+    _evidence_id,
     _mapping,
     _supports,
     _validate_match,
@@ -534,26 +534,13 @@ class CsvAdapter:
                 raise AdapterSelectorError(
                     f"selected {self._label} identifier is invalid: {exc}"
                 ) from exc
-        scoped_selector_identity = tuple(
-            (
-                mapping.target_field,
-                selector_identity(mapping.selector),
-            )
-            for mapping in canonical_match.mappings
-            if type(mapping.selector) is TableSelector
-        )
-        evidence_id = (
-            _legacy_tabular_evidence_id(
-                self.adapter_id,
-                artifact,
-                adapter_semantic_version=self.semantic_version,
-                selector_identity=scoped_selector_identity,
-            )
-            if scoped_selector_identity
-            else f"evidence-{self.adapter_id}-{str(artifact.candidate.sha256)[:16]}"
-        )
         return NormalizedEvidence(
-            evidence_id=evidence_id,
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                canonical_match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=canonical_match,
             observations=tuple(observations),

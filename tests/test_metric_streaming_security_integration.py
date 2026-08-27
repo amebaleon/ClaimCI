@@ -31,6 +31,7 @@ from claimci.analysis import (
     TableSelector,
     approve_metric_binding,
     artifact_source_from_snapshot,
+    extract_bound_metric_evidence,
     extract_metric_candidate_scan,
     integrate_metric_binding,
     resolve_metric_binding,
@@ -344,8 +345,16 @@ def test_disjoint_role_predicates_stream_and_bind_successfully(tmp_path: Path) -
     )
 
     integrated = integrate_metric_binding(_safe_seed_mapping(source), binding)
+    evidence = extract_bound_metric_evidence(
+        source,
+        binding,
+        role=ExperimentRole.BASELINE,
+    )
 
     assert baseline.candidate_id != candidate.candidate_id
+    assert evidence.evidence_id.startswith("evidence-v2-")
+    assert evidence.scan_completeness is not None
+    assert evidence.source_trace_sha256 is not None
     assert len(integrated.bindings) == 2
     assert {
         (

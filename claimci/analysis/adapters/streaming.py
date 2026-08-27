@@ -31,18 +31,15 @@ from ..contracts import (
     NormalizedObservation,
     SelectorKind,
     TableSelector,
-    selector_identity,
 )
 from .core import (
     AdapterError,
     AdapterSelectorError,
     _adapter_provenance,
     _evidence_id,
-    _legacy_tabular_evidence_id,
     _supports,
     _validate_match,
 )
-from .dataset import _dataset_evidence_id
 from .structured import (
     _GENERIC_JSONL_KINDS,
     _RESULT_TARGETS,
@@ -63,6 +60,8 @@ from .tabular import (
     _generated_mappings_from_numeric,
     _row_value,
     _table_cell_matches,
+    CsvAdapter,
+    TsvAdapter,
 )
 from ..profiles import _BENCHMARK_PROFILE_FIELDS
 
@@ -565,12 +564,12 @@ def scan_jsonl_observations(
         return StreamingExtraction(evidence, report)
 
 
-def _delimited_format(source: ArtifactSource) -> tuple[str, str, str]:
+def _delimited_format(source: ArtifactSource) -> tuple[str, str, str, str]:
     suffix = PurePosixPath(str(source.candidate.path)).suffix.casefold()
     if suffix == ".csv":
-        return "excel", "CSV", "claimci-csv-v1"
+        return "excel", "CSV", CsvAdapter.adapter_id, CsvAdapter.semantic_version
     if suffix == ".tsv":
-        return "excel-tab", "TSV", "claimci-tsv-v1"
+        return "excel-tab", "TSV", TsvAdapter.adapter_id, TsvAdapter.semantic_version
     raise AdapterSelectorError("streaming delimited source must be CSV or TSV")
 
 
@@ -621,7 +620,7 @@ def scan_delimited_schema(
         raise AdapterSelectorError(
             "streaming delimited schema requires a fixed result-compatible source"
         )
-    dialect, label, adapter_id = _delimited_format(source)
+    dialect, label, adapter_id, _semantic_version = _delimited_format(source)
     records = 0
     with source.open_scan(ScanPurpose.SCHEMA, limits) as scan:
         physical = _DelimitedPhysicalLines(scan, limits)
@@ -814,7 +813,7 @@ def scan_delimited_observations(
         raise AdapterSelectorError(
             "streaming delimited observations require a fixed source"
         )
-    dialect, label, adapter_id = _delimited_format(source)
+    dialect, label, adapter_id, semantic_version = _delimited_format(source)
     mappings = _validate_match(
         source,
         match,
@@ -959,26 +958,13 @@ def scan_delimited_observations(
                 records_scanned=records,
                 semantic_complete=True,
             )
-            scoped = tuple(
-                (
-                    mapping.target_field,
-                    selector_identity(mapping.selector),
-                )
-                for mapping in canonical_match.mappings
-                if type(mapping.selector) is TableSelector
-            )
-            evidence_id = (
-                _legacy_tabular_evidence_id(
-                    adapter_id,
-                    source,
-                    adapter_semantic_version="1",
-                    selector_identity=scoped,
-                )
-                if scoped
-                else f"evidence-{adapter_id}-{str(source.candidate.sha256)[:16]}"
-            )
             evidence = NormalizedEvidence(
-                evidence_id=evidence_id,
+                evidence_id=_evidence_id(
+                    adapter_id,
+                    semantic_version,
+                    source,
+                    canonical_match.mappings,
+                ),
                 artifact=source.candidate,
                 adapter_match=canonical_match,
                 observations=tuple(observations),
@@ -1022,7 +1008,12 @@ def _extract_dataset_identity(
     from ..contracts import DatasetReference
 
     evidence = NormalizedEvidence(
-        evidence_id=_dataset_evidence_id(_DATASET_ADAPTER_ID, source),
+        evidence_id=_evidence_id(
+            _DATASET_ADAPTER_ID,
+            "1",
+            source,
+            match.mappings,
+        ),
         artifact=source.candidate,
         adapter_match=match,
         observations=(

@@ -15,17 +15,12 @@ from claimci.analysis import (
 )
 
 from .core import (
-    _ArtifactEnvelope,
     _adapter_provenance,
     _evidence_id,
     _supports,
     _validate_match,
     _verify_integrity,
 )
-
-
-def _dataset_evidence_id(adapter_id: str, artifact: _ArtifactEnvelope) -> str:
-    return _evidence_id(adapter_id, "1", artifact, ())
 
 
 class PassiveJsonLinesDatasetAdapter:
