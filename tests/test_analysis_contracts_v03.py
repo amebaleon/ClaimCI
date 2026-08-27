@@ -1341,6 +1341,17 @@ def test_json_serialization_rejects_nonfinite_and_unsupported_values() -> None:
         to_jsonable(10**5_000)
 
 
+def test_bounded_legacy_evidence_id_remains_constructible_and_serializable() -> None:
+    evidence = _normalized_evidence(evidence_id="evidence-legacy-completed-result")
+
+    assert evidence.evidence_id == "evidence-legacy-completed-result"
+    serialized = to_jsonable(evidence)
+    encoded = json.dumps(serialized, allow_nan=False, sort_keys=True)
+
+    assert serialized["evidence_id"] == "evidence-legacy-completed-result"  # type: ignore[index]
+    assert '"evidence_id": "evidence-legacy-completed-result"' in encoded
+
+
 def test_legacy_manifest_is_an_optional_high_confidence_mapping_hint() -> None:
     root = Path(__file__).resolve().parents[1]
     raw = (root / "research.yaml").read_bytes()

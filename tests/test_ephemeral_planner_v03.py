@@ -18,6 +18,7 @@ from claimci.analysis import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     ArtifactEvidenceSlot,
     Confidence,
     ConfigValue,
@@ -39,6 +40,7 @@ from claimci.analysis import (
     NormalizedEvidence,
     NormalizedObservation,
     PassiveArtifact,
+    passive_artifact_from_snapshot,
     PlanningRequest,
     PlanningState,
     ProvenanceKind,
@@ -56,7 +58,8 @@ from claimci.analysis import (
     planning_request_from_discovery,
     to_jsonable,
 )
-from claimci.analysis.adapters import CsvAdapter
+from claimci.analysis.adapters import CsvAdapter, JsonAdapter
+from claimci.analysis.adapters.core import _evidence_id
 from claimci.review.models import ClaimDirection, ClaimType, SourceKind, SourceLocation
 from claimci.analysis.discovery import ClaimedValue, DiscoveredClaim, DiscoveryResult
 
@@ -741,6 +744,81 @@ def _request(
         claim_id=CLAIM_ID,
         normalized_evidence=chosen_evidence,
     )
+
+
+def _v2_json_passive(
+    path: str,
+    content: bytes = b'{"accuracy":0.9}\n',
+    *,
+    snapshot_role: ArtifactSnapshotRole = ArtifactSnapshotRole.HEAD,
+    commit: GitCommitSha = HEAD_SHA,
+) -> PassiveArtifact:
+    candidate = _artifact(path, ArtifactKind.RESULTS, content)
+    return passive_artifact_from_snapshot(
+        REPOSITORY,
+        snapshot_role,
+        commit,
+        candidate,
+        content,
+    )
+
+
+def test_v2_occurrence_identity_matrix_preserves_planning_collision_checks() -> None:
+    adapter = JsonAdapter()
+    first_passive = _v2_json_passive("results/first.json")
+    first_match = adapter.probe(first_passive)
+    assert first_match is not None
+    first = adapter.extract(first_passive, first_match)
+
+    different_path_passive = _v2_json_passive("results/second.json")
+    different_path_match = adapter.probe(different_path_passive)
+    assert different_path_match is not None
+    different_path = adapter.extract(different_path_passive, different_path_match)
+    assert first.artifact.sha256 == different_path.artifact.sha256
+    assert first.evidence_id != different_path.evidence_id
+
+    base_passive = _v2_json_passive(
+        "results/first.json",
+        snapshot_role=ArtifactSnapshotRole.BASE,
+    )
+    base_match = adapter.probe(base_passive)
+    assert base_match is not None
+    base = adapter.extract(base_passive, base_match)
+    assert base.evidence_id != first.evidence_id
+
+    reread_passive = _v2_json_passive("results/first.json")
+    reread_match = adapter.probe(reread_passive)
+    assert reread_match is not None
+    assert adapter.extract(reread_passive, reread_match).evidence_id == first.evidence_id
+
+    alternate_mapping = dataclasses.replace(
+        first_match.mappings[0],
+        selector=dataclasses.replace(
+            first_match.mappings[0].selector,
+            expression="/different_metric",
+        ),
+    )
+    assert _evidence_id(
+        adapter.adapter_id,
+        adapter.semantic_version,
+        first_passive,
+        (alternate_mapping,),
+    ) != first.evidence_id
+
+    request = _request(
+        evidence=(
+            *_complete_evidence(),
+            first,
+            different_path,
+        )
+    )
+    assert request.normalized_evidence[-2:] == (first, different_path)
+
+    with pytest.raises(AnalysisContractError, match="unique"):
+        dataclasses.replace(
+            request,
+            normalized_evidence=(*request.normalized_evidence, first),
+        )
 
 
 def test_shared_benchmark_table_selectors_bind_baseline_and_candidate_independently() -> None:

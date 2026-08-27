@@ -1,0 +1,12 @@
+training_steps: 100
+epochs: 4
+batch_size: 8
+dataset:
+  identifier: claimci-production-smoke-train
+  version: v1
+evaluation:
+  dataset_identifier: claimci-production-smoke-eval
+  dataset_version: v1
+  split: test
+model: claimci-production-smoke-model
+learning_rate: 0.001

@@ -1554,6 +1554,43 @@ def test_provider_mapping_rejects_unsafe_selectors_and_authority_fields(
         )
 
 
+@pytest.mark.parametrize("location", ("mapping", "binding"))
+@pytest.mark.parametrize("field", ("occurrence", "repository", "snapshot_role", "commit"))
+def test_provider_mapping_schema_rejects_occurrence_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+    field: str,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        ("results/candidate_results.json",),
+    )
+    payload = _provider_mapping_payload("results/candidate_results.json")
+    target = (
+        payload["mappings"][0]
+        if location == "mapping"
+        else payload["mappings"][0]["bindings"][0]
+    )
+    target[field] = "hostile provider scope"
+
+    import claimci.analysis.contracts as contracts
+
+    def forbidden_factory(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("provider data must not issue an artifact occurrence")
+
+    monkeypatch.setattr(contracts, "artifact_occurrence_from_snapshot", forbidden_factory)
+    with pytest.raises(DiscoveryError, match="provider"):
+        resolve_mappings(
+            discovered.artifacts,
+            claims,
+            (),
+            repository=REPOSITORY,
+            provider_payload=payload,
+            limits=DiscoveryLimits(),
+        )
+
+
 def test_discover_repository_runs_zero_config_pipeline_without_manifest(
     tmp_path: Path,
 ) -> None:

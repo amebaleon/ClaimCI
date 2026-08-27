@@ -7,11 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.analysis_occurrence_support import passive_artifact
-
 from claimci.analysis import (
     AnalysisState,
     ArtifactKind,
+    ArtifactSnapshotRole,
     DatasetSplit,
     ExperimentRole,
     GitCommitSha,
@@ -19,7 +18,6 @@ from claimci.analysis import (
     MappingTrust,
     MetricImprovementClaim,
     NormalizedEvidence,
-    PassiveArtifact,
     PlanningState,
     ProvenanceKind,
     RepositoryIdentity,
@@ -27,6 +25,7 @@ from claimci.analysis import (
     RuntimeExecutionContext,
     execute_ephemeral_audit,
     plan_ephemeral_audit,
+    passive_artifact_from_snapshot,
     planning_request_from_discovery,
     run_unified_analysis,
 )
@@ -205,6 +204,31 @@ def test_provider_projection_does_not_derive_arithmetic_threshold(
     assert provider[0].minimum_improvement is None
 
 
+@pytest.mark.parametrize("field", ("occurrence", "repository", "snapshot_role", "commit"))
+def test_provider_claim_schema_rejects_occurrence_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    claim_text = (
+        "candidate improves accuracy from 0.60 to 0.70 under the same "
+        "configuration and evaluation dataset."
+    )
+    context = _provider_context(tmp_path, claim_text)
+    source = context.source_bundle.sources[0]
+    payload = _provider_claim_payload(source.source_id, claim_text)
+    payload["claims"][0][field] = "hostile provider scope"
+
+    import claimci.analysis.contracts as contracts
+
+    def forbidden_factory(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("provider data must not issue an artifact occurrence")
+
+    monkeypatch.setattr(contracts, "artifact_occurrence_from_snapshot", forbidden_factory)
+    with pytest.raises(DiscoveryError, match="provider"):
+        _provider_claims(context, payload, DiscoveryLimits())
+
+
 def _write_repository(root: Path) -> None:
     files = {
         "README.md": b"Accuracy improved by at least 0.05.\n",
@@ -308,7 +332,13 @@ def _extract_evidence(root: Path, discovery) -> tuple[NormalizedEvidence, ...]:
     extracted: list[NormalizedEvidence] = []
     for artifact in discovery.artifacts:
         content = (root / Path(str(artifact.path))).read_bytes()
-        passive = passive_artifact(artifact, content)
+        passive = passive_artifact_from_snapshot(
+            discovery.repository,
+            ArtifactSnapshotRole.HEAD,
+            discovery.head_sha,
+            artifact,
+            content,
+        )
         if artifact.kind not in {
             ArtifactKind.RESULTS,
             ArtifactKind.CONFIG,
