@@ -261,6 +261,19 @@ def test_subject_first_threshold_uses_existing_explicit_continuation() -> None:
     assert recovered.primary.minimum_improvement.value == 0.05
 
 
+def test_subject_first_inline_threshold_remains_explicit() -> None:
+    recovered = recover_scientific_claim(
+        _reference(
+            "candidate improves accuracy from 0.60 to 0.70 by at least 0.05"
+        )
+    )
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.minimum_improvement is not None
+    assert recovered.primary.minimum_improvement.value == 0.05
+
+
 def test_subject_first_lower_threshold_uses_existing_explicit_continuation() -> None:
     recovered = recover_scientific_claim(
         _reference(
@@ -286,6 +299,41 @@ def test_subject_first_does_not_derive_threshold_from_arithmetic() -> None:
 
     assert recovered is not None
     assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.minimum_improvement is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        (
+            "candidate improves accuracy from 0.60 to 0.70, at least 2 GPUs "
+            "were used"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70, minimum of 3 epochs "
+            "were run"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70: no less than 4 "
+            "training runs were completed"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70 (at least 5 GPU-hours "
+            "were used)"
+        ),
+    ),
+)
+def test_subject_first_does_not_borrow_unrelated_clause_threshold(
+    text: str,
+) -> None:
+    recovered = recover_scientific_claim(_reference(text))
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.baseline_value is not None
+    assert recovered.primary.baseline_value.value == 0.60
+    assert recovered.primary.candidate_value is not None
+    assert recovered.primary.candidate_value.value == 0.70
     assert recovered.primary.minimum_improvement is None
 
 

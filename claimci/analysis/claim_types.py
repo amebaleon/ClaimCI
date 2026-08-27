@@ -415,6 +415,10 @@ def _only_separators(value: str) -> bool:
     return not any(character.isalnum() or character == "_" for character in value)
 
 
+def _only_whitespace(value: str) -> bool:
+    return not value.strip()
+
+
 def _verb_direction(verb: str) -> Direction:
     return (
         Direction.LOWER
@@ -468,7 +472,7 @@ def _recover_primary(
             pair = None
         threshold = thresholds[0] if thresholds else continuation_threshold
         threshold_anchor = improvement_end if pair is None else pair.end()
-        if thresholds and not _only_separators(
+        if thresholds and not _only_whitespace(
             tail[threshold_anchor : threshold.start()]
         ):
             threshold = None
