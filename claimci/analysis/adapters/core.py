@@ -20,6 +20,7 @@ from claimci.analysis import (
     AnalysisContractError,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactOccurrence,
     EvidenceSelector,
     FieldMapping,
     FieldProvenance,
@@ -28,6 +29,8 @@ from claimci.analysis import (
     SelectorKind,
 )
 from claimci.parsing import unique_json_object
+
+from ..evidence_identity import canonical_selector_material
 
 
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
@@ -42,6 +45,7 @@ _CANONICAL_ARRAY_INDEX = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 
 
 class _ArtifactEnvelope(Protocol):
+    occurrence: ArtifactOccurrence
     candidate: ArtifactCandidate
 
 
@@ -388,46 +392,84 @@ def _validate_match(
     return validated
 
 
-def _evidence_id(
+def _legacy_tabular_evidence_id(
     adapter_id: str,
     artifact: _ArtifactEnvelope,
     *,
-    adapter_semantic_version: str | None = None,
-    selector_identity: object | None = None,
+    adapter_semantic_version: str,
+    selector_identity: object,
 ) -> str:
-    """Return a stable bounded identity for normalized evidence."""
+    """Preserve the selector-scoped-v1 table identity until Task 4."""
 
-    if selector_identity is not None:
-        if (
-            not isinstance(adapter_semantic_version, str)
-            or not adapter_semantic_version
-        ):
-            raise TypeError(
-                "selector-scoped evidence requires an adapter semantic version"
-            )
-        material = json.dumps(
-            {
-                "schema": "claimci-selector-scoped-evidence-v1",
-                "artifact": {
-                    "path": str(artifact.candidate.path),
-                    "kind": artifact.candidate.kind.value,
-                    "sha256": str(artifact.candidate.sha256),
-                    "size": artifact.candidate.size,
-                },
-                "adapter_id": adapter_id,
-                "adapter_semantic_version": adapter_semantic_version,
-                "selector": selector_identity,
+    if not isinstance(adapter_semantic_version, str) or not adapter_semantic_version:
+        raise TypeError("selector-scoped evidence requires an adapter semantic version")
+    material = json.dumps(
+        {
+            "schema": "claimci-selector-scoped-evidence-v1",
+            "artifact": {
+                "path": str(artifact.candidate.path),
+                "kind": artifact.candidate.kind.value,
+                "sha256": str(artifact.candidate.sha256),
+                "size": artifact.candidate.size,
             },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        return (
-            f"evidence-{adapter_id}-table-"
-            + hashlib.sha256(material).hexdigest()[:16]
+            "adapter_id": adapter_id,
+            "adapter_semantic_version": adapter_semantic_version,
+            "selector": selector_identity,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return (
+        f"evidence-{adapter_id}-table-"
+        + hashlib.sha256(material).hexdigest()[:16]
+    )
+
+
+def _evidence_id(
+    adapter_id: str,
+    adapter_semantic_version: str,
+    artifact: _ArtifactEnvelope,
+    mappings: tuple[FieldMapping, ...],
+) -> str:
+    """Return the exact v2 identity for one trusted occurrence and selector."""
+
+    if not isinstance(adapter_id, str) or not adapter_id:
+        raise TypeError("adapter ID must be a non-empty string")
+    if not isinstance(adapter_semantic_version, str) or not adapter_semantic_version:
+        raise TypeError("adapter semantic version must be a non-empty string")
+    if type(getattr(artifact, "occurrence", None)) is not ArtifactOccurrence:
+        raise TypeError(
+            "evidence v2 identity requires a concrete ArtifactOccurrence"
         )
-    return f"evidence-{adapter_id}-{str(artifact.candidate.sha256)[:16]}"
+    material = {
+        "schema_version": 2,
+        "repository": {
+            "owner": artifact.occurrence.repository.owner,
+            "name": artifact.occurrence.repository.name,
+        },
+        "snapshot": {
+            "role": artifact.occurrence.snapshot_role.value,
+            "commit": str(artifact.occurrence.commit),
+        },
+        "artifact": {
+            "path": str(artifact.candidate.path),
+            "kind": artifact.candidate.kind.value,
+            "sha256": str(artifact.candidate.sha256),
+            "size": artifact.candidate.size,
+        },
+        "adapter": {"id": adapter_id, "version": adapter_semantic_version},
+        "selector": list(canonical_selector_material(mappings)),
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "evidence-v2-" + hashlib.sha256(encoded).hexdigest()
 
 
 __all__ = [

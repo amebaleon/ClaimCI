@@ -85,9 +85,25 @@ def field_mapping_material(mapping: FieldMapping) -> dict[str, object]:
     return material
 
 
+def canonical_selector_material(
+    mappings: tuple[FieldMapping, ...],
+) -> tuple[dict[str, object], ...]:
+    """Return sorted selector material without provenance or scientific role."""
+
+    if not isinstance(mappings, tuple) or not all(
+        type(item) is FieldMapping for item in mappings
+    ):
+        raise TypeError("selector material requires a tuple of FieldMapping values")
+    return tuple(
+        field_mapping_material(item)
+        for item in sorted(mappings, key=field_mapping_identity)
+    )
+
+
 __all__ = [
     "evidence_for_binding",
     "evidence_matches_binding",
+    "canonical_selector_material",
     "field_mapping_material",
     "field_mapping_projection",
 ]

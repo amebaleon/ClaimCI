@@ -587,6 +587,11 @@ class AdapterMatch:
 class Adapter(Protocol):
     """A deterministic parser of validated passive artifact bytes."""
 
+    @property
+    def semantic_version(self) -> str:
+        """Trusted adapter semantic version used in evidence identity."""
+        ...
+
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         ...
 

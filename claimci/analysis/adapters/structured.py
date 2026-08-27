@@ -347,6 +347,7 @@ class JsonAdapter:
 
     __slots__ = ()
     adapter_id = "claimci-json-v1"
+    semantic_version = "1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         if not _supports(
@@ -466,7 +467,12 @@ class JsonAdapter:
             )
             observations = (_observation(value, mappings, provenance=provenance),)
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=observations,
@@ -478,6 +484,7 @@ class JsonLinesAdapter:
 
     __slots__ = ()
     adapter_id = "claimci-jsonl-v1"
+    semantic_version = "1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         if not _supports(
@@ -539,7 +546,12 @@ class JsonLinesAdapter:
             for index, record in enumerate(records)
         )
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=observations,

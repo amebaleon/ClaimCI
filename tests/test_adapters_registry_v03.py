@@ -51,6 +51,7 @@ EXPECTED_IDS = (
 def test_registry_order_ids_instances_and_limits_are_exact() -> None:
     assert isinstance(ADAPTERS, tuple)
     assert tuple(item.adapter_id for item in ADAPTERS) == EXPECTED_IDS
+    assert tuple(item.semantic_version for item in ADAPTERS) == ("1",) * len(ADAPTERS)
     assert tuple(type(item) for item in ADAPTERS) == (
         NativeManifestAdapter,
         NativeResultsAdapter,

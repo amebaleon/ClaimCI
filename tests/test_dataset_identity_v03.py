@@ -221,6 +221,29 @@ def test_identical_dataset_bytes_at_distinct_paths_have_distinct_evidence_ids() 
     ).evidence_id
 
 
+def test_identical_dataset_occurrences_are_v2_distinct_and_stable() -> None:
+    adapter = PassiveJsonLinesDatasetAdapter()
+    content = b'{"id":"same"}\n'
+    baseline = _passive_dataset(content, path="baseline-data.jsonl")
+    candidate = _passive_dataset(content, path="candidate-data.jsonl")
+    reread = _passive_dataset(content, path="baseline-data.jsonl")
+
+    baseline_match = adapter.probe(baseline)
+    candidate_match = adapter.probe(candidate)
+    reread_match = adapter.probe(reread)
+    assert baseline_match is not None
+    assert candidate_match is not None
+    assert reread_match is not None
+    baseline_evidence = adapter.extract(baseline, baseline_match)
+    candidate_evidence = adapter.extract(candidate, candidate_match)
+    reread_evidence = adapter.extract(reread, reread_match)
+
+    assert baseline_evidence.evidence_id.startswith("evidence-v2-")
+    assert len(baseline_evidence.evidence_id) == 76
+    assert baseline_evidence.evidence_id != candidate_evidence.evidence_id
+    assert baseline_evidence.evidence_id == reread_evidence.evidence_id
+
+
 @pytest.mark.parametrize(
     ("path", "kind"),
     [

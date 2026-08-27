@@ -698,6 +698,8 @@ def test_normalized_evidence_rejects_mismatched_path_or_empty_observations() -> 
 
 def test_trivial_adapter_operates_only_on_passive_bytes() -> None:
     class FakeAdapter:
+        semantic_version = "1"
+
         def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
             assert isinstance(artifact.content, bytes)
             return _adapter_match()

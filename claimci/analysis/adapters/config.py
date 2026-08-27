@@ -171,7 +171,12 @@ class _ConfigAdapter:
             config_values=tuple(config_values),
         )
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=(observation,),
@@ -183,6 +188,7 @@ class YamlConfigAdapter(_ConfigAdapter):
 
     __slots__ = ()
     adapter_id = "claimci-yaml-config-v1"
+    semantic_version = "1"
     suffixes = frozenset({".yaml", ".yml"})
 
     def _parse(self, content: bytes) -> Mapping[str, object]:
@@ -199,6 +205,7 @@ class TomlConfigAdapter(_ConfigAdapter):
 
     __slots__ = ()
     adapter_id = "claimci-toml-config-v1"
+    semantic_version = "1"
     suffixes = frozenset({".toml"})
 
     def _parse(self, content: bytes) -> Mapping[str, object]:

@@ -38,6 +38,7 @@ from .core import (
     AdapterSelectorError,
     _adapter_provenance,
     _evidence_id,
+    _legacy_tabular_evidence_id,
     _supports,
     _validate_match,
 )
@@ -46,6 +47,7 @@ from .structured import (
     _GENERIC_JSONL_KINDS,
     _RESULT_TARGETS,
     _is_finite_number,
+    JsonLinesAdapter,
     _match,
     _observation,
     _pointer_leaves,
@@ -548,7 +550,12 @@ def scan_jsonl_observations(
             return StreamingExtraction(None, report)
         report = scan.finish(records_scanned=records, semantic_complete=True)
         evidence = NormalizedEvidence(
-            evidence_id=_evidence_id(_JSONL_ADAPTER_ID, source),
+            evidence_id=_evidence_id(
+                _JSONL_ADAPTER_ID,
+                JsonLinesAdapter.semantic_version,
+                source,
+                match.mappings,
+            ),
             artifact=source.candidate,
             adapter_match=match,
             observations=tuple(observations),
@@ -960,13 +967,18 @@ def scan_delimited_observations(
                 for mapping in canonical_match.mappings
                 if type(mapping.selector) is TableSelector
             )
-            evidence = NormalizedEvidence(
-                evidence_id=_evidence_id(
+            evidence_id = (
+                _legacy_tabular_evidence_id(
                     adapter_id,
                     source,
-                    adapter_semantic_version="1" if scoped else None,
-                    selector_identity=scoped if scoped else None,
-                ),
+                    adapter_semantic_version="1",
+                    selector_identity=scoped,
+                )
+                if scoped
+                else f"evidence-{adapter_id}-{str(source.candidate.sha256)[:16]}"
+            )
+            evidence = NormalizedEvidence(
+                evidence_id=evidence_id,
                 artifact=source.candidate,
                 adapter_match=canonical_match,
                 observations=tuple(observations),

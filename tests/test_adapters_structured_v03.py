@@ -309,3 +309,26 @@ def test_json_probe_rejects_duplicate_keys_and_nonfinite_values() -> None:
     ):
         with pytest.raises(AdapterParseError):
             JsonAdapter().probe(_passive(content, path="results/data.json"))
+
+
+def test_identical_json_results_at_distinct_paths_have_distinct_v2_ids() -> None:
+    content = b'{"accuracy":0.9}'
+    adapter = JsonAdapter()
+    baseline = _passive(content, path="baseline-results.json")
+    candidate = _passive(content, path="candidate-results.json")
+    baseline_match = adapter.probe(baseline)
+    candidate_match = adapter.probe(candidate)
+    reread = _passive(content, path="baseline-results.json")
+    reread_match = adapter.probe(reread)
+
+    assert baseline_match is not None
+    assert candidate_match is not None
+    assert reread_match is not None
+    baseline_evidence = adapter.extract(baseline, baseline_match)
+    candidate_evidence = adapter.extract(candidate, candidate_match)
+    reread_evidence = adapter.extract(reread, reread_match)
+
+    assert baseline_evidence.evidence_id.startswith("evidence-v2-")
+    assert len(baseline_evidence.evidence_id) == 76
+    assert baseline_evidence.evidence_id != candidate_evidence.evidence_id
+    assert baseline_evidence.evidence_id == reread_evidence.evidence_id
