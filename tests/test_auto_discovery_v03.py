@@ -41,7 +41,11 @@ from claimci.analysis.discovery.repository import (
     inspect_artifact,
     read_artifact_text,
 )
-from claimci.analysis.discovery.claims import as_scientific_claim, discover_claims
+from claimci.analysis.discovery.claims import (
+    _provider_claims,
+    as_scientific_claim,
+    discover_claims,
+)
 from claimci.analysis.discovery.artifacts import discover_artifacts
 from claimci.analysis.discovery.mappings import resolve_mappings
 from claimci.models import Direction
@@ -536,6 +540,39 @@ def test_metric_claim_captures_unitless_explicit_absolute_threshold(
     assert claims[0].minimum_improvement.unit is None
 
 
+def test_subject_first_discovery_projects_canonical_metric_values(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = (
+        "The candidate improves accuracy from 0.60 to 0.70 under the same "
+        "configuration and evaluation dataset."
+    )
+
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity(
+            "amebaleon",
+            "claimci-production-smoke-fixture",
+        ),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+        pr_title="Production smoke: verify supported result",
+        pr_description=claim_text,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].reference.text == claim_text
+    assert result.claims[0].scientific_claim is not None
+    assert type(result.claims[0].scientific_claim.primary) is MetricImprovementClaim
+    assert result.claims[0].metric == "accuracy"
+    assert result.claims[0].direction is ClaimDirection.HIGHER
+    assert result.claims[0].baseline_value is not None
+    assert result.claims[0].baseline_value.value == 0.60
+    assert result.claims[0].candidate_value is not None
+    assert result.claims[0].candidate_value.value == 0.70
+    assert result.claims[0].minimum_improvement is None
+
+
 def test_held_out_metric_improvement_discovery_keeps_primary_and_constraint(
     tmp_path: Path,
 ) -> None:
@@ -688,7 +725,7 @@ def _provider_claim_payload(
 def test_provider_claims_require_trusted_quotes_and_indexed_hints(tmp_path: Path) -> None:
     head = tmp_path / "head"
     head.mkdir()
-    source_text = "Reported accuracy values are 71 to 79."
+    source_text = "Candidate improves accuracy from 71 to 79."
     (head / "README.md").write_text(source_text, encoding="utf-8")
     (head / "results.json").write_text("{}\n", encoding="utf-8")
     context = collect_repository_context(head, limits=DiscoveryLimits())
@@ -699,10 +736,10 @@ def test_provider_claims_require_trusted_quotes_and_indexed_hints(tmp_path: Path
         evidence_hints=["results.json"],
     )
 
-    claims = discover_claims(
+    claims = _provider_claims(
         context,
-        provider_payload=payload,
-        limits=DiscoveryLimits(),
+        payload,
+        DiscoveryLimits(),
     )
 
     assert len(claims) == 1
@@ -720,10 +757,10 @@ def test_provider_claims_require_trusted_quotes_and_indexed_hints(tmp_path: Path
         evidence_hints=["../outside.json"],
     )
     with pytest.raises(DiscoveryError, match="provider"):
-        discover_claims(
+        _provider_claims(
             context,
-            provider_payload=unsafe,
-            limits=DiscoveryLimits(),
+            unsafe,
+            DiscoveryLimits(),
         )
 
 
@@ -1481,7 +1518,7 @@ def test_discovery_preserves_existing_review_source_claim_and_evidence_behavior(
 ) -> None:
     head = tmp_path / "head"
     head.mkdir()
-    source_text = "Reported accuracy values are 71 to 79."
+    source_text = "Candidate improves accuracy from 71 to 79."
     (head / "README.md").write_text(source_text, encoding="utf-8")
     (head / "results.json").write_text("{}\n", encoding="utf-8")
     before_sources = collect_review_sources(head)

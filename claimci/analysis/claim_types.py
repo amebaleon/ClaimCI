@@ -30,6 +30,12 @@ _METRIC_IMPROVEMENT = re.compile(
     r"(?P<verb>improved|increased|rose|grew|decreased|fell|dropped|reduced)\b",
     flags=re.IGNORECASE,
 )
+_SUBJECT_METRIC_IMPROVEMENT = re.compile(
+    r"\b(?:the\s+)?(?:candidate|model)\s+"
+    r"(?P<verb>improves|increases|raises|grows|reduces|decreases|lowers|drops)\s+"
+    r"(?P<metric>[A-Za-z][A-Za-z0-9_.-]{0,63})\b",
+    flags=re.IGNORECASE,
+)
 _VALUE_PAIR = re.compile(
     rf"(?:from\s+)?(?P<baseline>{_NUMBER})\s*(?P<baseline_unit>%?)\s*"
     rf"(?:->|→|to)\s*(?P<candidate>{_NUMBER})\s*(?P<candidate_unit>%?)",
@@ -80,6 +86,18 @@ _GENERIC_BOUND = re.compile(
 )
 _WHITESPACE = re.compile(r"\s+")
 _CLAUSE_BOUNDARY = re.compile(r"[;!?\n]|\.(?=\s|$)")
+_LOWER_VERBS = frozenset(
+    {
+        "decreased",
+        "fell",
+        "dropped",
+        "reduced",
+        "reduces",
+        "decreases",
+        "lowers",
+        "drops",
+    }
+)
 
 
 class ClaimTypeContractError(ValueError):
@@ -400,7 +418,7 @@ def _only_separators(value: str) -> bool:
 def _verb_direction(verb: str) -> Direction:
     return (
         Direction.LOWER
-        if verb.casefold() in {"decreased", "fell", "dropped", "reduced"}
+        if verb.casefold() in _LOWER_VERBS
         else Direction.HIGHER
     )
 
@@ -409,7 +427,15 @@ def _recover_primary(
     text: str,
     provenance: FieldProvenance,
 ) -> PrimaryScientificClaim | None:
-    improvements = tuple(_METRIC_IMPROVEMENT.finditer(text))
+    improvements = tuple(
+        sorted(
+            (
+                *_METRIC_IMPROVEMENT.finditer(text),
+                *_SUBJECT_METRIC_IMPROVEMENT.finditer(text),
+            ),
+            key=lambda match: match.start(),
+        )
+    )
     if len(improvements) == 1:
         improvement = improvements[0]
         tail = text[improvement.start() :]
@@ -417,15 +443,18 @@ def _recover_primary(
         boundary = _CLAUSE_BOUNDARY.search(tail)
         if boundary is not None:
             if boundary.group(0) == ";":
-                candidate = _MINIMUM_CONTINUATION.fullmatch(
-                    tail[boundary.end() :]
-                )
+                continuation = tail[boundary.end() :]
+                candidate = _MINIMUM_CONTINUATION.fullmatch(continuation)
                 if (
                     candidate is not None
                     and _verb_direction(candidate.group("verb"))
                     is _verb_direction(improvement.group("verb"))
                 ):
                     continuation_threshold = candidate
+                elif continuation.count(";") and len(
+                    tuple(_MINIMUM.finditer(continuation))
+                ) > 1:
+                    return None
             tail = tail[: boundary.start()]
         pairs = tuple(_VALUE_PAIR.finditer(tail))
         thresholds = tuple(_MINIMUM.finditer(tail))

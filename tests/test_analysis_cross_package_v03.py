@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from claimci.analysis import (
     AnalysisState,
     ArtifactKind,
@@ -13,6 +15,7 @@ from claimci.analysis import (
     GitCommitSha,
     MaterializationLimits,
     MappingTrust,
+    MetricImprovementClaim,
     NormalizedEvidence,
     PassiveArtifact,
     PlanningState,
@@ -26,7 +29,13 @@ from claimci.analysis import (
     run_unified_analysis,
 )
 from claimci.analysis.adapters import extract_registered_artifact
-from claimci.analysis.discovery import discover_repository
+from claimci.analysis.discovery import (
+    DiscoveryError,
+    DiscoveryLimits,
+    discover_repository,
+)
+from claimci.analysis.discovery.claims import _provider_claims, discover_claims
+from claimci.analysis.discovery.repository import collect_repository_context
 from claimci.models import Verdict
 from claimci.review import ProviderUsage, ReviewConfig
 from claimci.review.provider import ProviderResponse, StructuredRequest
@@ -58,6 +67,117 @@ class _SynthesisProvider:
             "fake-model",
             usage=ProviderUsage(input_tokens=10, output_tokens=5, total_tokens=15),
         )
+
+
+def _provider_claim_payload(source_id: str, source_text: str) -> dict[str, object]:
+    return {
+        "claims": [
+            {
+                "source_text": source_text,
+                "claim_type": "metric_improvement",
+                "subject": "candidate",
+                "metric": "accuracy",
+                "direction": "higher",
+                "claimed_magnitude": None,
+                "qualifiers": [],
+                "source": {
+                    "source_id": source_id,
+                    "start_line": 1,
+                    "end_line": 1,
+                },
+                "confidence": 0.82,
+                "evidence_hints": [],
+            }
+        ]
+    }
+
+
+def _provider_context(tmp_path: Path, text: str):
+    head = tmp_path / "head"
+    head.mkdir()
+    return collect_repository_context(
+        head,
+        pr_description=text,
+        limits=DiscoveryLimits(),
+    )
+
+
+def test_provider_projection_uses_canonical_subject_first_source_values(
+    tmp_path: Path,
+) -> None:
+    claim_text = (
+        "The candidate improves accuracy from 0.60 to 0.70 under the same "
+        "configuration and evaluation dataset."
+    )
+    context = _provider_context(tmp_path, claim_text)
+    source = context.source_bundle.sources[0]
+    payload = _provider_claim_payload(source.source_id, claim_text)
+
+    deterministic = discover_claims(context, limits=DiscoveryLimits())
+    provider = _provider_claims(context, payload, DiscoveryLimits())
+
+    assert len(deterministic) == len(provider) == 1
+    assert provider[0].reference.text == claim_text
+    assert provider[0].scientific_claim is not None
+    assert type(provider[0].scientific_claim.primary) is MetricImprovementClaim
+    assert provider[0].baseline_value is not None
+    assert deterministic[0].baseline_value is not None
+    assert provider[0].baseline_value.value == deterministic[0].baseline_value.value
+    assert provider[0].baseline_value.unit == deterministic[0].baseline_value.unit
+    assert provider[0].candidate_value is not None
+    assert deterministic[0].candidate_value is not None
+    assert provider[0].candidate_value.value == deterministic[0].candidate_value.value
+    assert provider[0].candidate_value.unit == deterministic[0].candidate_value.unit
+    assert provider[0].minimum_improvement is None
+    assert deterministic[0].minimum_improvement is None
+
+
+def test_provider_projection_rejects_ambiguous_subject_first_metric_source(
+    tmp_path: Path,
+) -> None:
+    claim_text = (
+        "candidate improves accuracy from 0.60 to 0.70 and loss from "
+        "0.40 to 0.30"
+    )
+    context = _provider_context(tmp_path, claim_text)
+    source = context.source_bundle.sources[0]
+
+    with pytest.raises(DiscoveryError, match="provider"):
+        _provider_claims(
+            context,
+            _provider_claim_payload(source.source_id, claim_text),
+            DiscoveryLimits(),
+        )
+
+
+def test_provider_projection_does_not_derive_arithmetic_threshold(
+    tmp_path: Path,
+) -> None:
+    claim_text = (
+        "candidate improves accuracy from 0.60 to 0.70; "
+        "0.70 - 0.60 = 0.10"
+    )
+    context = _provider_context(tmp_path, claim_text)
+    source = context.source_bundle.sources[0]
+    payload = _provider_claim_payload(source.source_id, claim_text)
+    payload["claims"][0]["claimed_magnitude"] = {
+        "raw": "0.10",
+        "value": 0.10,
+        "unit": None,
+        "kind": "absolute",
+    }
+    provider = _provider_claims(
+        context,
+        payload,
+        DiscoveryLimits(),
+    )
+
+    assert len(provider) == 1
+    assert provider[0].baseline_value is not None
+    assert provider[0].baseline_value.value == 0.60
+    assert provider[0].candidate_value is not None
+    assert provider[0].candidate_value.value == 0.70
+    assert provider[0].minimum_improvement is None
 
 
 def _write_repository(root: Path) -> None:

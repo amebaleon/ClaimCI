@@ -147,6 +147,135 @@ def test_metric_compiler_recovers_only_source_bound_fields() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "metric", "direction", "baseline", "candidate"),
+    (
+        (
+            "accuracy improved from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
+            "the candidate improves accuracy from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
+            "model improves accuracy from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
+            "candidate increases accuracy from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
+            "candidate reduces loss from 0.40 to 0.30",
+            "loss",
+            Direction.LOWER,
+            0.40,
+            0.30,
+        ),
+    ),
+)
+def test_metric_improvement_recovery_uses_one_bounded_grammar(
+    text: str,
+    metric: str,
+    direction: Direction,
+    baseline: float,
+    candidate: float,
+) -> None:
+    recovered = recover_scientific_claim(_reference(text))
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.metric == metric
+    assert recovered.primary.direction is direction
+    assert recovered.primary.baseline_value is not None
+    assert recovered.primary.candidate_value is not None
+    assert recovered.primary.baseline_value.value == baseline
+    assert recovered.primary.candidate_value.value == candidate
+
+
+def test_subject_first_threshold_uses_existing_explicit_continuation() -> None:
+    recovered = recover_scientific_claim(
+        _reference(
+            "candidate improves accuracy from 0.60 to 0.70; "
+            "improved by at least 0.05"
+        )
+    )
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.minimum_improvement is not None
+    assert recovered.primary.minimum_improvement.value == 0.05
+
+
+def test_subject_first_lower_threshold_uses_existing_explicit_continuation() -> None:
+    recovered = recover_scientific_claim(
+        _reference(
+            "candidate reduces loss from 0.40 to 0.30; "
+            "reduced by at least 0.05"
+        )
+    )
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.direction is Direction.LOWER
+    assert recovered.primary.minimum_improvement is not None
+    assert recovered.primary.minimum_improvement.value == 0.05
+
+
+def test_subject_first_does_not_derive_threshold_from_arithmetic() -> None:
+    recovered = recover_scientific_claim(
+        _reference(
+            "candidate improves accuracy from 0.60 to 0.70; "
+            "0.70 - 0.60 = 0.10"
+        )
+    )
+
+    assert recovered is not None
+    assert type(recovered.primary) is MetricImprovementClaim
+    assert recovered.primary.minimum_improvement is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        (
+            "candidate improves accuracy from 0.60 to 0.70 and loss from "
+            "0.40 to 0.30"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70; improved by at "
+            "least 0.05; improved by at least 0.06"
+        ),
+        (
+            "candidate says model improves accuracy from 0.60 to 0.70 while "
+            "candidate reduces loss from 0.40 to 0.30"
+        ),
+    ),
+)
+def test_subject_first_rejects_ambiguous_metric_improvement(text: str) -> None:
+    assert recover_scientific_claim(_reference(text)) is None
+
+
+@pytest.mark.parametrize(
     "text,expected_threshold",
     [
         (
