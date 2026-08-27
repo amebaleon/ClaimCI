@@ -203,9 +203,9 @@ It must prove:
 - all normalized evidence IDs use v2;
 - byte-identical baseline/candidate configs have different IDs;
 - `planning_request_from_discovery()` succeeds;
-- `plan_ephemeral_audit()` is `READY`, or—only if an independently real ambiguity is exposed—an exact bounded `MAPPING_NEEDED`/`PARTIAL` reason that is not `scientific_routing_uncertain`.
+- `plan_ephemeral_audit()` returns the legitimate bounded `PARTIAL` reason `required_threshold_not_recovered`: the exact approved prose has no explicit threshold, the manifest mapping does not become claim-prose authority, and no threshold is synthesized. If implementation instead exposes an independently real `READY` or `MAPPING_NEEDED` state, the report must prove the exact existing authority path; the result must never be `scientific_routing_uncertain`.
 
-The approved manifest is expected to make the fixture `READY`; any weaker outcome requires evidence in the test report.
+The approved manifest supplies the eight artifact bindings but does not supply canonical claim-field support. The fixture gate therefore freezes claim recovery and the current honest pre-Audit boundary without broadening manifest or mapping authority.
 
 ## Verification
 

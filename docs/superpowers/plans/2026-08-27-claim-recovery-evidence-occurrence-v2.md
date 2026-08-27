@@ -574,7 +574,7 @@ git commit -m "feat: unify selector scoped evidence v2"
 
 **Interfaces:**
 - Consumes: Tasks 1–4 canonical discovery and v2 extraction.
-- Produces: exact fixture claim count `1` and deterministic planning state `READY`; planner still rejects a true repeated identity.
+- Produces: exact fixture claim count `1` followed by the honest deterministic `PARTIAL / required_threshold_not_recovered` boundary; planner still rejects a true repeated identity.
 
 - [ ] **Step 1: Copy the controlled fixture byte-for-byte and pin its hashes**
 
@@ -620,11 +620,13 @@ assert discovery.claims[0].minimum_improvement is None
 assert evidence
 assert all(re.fullmatch(r"evidence-v2-[0-9a-f]{64}", item.evidence_id) for item in evidence)
 assert config_ids["baseline-config.yaml"] != config_ids["candidate-config.yaml"]
-assert outcome.state is PlanningState.READY
-assert outcome.plan is not None
+assert outcome.state is PlanningState.PARTIAL
+assert outcome.reason == "required_threshold_not_recovered"
+assert outcome.plan is None
+assert outcome.mapping_question is None
 ```
 
-The checked-in manifest is valid and supplies all eight explicit bindings, so this exact fixture is required to be `READY`. If implementation exposes an independently real ambiguity that contradicts that premise, stop the task and report the exact bounded state/reason for a design re-review instead of weakening the assertion.
+Also assert the blocking obligation is exactly `claim.threshold`, with state `MISSING` and reason `REQUIRED_THRESHOLD_NOT_RECOVERED`. The checked-in manifest validly supplies all eight artifact bindings, but its `minimum_improvement` hint is mapping metadata and must not become canonical claim-field authority. The exact approved prose contains no threshold, so synthesizing `0.10` from arithmetic or importing manifest `0.05` into the claim is forbidden. If implementation exposes an independently real `READY` or `MAPPING_NEEDED` authority path, stop the task and report it for design re-review rather than weakening or relabeling the assertion.
 
 - [ ] **Step 4: Run Stage B/C RED tests before any planner edit**
 
@@ -648,7 +650,7 @@ Run:
 python -m pytest tests/test_evidence_identity_v2.py tests/test_ephemeral_planner_v03.py tests/test_ephemeral_materialize_v03.py tests/test_streaming_materialize_v1.py tests/test_production_smoke_remediation.py -q
 ```
 
-Expected: all tests pass; exact fixture claim count is 1 and planning state is READY.
+Expected: all tests pass; exact fixture claim count is 1 and planning terminates honestly as `PARTIAL / required_threshold_not_recovered`, never `scientific_routing_uncertain`.
 
 - [ ] **Step 7: Run the focused historical-decoding/provider-schema regression**
 
