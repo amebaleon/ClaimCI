@@ -439,10 +439,16 @@ def _evidence_id(
         raise TypeError("adapter ID must be a non-empty string")
     if not isinstance(adapter_semantic_version, str) or not adapter_semantic_version:
         raise TypeError("adapter semantic version must be a non-empty string")
-    if type(getattr(artifact, "occurrence", None)) is not ArtifactOccurrence:
+    occurrence = getattr(artifact, "occurrence", None)
+    if type(occurrence) is not ArtifactOccurrence:
         raise TypeError(
             "evidence v2 identity requires a concrete ArtifactOccurrence"
         )
+    if getattr(artifact, "candidate", None) is not occurrence.candidate:
+        raise TypeError(
+            "evidence v2 identity requires the candidate bound to the occurrence"
+        )
+    candidate = occurrence.candidate
     material = {
         "schema_version": 2,
         "repository": {
@@ -454,10 +460,10 @@ def _evidence_id(
             "commit": str(artifact.occurrence.commit),
         },
         "artifact": {
-            "path": str(artifact.candidate.path),
-            "kind": artifact.candidate.kind.value,
-            "sha256": str(artifact.candidate.sha256),
-            "size": artifact.candidate.size,
+            "path": str(candidate.path),
+            "kind": candidate.kind.value,
+            "sha256": str(candidate.sha256),
+            "size": candidate.size,
         },
         "adapter": {"id": adapter_id, "version": adapter_semantic_version},
         "selector": list(canonical_selector_material(mappings)),

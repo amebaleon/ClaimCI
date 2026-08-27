@@ -334,6 +334,54 @@ def test_v2_identity_requires_a_concrete_factory_issued_occurrence() -> None:
         _evidence_id("claimci-json-v1", "", artifact, mappings)
 
 
+def test_v2_identity_rejects_candidate_not_bound_to_occurrence() -> None:
+    occurrence_artifact = _artifact(
+        b'{"metrics":{"accuracy":0.9},"run":"one"}',
+        path="results/occurrence-a.json",
+    )
+    unbound_candidate = _candidate(
+        b'{"metrics":{"accuracy":0.8},"run":"two"}',
+        path="results/candidate-b.json",
+    )
+
+    class MismatchedEnvelope:
+        occurrence = occurrence_artifact.occurrence
+        candidate = unbound_candidate
+
+    expected_if_unbound_candidate_were_hashed = _expected_v2(
+        {
+            "schema_version": 2,
+            "repository": {"owner": "claimci-tests", "name": "identity-v2"},
+            "snapshot": {"role": "head", "commit": "a" * 40},
+            "artifact": {
+                "path": "results/candidate-b.json",
+                "kind": "results",
+                "sha256": str(unbound_candidate.sha256),
+                "size": unbound_candidate.size,
+            },
+            "adapter": {"id": "claimci-json-v1", "version": "1"},
+            "selector": [],
+        }
+    )
+
+    try:
+        observed = _evidence_id(
+            "claimci-json-v1",
+            "1",
+            MismatchedEnvelope(),  # type: ignore[arg-type]
+            (),
+        )
+    except TypeError as error:
+        assert "candidate" in str(error)
+        return
+
+    assert observed == expected_if_unbound_candidate_were_hashed
+    pytest.fail(
+        "v2 identity accepted an unbound candidate; expected a TypeError "
+        f"(observed {observed})"
+    )
+
+
 def test_streaming_jsonl_uses_fixed_version_and_real_canonical_mappings(
     tmp_path: Path,
 ) -> None:
