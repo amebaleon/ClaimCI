@@ -304,14 +304,25 @@ def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
                 and type(canonical.primary) is MetricImprovementClaim
                 else None
             )
+            if primary is not None:
+                metric = primary.metric
+                direction = ClaimDirection(primary.direction.value)
+            elif canonical is not None:
+                metric = None
+                direction = ClaimDirection.NOT_APPLICABLE
+            elif matched.claim_type is ClaimType.METRIC_IMPROVEMENT:
+                continue
+            else:
+                metric = matched.metric
+                direction = matched.direction
             claims.append(
                 DiscoveredClaim(
                     reference=reference,
                     claim_type=matched.claim_type,
                     subject=matched.subject,
                     source=source,
-                    metric=matched.metric,
-                    direction=matched.direction,
+                    metric=metric,
+                    direction=direction,
                     baseline_value=(
                         _claimed_value(primary.baseline_value)
                         if primary is not None
@@ -383,22 +394,31 @@ def _provider_claims(
             provenance=provenance,
         )
         canonical = recover_scientific_claim(reference)
-        if claim.claim_type is ClaimType.METRIC_IMPROVEMENT and canonical is None:
-            raise DiscoveryError("provider claim source semantics are ambiguous")
         primary = (
             canonical.primary
             if canonical is not None
             and type(canonical.primary) is MetricImprovementClaim
             else None
         )
+        if claim.claim_type is ClaimType.METRIC_IMPROVEMENT and primary is None:
+            raise DiscoveryError("provider claim source semantics are ambiguous")
+        if primary is not None:
+            metric = primary.metric
+            direction = ClaimDirection(primary.direction.value)
+        elif canonical is not None:
+            metric = None
+            direction = ClaimDirection.NOT_APPLICABLE
+        else:
+            metric = claim.metric
+            direction = claim.direction
         discovered.append(
             DiscoveredClaim(
                 reference=reference,
                 claim_type=claim.claim_type,
                 subject=claim.subject,
                 source=claim.source,
-                metric=claim.metric,
-                direction=claim.direction,
+                metric=metric,
+                direction=direction,
                 baseline_value=(
                     _claimed_value(primary.baseline_value)
                     if primary is not None

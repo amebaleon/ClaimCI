@@ -38,6 +38,7 @@ from claimci.analysis.discovery.claims import _provider_claims, discover_claims
 from claimci.analysis.discovery.repository import collect_repository_context
 from claimci.models import Verdict
 from claimci.review import ProviderUsage, ReviewConfig
+from claimci.review.models import ClaimDirection
 from claimci.review.provider import ProviderResponse, StructuredRequest
 
 
@@ -112,6 +113,8 @@ def test_provider_projection_uses_canonical_subject_first_source_values(
     context = _provider_context(tmp_path, claim_text)
     source = context.source_bundle.sources[0]
     payload = _provider_claim_payload(source.source_id, claim_text)
+    payload["claims"][0]["metric"] = "loss"
+    payload["claims"][0]["direction"] = "lower"
 
     deterministic = discover_claims(context, limits=DiscoveryLimits())
     provider = _provider_claims(context, payload, DiscoveryLimits())
@@ -120,6 +123,8 @@ def test_provider_projection_uses_canonical_subject_first_source_values(
     assert provider[0].reference.text == claim_text
     assert provider[0].scientific_claim is not None
     assert type(provider[0].scientific_claim.primary) is MetricImprovementClaim
+    assert provider[0].metric == "accuracy"
+    assert provider[0].direction is ClaimDirection.HIGHER
     assert provider[0].baseline_value is not None
     assert deterministic[0].baseline_value is not None
     assert provider[0].baseline_value.value == deterministic[0].baseline_value.value
@@ -132,13 +137,31 @@ def test_provider_projection_uses_canonical_subject_first_source_values(
     assert deterministic[0].minimum_improvement is None
 
 
+@pytest.mark.parametrize(
+    "claim_text",
+    (
+        (
+            "candidate improves accuracy from 0.60 to 0.70 and loss from "
+            "0.40 to 0.30"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70; improved by at "
+            "least 0.05; improved by at least 0.06"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70; improved by at "
+            "least 0.05, minimum 0.06"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70; improved by at "
+            "least 0.05 and no less than 0.06"
+        ),
+    ),
+)
 def test_provider_projection_rejects_ambiguous_subject_first_metric_source(
     tmp_path: Path,
+    claim_text: str,
 ) -> None:
-    claim_text = (
-        "candidate improves accuracy from 0.60 to 0.70 and loss from "
-        "0.40 to 0.30"
-    )
     context = _provider_context(tmp_path, claim_text)
     source = context.source_bundle.sources[0]
 

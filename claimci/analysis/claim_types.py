@@ -451,9 +451,7 @@ def _recover_primary(
                     is _verb_direction(improvement.group("verb"))
                 ):
                     continuation_threshold = candidate
-                elif continuation.count(";") and len(
-                    tuple(_MINIMUM.finditer(continuation))
-                ) > 1:
+                elif len(tuple(_MINIMUM.finditer(continuation))) > 1:
                     return None
             tail = tail[: boundary.start()]
         pairs = tuple(_VALUE_PAIR.finditer(tail))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import FrozenInstanceError
 import hashlib
 from pathlib import Path
@@ -7,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from claimci.analysis import (
-    AbsoluteMetricClaim,
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
@@ -46,6 +46,7 @@ from claimci.analysis.discovery.claims import (
     as_scientific_claim,
     discover_claims,
 )
+import claimci.analysis.discovery.claims as discovery_claims
 from claimci.analysis.discovery.artifacts import discover_artifacts
 from claimci.analysis.discovery.mappings import resolve_mappings
 from claimci.models import Direction
@@ -573,6 +574,45 @@ def test_subject_first_discovery_projects_canonical_metric_values(tmp_path: Path
     assert result.claims[0].minimum_improvement is None
 
 
+def test_deterministic_projection_uses_final_canonical_metric_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = "candidate improves accuracy from 0.60 to 0.70"
+    original_recovery = discovery_claims.recover_scientific_claim
+
+    def recover(reference: ClaimReference):
+        recovered = original_recovery(reference)
+        if reference.claim_id == "claim-provisional" and recovered is not None:
+            forged_primary = dataclasses.replace(
+                recovered.primary,
+                metric="forged",
+                direction=Direction.LOWER,
+            )
+            return dataclasses.replace(recovered, primary=forged_primary)
+        return recovered
+
+    monkeypatch.setattr(discovery_claims, "recover_scientific_claim", recover)
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity("amebaleon", "final-projection-test"),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+        pr_description=claim_text,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].metric == "accuracy"
+    assert result.claims[0].direction is ClaimDirection.HIGHER
+    assert result.claims[0].baseline_value is not None
+    assert result.claims[0].baseline_value.value == 0.60
+    assert result.claims[0].candidate_value is not None
+    assert result.claims[0].candidate_value.value == 0.70
+    assert result.claims[0].minimum_improvement is None
+
+
 def test_held_out_metric_improvement_discovery_keeps_primary_and_constraint(
     tmp_path: Path,
 ) -> None:
@@ -820,18 +860,12 @@ def test_provider_claim_fields_cannot_retype_an_absolute_source_bound(
         },
     )
 
-    claims = discover_claims(
-        context,
-        provider_payload=payload,
-        limits=DiscoveryLimits(),
-    )
-
-    assert len(claims) == 1
-    assert claims[0].scientific_claim is not None
-    assert type(claims[0].scientific_claim.primary) is AbsoluteMetricClaim
-    assert claims[0].scientific_claim.primary.metric == "accuracy"
-    assert claims[0].scientific_claim.primary.bound.value == 0.90
-    assert claims[0].reference.provenance.kind is ProvenanceKind.DETERMINISTIC_DISCOVERY
+    with pytest.raises(DiscoveryError, match="provider"):
+        discover_claims(
+            context,
+            provider_payload=payload,
+            limits=DiscoveryLimits(),
+        )
 
 
 def test_discover_artifacts_ranks_obvious_evidence_without_manifest(tmp_path: Path) -> None:

@@ -185,7 +185,42 @@ def test_metric_compiler_recovers_only_source_bound_fields() -> None:
             0.70,
         ),
         (
+            "candidate raises accuracy from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
+            "candidate grows accuracy from 0.60 to 0.70",
+            "accuracy",
+            Direction.HIGHER,
+            0.60,
+            0.70,
+        ),
+        (
             "candidate reduces loss from 0.40 to 0.30",
+            "loss",
+            Direction.LOWER,
+            0.40,
+            0.30,
+        ),
+        (
+            "candidate decreases loss from 0.40 to 0.30",
+            "loss",
+            Direction.LOWER,
+            0.40,
+            0.30,
+        ),
+        (
+            "candidate lowers loss from 0.40 to 0.30",
+            "loss",
+            Direction.LOWER,
+            0.40,
+            0.30,
+        ),
+        (
+            "candidate drops loss from 0.40 to 0.30",
             "loss",
             Direction.LOWER,
             0.40,
@@ -266,12 +301,36 @@ def test_subject_first_does_not_derive_threshold_from_arithmetic() -> None:
             "least 0.05; improved by at least 0.06"
         ),
         (
+            "candidate improves accuracy from 0.60 to 0.70; improved by at "
+            "least 0.05, minimum 0.06"
+        ),
+        (
+            "candidate improves accuracy from 0.60 to 0.70; improved by at "
+            "least 0.05 and no less than 0.06"
+        ),
+        (
             "candidate says model improves accuracy from 0.60 to 0.70 while "
             "candidate reduces loss from 0.40 to 0.30"
         ),
     ),
 )
 def test_subject_first_rejects_ambiguous_metric_improvement(text: str) -> None:
+    assert recover_scientific_claim(_reference(text)) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "candidates improves accuracy from 0.60 to 0.70",
+        "candidate improve accuracy from 0.60 to 0.70",
+        "candidate improvesaccuracy from 0.60 to 0.70",
+        "candidate's improves accuracy from 0.60 to 0.70",
+        "system improves accuracy from 0.60 to 0.70",
+    ),
+)
+def test_subject_first_rejects_unapproved_subject_or_verb_boundaries(
+    text: str,
+) -> None:
     assert recover_scientific_claim(_reference(text)) is None
 
 
