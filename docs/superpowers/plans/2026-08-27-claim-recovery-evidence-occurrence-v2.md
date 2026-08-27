@@ -684,6 +684,29 @@ git commit -m "test: prove production smoke deterministic planning"
 
 If the RED test proves a planner edit is necessary, add that one path explicitly before committing. In all cases verify `git status --short` and `git diff --cached --name-status` so only intended files enter the commit.
 
+### Whole-branch review remediation: threshold locality
+
+**Files:**
+- Modify: `claimci/analysis/claim_types.py`
+- Test: `tests/test_claim_types_v0.py`
+
+- [x] Reproduce the review finding that an unsupported quantity such as `by at least 2 GPUs` or an arithmetic expression can be prefix-matched as a unitless scientific threshold.
+- [x] Add metric-first and subject-first RED coverage for unknown noun/unit suffixes, hyphen/slash/comma-number forms, arithmetic, zero values, and normalized whitespace.
+- [x] Require the canonical parser to validate the complete trailing threshold clause through a fixed bounded qualifier grammar; preserve direct inline, semicolon continuation, and held-out qualifier thresholds.
+- [x] Keep all handling inside `recover_scientific_claim()` and retain the prohibition on arithmetic threshold synthesis.
+- [x] Independently review the final remediation. Commits: `c376c01`, `5150239`. Final focused gate: 155 passed, 1 skipped; adversarial re-review approved.
+
+### Whole-branch review remediation: runtime occurrence revalidation
+
+**Files:**
+- Modify: `claimci/analysis/materialize.py`
+- Test: `tests/test_ephemeral_materialize_v03.py`
+
+- [x] Reproduce repository-A evidence being recaptured under repository B with identical path and bytes when ordinary passive fixed-adapter equality was conditional.
+- [x] Require every built-in `evidence-v2-*` passive non-dataset extraction to be freshly re-extracted from the runtime occurrence and compared exactly.
+- [x] Preserve the dedicated metric-binding, table, dataset, streaming, and profile checks and the bounded legacy/custom evidence path.
+- [x] Independently review the final remediation. Commit: `eff7847`. Focused gate: 59 passed, 2 skipped; re-review approved.
+
 ## Branch completion gate
 
 After all five tasks pass their independent reviews, the controller performs one whole-branch review, one scoped security review, and the single final Core verification pass. Only then may it push this feature branch and create one Draft PR. It must not merge or deploy the PR.
