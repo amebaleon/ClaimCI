@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from claimci.analysis import (
+    AbsoluteMetricClaim,
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
@@ -613,6 +614,67 @@ def test_deterministic_projection_uses_final_canonical_metric_fields(
     assert result.claims[0].minimum_improvement is None
 
 
+def test_deterministic_confidence_uses_final_canonical_value_presence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = "candidate improves accuracy from 0.60 to 0.70"
+    original_recovery = discovery_claims.recover_scientific_claim
+
+    def recover(reference: ClaimReference):
+        recovered = original_recovery(reference)
+        if reference.claim_id == "claim-provisional" and recovered is not None:
+            forged_primary = dataclasses.replace(
+                recovered.primary,
+                baseline_value=None,
+                candidate_value=None,
+                minimum_improvement=None,
+            )
+            return dataclasses.replace(recovered, primary=forged_primary)
+        return recovered
+
+    monkeypatch.setattr(discovery_claims, "recover_scientific_claim", recover)
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity("amebaleon", "final-confidence-test"),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+        pr_description=claim_text,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].reference.confidence == Confidence(0.95)
+    assert result.claims[0].baseline_value is not None
+    assert result.claims[0].candidate_value is not None
+
+
+def test_deterministic_projection_preserves_absolute_canonical_metric(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = "Candidate accuracy is at least 0.90."
+    (head / "README.md").write_text(claim_text, encoding="utf-8")
+
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity("amebaleon", "absolute-projection-test"),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].scientific_claim is not None
+    assert type(result.claims[0].scientific_claim.primary) is AbsoluteMetricClaim
+    assert result.claims[0].metric == "accuracy"
+    assert result.claims[0].direction is ClaimDirection.NOT_APPLICABLE
+    assert result.claims[0].baseline_value is None
+    assert result.claims[0].candidate_value is None
+    assert result.claims[0].minimum_improvement is None
+
+
 def test_held_out_metric_improvement_discovery_keeps_primary_and_constraint(
     tmp_path: Path,
 ) -> None:
@@ -866,6 +928,37 @@ def test_provider_claim_fields_cannot_retype_an_absolute_source_bound(
             provider_payload=payload,
             limits=DiscoveryLimits(),
         )
+
+
+def test_provider_projection_preserves_absolute_canonical_metric(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    source_text = "Candidate accuracy is at least 0.90."
+    (head / "README.md").write_text(source_text, encoding="utf-8")
+    context = collect_repository_context(head, limits=DiscoveryLimits())
+    source = context.source_bundle.sources[0]
+    payload = _provider_claim_payload(
+        source.source_id,
+        source_text=source_text,
+        extra={
+            "claim_type": "other_scientific",
+            "metric": "f1",
+            "direction": "lower",
+        },
+    )
+
+    claims = _provider_claims(context, payload, DiscoveryLimits())
+
+    assert len(claims) == 1
+    assert claims[0].scientific_claim is not None
+    assert type(claims[0].scientific_claim.primary) is AbsoluteMetricClaim
+    assert claims[0].metric == "accuracy"
+    assert claims[0].direction is ClaimDirection.NOT_APPLICABLE
+    assert claims[0].baseline_value is None
+    assert claims[0].candidate_value is None
+    assert claims[0].minimum_improvement is None
 
 
 def test_discover_artifacts_ranks_obvious_evidence_without_manifest(tmp_path: Path) -> None:

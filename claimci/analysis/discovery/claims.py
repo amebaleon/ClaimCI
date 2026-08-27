@@ -6,10 +6,12 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from claimci.analysis.confidence import Confidence
 from claimci.analysis.claim_types import (
+    AbsoluteMetricClaim,
+    CanonicalScientificClaim,
     ClaimQuantity,
     MetricImprovementClaim,
     PrimaryClaimKind,
@@ -171,26 +173,19 @@ def _canonical_fallback_match(
         return None
     primary = canonical.primary
     if primary.kind is PrimaryClaimKind.METRIC_IMPROVEMENT:
-        confidence = (
-            0.95
-            if primary.baseline_value is not None
-            else 0.90
-            if primary.minimum_improvement is not None
-            else 0.70
-        )
         return _ClaimMatch(
             ClaimType.METRIC_IMPROVEMENT,
             "candidate",
-            primary.metric,
-            ClaimDirection(primary.direction.value),
-            confidence,
+            None,
+            ClaimDirection.NOT_APPLICABLE,
+            0.70,
             "canonical_metric_improvement",
         )
     if primary.kind is PrimaryClaimKind.ABSOLUTE_METRIC:
         return _ClaimMatch(
             ClaimType.OTHER_SCIENTIFIC,
             "candidate",
-            primary.metric,
+            None,
             ClaimDirection.NOT_APPLICABLE,
             0.84,
             "absolute_metric",
@@ -214,6 +209,49 @@ def _canonical_fallback_match(
             "generic_quantitative",
         )
     return None
+
+
+def _canonical_confidence(canonical: CanonicalScientificClaim) -> Confidence:
+    primary = canonical.primary
+    if type(primary) is MetricImprovementClaim:
+        value = (
+            0.95
+            if primary.baseline_value is not None
+            else 0.90
+            if primary.minimum_improvement is not None
+            else 0.70
+        )
+    elif type(primary) is AbsoluteMetricClaim:
+        value = 0.84
+    elif primary.kind is PrimaryClaimKind.GENERALIZATION:
+        value = 0.74
+    else:
+        value = 0.72
+    return Confidence(value)
+
+
+def _recover_final_reference(
+    reference: ClaimReference,
+) -> tuple[ClaimReference, CanonicalScientificClaim | None]:
+    canonical = recover_scientific_claim(reference)
+    if canonical is None:
+        return reference, None
+    confidence = _canonical_confidence(canonical)
+    if confidence != reference.confidence:
+        reference = replace(reference, confidence=confidence)
+        canonical = recover_scientific_claim(reference)
+    return reference, canonical
+
+
+def _canonical_metric_projection(
+    canonical: CanonicalScientificClaim,
+) -> tuple[str | None, ClaimDirection]:
+    primary = canonical.primary
+    if type(primary) is MetricImprovementClaim:
+        return primary.metric, ClaimDirection(primary.direction.value)
+    if type(primary) is AbsoluteMetricClaim:
+        return primary.metric, ClaimDirection.NOT_APPLICABLE
+    return None, ClaimDirection.NOT_APPLICABLE
 
 
 def _provenance(
@@ -297,19 +335,15 @@ def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
                 confidence=Confidence(matched.confidence),
                 provenance=provenance,
             )
-            canonical = recover_scientific_claim(reference)
+            reference, canonical = _recover_final_reference(reference)
             primary = (
                 canonical.primary
                 if canonical is not None
                 and type(canonical.primary) is MetricImprovementClaim
                 else None
             )
-            if primary is not None:
-                metric = primary.metric
-                direction = ClaimDirection(primary.direction.value)
-            elif canonical is not None:
-                metric = None
-                direction = ClaimDirection.NOT_APPLICABLE
+            if canonical is not None:
+                metric, direction = _canonical_metric_projection(canonical)
             elif matched.claim_type is ClaimType.METRIC_IMPROVEMENT:
                 continue
             else:
@@ -402,12 +436,8 @@ def _provider_claims(
         )
         if claim.claim_type is ClaimType.METRIC_IMPROVEMENT and primary is None:
             raise DiscoveryError("provider claim source semantics are ambiguous")
-        if primary is not None:
-            metric = primary.metric
-            direction = ClaimDirection(primary.direction.value)
-        elif canonical is not None:
-            metric = None
-            direction = ClaimDirection.NOT_APPLICABLE
+        if canonical is not None:
+            metric, direction = _canonical_metric_projection(canonical)
         else:
             metric = claim.metric
             direction = claim.direction
