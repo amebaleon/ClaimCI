@@ -452,12 +452,12 @@ def _evidence_id(
     material = {
         "schema_version": 2,
         "repository": {
-            "owner": artifact.occurrence.repository.owner,
-            "name": artifact.occurrence.repository.name,
+            "owner": occurrence.repository.owner,
+            "name": occurrence.repository.name,
         },
         "snapshot": {
-            "role": artifact.occurrence.snapshot_role.value,
-            "commit": str(artifact.occurrence.commit),
+            "role": occurrence.snapshot_role.value,
+            "commit": str(occurrence.commit),
         },
         "artifact": {
             "path": str(candidate.path),

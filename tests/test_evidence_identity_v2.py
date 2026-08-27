@@ -382,6 +382,66 @@ def test_v2_identity_rejects_candidate_not_bound_to_occurrence() -> None:
     )
 
 
+def test_v2_identity_freezes_validated_occurrence_once() -> None:
+    occurrence_artifact = _artifact(
+        b'{"metrics":{"accuracy":0.9},"run":"one"}',
+        path="results/switch-a.json",
+    )
+    switched_artifact = _artifact(
+        b'{"metrics":{"accuracy":0.8},"run":"two"}',
+        path="results/switch-b.json",
+        repository=RepositoryIdentity("switch-owner", "switch-repo"),
+        snapshot_role=ArtifactSnapshotRole.BASE,
+        commit=GitCommitSha("c" * 40),
+    )
+
+    class SwitchingEnvelope:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def occurrence(self):
+            self.reads += 1
+            return (
+                occurrence_artifact.occurrence
+                if self.reads == 1
+                else switched_artifact.occurrence
+            )
+
+        @property
+        def candidate(self):
+            return occurrence_artifact.candidate
+
+    envelope = SwitchingEnvelope()
+    expected = _expected_v2(
+        {
+            "schema_version": 2,
+            "repository": {"owner": "claimci-tests", "name": "identity-v2"},
+            "snapshot": {"role": "head", "commit": "a" * 40},
+            "artifact": {
+                "path": "results/switch-a.json",
+                "kind": "results",
+                "sha256": str(occurrence_artifact.candidate.sha256),
+                "size": occurrence_artifact.candidate.size,
+            },
+            "adapter": {"id": "claimci-json-v1", "version": "1"},
+            "selector": [],
+        }
+    )
+
+    observed = _evidence_id(
+        "claimci-json-v1",
+        "1",
+        envelope,  # type: ignore[arg-type]
+        (),
+    )
+    assert envelope.reads == 1, (
+        f"switching occurrence read {envelope.reads} times; "
+        f"observed {observed}; expected {expected}"
+    )
+    assert observed == expected
+
+
 def test_streaming_jsonl_uses_fixed_version_and_real_canonical_mappings(
     tmp_path: Path,
 ) -> None:
