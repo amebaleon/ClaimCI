@@ -6,11 +6,17 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from claimci.analysis.confidence import Confidence
 from claimci.analysis.claim_types import (
+    AbsoluteMetricClaim,
+    CanonicalScientificClaim,
+    ClaimQuantity,
+    MetricImprovementClaim,
     PrimaryClaimKind,
+    _TrustedSourceDocument,
+    _issue_trusted_source_document,
     recover_scientific_claim,
 )
 from claimci.analysis.contracts import (
@@ -37,30 +43,6 @@ from .repository import RepositoryContext
 
 
 MAX_DISCOVERED_CLAIMS = 64
-_NUMBER = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
-_METRIC_PAIR = re.compile(
-    rf"\b(?P<metric>[A-Za-z][A-Za-z0-9_.-]{{0,63}})\s+"
-    rf"(?:score\s+)?(?:improved|increased|rose|grew)\s+"
-    rf"(?:from\s+)?(?P<baseline>{_NUMBER})\s*(?P<baseline_unit>%?)\s*"
-    rf"(?:->|→|to)\s*(?P<candidate>{_NUMBER})\s*(?P<candidate_unit>%?)",
-    flags=re.IGNORECASE,
-)
-_METRIC_VAGUE = re.compile(
-    r"\b(?P<metric>[A-Za-z][A-Za-z0-9_.-]{0,63})\s+"
-    r"(?:score\s+)?(?:improved|increased|rose|grew)\b",
-    flags=re.IGNORECASE,
-)
-_VALUE_PAIR = re.compile(
-    rf"(?P<baseline>{_NUMBER})\s*(?P<baseline_unit>%?)\s*"
-    rf"(?:->|→|to)\s*(?P<candidate>{_NUMBER})\s*(?P<candidate_unit>%?)",
-    flags=re.IGNORECASE,
-)
-_MINIMUM = re.compile(
-    rf"(?:improved|increased|rose|grew)\s+by\s+at\s+least\s+"
-    rf"(?P<value>{_NUMBER})"
-    rf"(?:\s*(?P<unit>%|percentage\s+points?|points?))?(?![A-Za-z])",
-    flags=re.IGNORECASE,
-)
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -74,40 +56,7 @@ class _ClaimMatch:
     pattern: str
 
 
-def _normalized_unit(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    normalized = _WHITESPACE.sub(" ", raw.strip().casefold())
-    if normalized.startswith("percentage point"):
-        return "percentage points"
-    if normalized.startswith("point"):
-        return "points"
-    return "%" if normalized == "%" else normalized
-
-
-def _explicit_pair(text: str, *, require_metric: bool) -> re.Match[str] | None:
-    return (_METRIC_PAIR if require_metric else _VALUE_PAIR).search(text)
-
-
-def _explicit_minimum(text: str) -> re.Match[str] | None:
-    return _MINIMUM.search(text)
-
-
 def _classify_line(text: str) -> _ClaimMatch | None:
-    metric = _METRIC_VAGUE.search(text)
-    if metric is not None:
-        explicit = _METRIC_PAIR.search(text)
-        threshold = _MINIMUM.search(text)
-        confidence = 0.95 if explicit is not None else 0.90 if threshold else 0.70
-        return _ClaimMatch(
-            claim_type=ClaimType.METRIC_IMPROVEMENT,
-            subject="candidate",
-            metric=metric.group("metric").casefold(),
-            direction=ClaimDirection.HIGHER,
-            confidence=confidence,
-            pattern="metric_explicit" if explicit else "metric_threshold" if threshold else "metric_vague",
-        )
-
     lowered = _WHITESPACE.sub(" ", text.casefold())
     if "compute" in lowered and any(
         term in lowered for term in ("equivalent", "equal", "same", "matching")
@@ -226,26 +175,19 @@ def _canonical_fallback_match(
         return None
     primary = canonical.primary
     if primary.kind is PrimaryClaimKind.METRIC_IMPROVEMENT:
-        confidence = (
-            0.95
-            if primary.baseline_value is not None
-            else 0.90
-            if primary.minimum_improvement is not None
-            else 0.70
-        )
         return _ClaimMatch(
             ClaimType.METRIC_IMPROVEMENT,
             "candidate",
-            primary.metric,
-            ClaimDirection(primary.direction.value),
-            confidence,
+            None,
+            ClaimDirection.NOT_APPLICABLE,
+            0.70,
             "canonical_metric_improvement",
         )
     if primary.kind is PrimaryClaimKind.ABSOLUTE_METRIC:
         return _ClaimMatch(
             ClaimType.OTHER_SCIENTIFIC,
             "candidate",
-            primary.metric,
+            None,
             ClaimDirection.NOT_APPLICABLE,
             0.84,
             "absolute_metric",
@@ -269,6 +211,60 @@ def _canonical_fallback_match(
             "generic_quantitative",
         )
     return None
+
+
+def _canonical_confidence(canonical: CanonicalScientificClaim) -> Confidence:
+    primary = canonical.primary
+    if type(primary) is MetricImprovementClaim:
+        value = (
+            0.95
+            if primary.baseline_value is not None
+            else 0.90
+            if primary.minimum_improvement is not None
+            else 0.70
+        )
+    elif type(primary) is AbsoluteMetricClaim:
+        value = 0.84
+    elif primary.kind is PrimaryClaimKind.GENERALIZATION:
+        value = 0.74
+    else:
+        value = 0.72
+    return Confidence(value)
+
+
+def _recover_final_reference(
+    reference: ClaimReference,
+    *,
+    trusted_source_document: _TrustedSourceDocument | None = None,
+    primary_span: tuple[int, int] | None = None,
+) -> tuple[ClaimReference, CanonicalScientificClaim | None]:
+    canonical = recover_scientific_claim(
+        reference,
+        trusted_source_document=trusted_source_document,
+        primary_span=primary_span,
+    )
+    if canonical is None:
+        return reference, None
+    confidence = _canonical_confidence(canonical)
+    if confidence != reference.confidence:
+        reference = replace(reference, confidence=confidence)
+        canonical = recover_scientific_claim(
+            reference,
+            trusted_source_document=trusted_source_document,
+            primary_span=primary_span,
+        )
+    return reference, canonical
+
+
+def _canonical_metric_projection(
+    canonical: CanonicalScientificClaim,
+) -> tuple[str | None, ClaimDirection]:
+    primary = canonical.primary
+    if type(primary) is MetricImprovementClaim:
+        return primary.metric, ClaimDirection(primary.direction.value)
+    if type(primary) is AbsoluteMetricClaim:
+        return primary.metric, ClaimDirection.NOT_APPLICABLE
+    return None, ClaimDirection.NOT_APPLICABLE
 
 
 def _provenance(
@@ -308,57 +304,56 @@ def _claim_id(
     return "claim-" + hashlib.sha256(material).hexdigest()[:16]
 
 
-def _claimed_values(
-    text: str,
-    provenance: FieldProvenance,
-    *,
-    require_metric: bool,
-) -> tuple[ClaimedValue | None, ClaimedValue | None, ClaimedValue | None]:
-    pair = _explicit_pair(text, require_metric=require_metric)
-    baseline = candidate = None
-    if pair is not None:
-        baseline = ClaimedValue(
-            float(pair.group("baseline")),
-            _normalized_unit(pair.group("baseline_unit")),
-            provenance,
+def _claimed_value(quantity: ClaimQuantity | None) -> ClaimedValue | None:
+    if quantity is None:
+        return None
+    return ClaimedValue(quantity.value, quantity.unit, quantity.provenance)
+
+
+def _source_lines(text: str) -> tuple[tuple[int, int, str], ...]:
+    """Return original source lines with the exact spans used for certification."""
+
+    lines: list[tuple[int, int, str]] = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        end = offset + len(raw_line)
+        line_end = (
+            end - 2
+            if raw_line.endswith("\r\n")
+            else end - 1
+            if raw_line.endswith(("\n", "\r"))
+            else end
         )
-        candidate = ClaimedValue(
-            float(pair.group("candidate")),
-            _normalized_unit(pair.group("candidate_unit")),
-            provenance,
-        )
-    threshold = _explicit_minimum(text)
-    minimum = None
-    if threshold is not None:
-        minimum = ClaimedValue(
-            float(threshold.group("value")),
-            _normalized_unit(threshold.group("unit")),
-            provenance,
-        )
-    return baseline, candidate, minimum
+        lines.append((offset, line_end, text[offset:line_end]))
+        offset = end
+    if offset < len(text):
+        lines.append((offset, len(text), text[offset:]))
+    return tuple(lines)
 
 
 def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
     claims: list[DiscoveredClaim] = []
     for record in context.source_bundle.sources:
-        lines = record.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        for line_number, source_text in enumerate(lines, start=1):
+        trusted_source_document = _issue_trusted_source_document(
+            source_id=record.source_id,
+            sha256=record.sha256,
+            text=record.text,
+        )
+        for line_number, (start, end, source_text) in enumerate(
+            _source_lines(record.text),
+            start=1,
+        ):
             if not source_text.strip():
                 continue
-            matched = _classify_line(source_text)
+            matched = _canonical_fallback_match(source_text, record)
             if matched is None:
-                matched = _canonical_fallback_match(source_text, record)
+                matched = _classify_line(source_text)
             if matched is None:
                 continue
             provenance = _provenance(
                 record,
                 kind=ProvenanceKind.DETERMINISTIC_DISCOVERY,
                 detail=f"deterministic claim pattern: {matched.pattern}",
-            )
-            baseline, candidate, minimum = _claimed_values(
-                source_text,
-                provenance,
-                require_metric=True,
             )
             claim_id = _claim_id(
                 kind=ProvenanceKind.DETERMINISTIC_DISCOVERY,
@@ -381,17 +376,48 @@ def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
                 confidence=Confidence(matched.confidence),
                 provenance=provenance,
             )
+            reference, canonical = _recover_final_reference(
+                reference,
+                trusted_source_document=trusted_source_document,
+                primary_span=(start, end),
+            )
+            primary = (
+                canonical.primary
+                if canonical is not None
+                and type(canonical.primary) is MetricImprovementClaim
+                else None
+            )
+            if canonical is not None:
+                metric, direction = _canonical_metric_projection(canonical)
+            elif matched.claim_type is ClaimType.METRIC_IMPROVEMENT:
+                continue
+            else:
+                metric = matched.metric
+                direction = matched.direction
             claims.append(
                 DiscoveredClaim(
                     reference=reference,
                     claim_type=matched.claim_type,
                     subject=matched.subject,
                     source=source,
-                    metric=matched.metric,
-                    direction=matched.direction,
-                    baseline_value=baseline,
-                    candidate_value=candidate,
-                    minimum_improvement=minimum,
+                    metric=metric,
+                    direction=direction,
+                    baseline_value=(
+                        _claimed_value(primary.baseline_value)
+                        if primary is not None
+                        else None
+                    ),
+                    candidate_value=(
+                        _claimed_value(primary.candidate_value)
+                        if primary is not None
+                        else None
+                    ),
+                    minimum_improvement=(
+                        _claimed_value(primary.minimum_improvement)
+                        if primary is not None
+                        else None
+                    ),
+                    scientific_claim=canonical,
                 )
             )
             if len(claims) >= MAX_DISCOVERED_CLAIMS:
@@ -438,11 +464,6 @@ def _provider_claims(
             kind=ProvenanceKind.PROVIDER_PROPOSAL,
             detail="validated provider claim proposal",
         )
-        baseline, candidate, minimum = _claimed_values(
-            claim.source_text,
-            provenance,
-            require_metric=False,
-        )
         reference = ClaimReference(
             claim_id=claim.claim_id,
             text=claim.source_text,
@@ -452,17 +473,43 @@ def _provider_claims(
             confidence=Confidence(claim.confidence),
             provenance=provenance,
         )
+        canonical = recover_scientific_claim(reference)
+        primary = (
+            canonical.primary
+            if canonical is not None
+            and type(canonical.primary) is MetricImprovementClaim
+            else None
+        )
+        if claim.claim_type is ClaimType.METRIC_IMPROVEMENT and primary is None:
+            raise DiscoveryError("provider claim source semantics are ambiguous")
+        if canonical is not None:
+            metric, direction = _canonical_metric_projection(canonical)
+        else:
+            metric = claim.metric
+            direction = claim.direction
         discovered.append(
             DiscoveredClaim(
                 reference=reference,
                 claim_type=claim.claim_type,
                 subject=claim.subject,
                 source=claim.source,
-                metric=claim.metric,
-                direction=claim.direction,
-                baseline_value=baseline,
-                candidate_value=candidate,
-                minimum_improvement=minimum,
+                metric=metric,
+                direction=direction,
+                baseline_value=(
+                    _claimed_value(primary.baseline_value)
+                    if primary is not None
+                    else None
+                ),
+                candidate_value=(
+                    _claimed_value(primary.candidate_value)
+                    if primary is not None
+                    else None
+                ),
+                minimum_improvement=(
+                    _claimed_value(primary.minimum_improvement)
+                    if primary is not None
+                    else None
+                ),
                 qualifiers=claim.qualifiers,
                 evidence_hints=tuple(hints),
             )

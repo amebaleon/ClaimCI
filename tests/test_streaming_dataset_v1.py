@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 import claimci.analysis.streaming_dataset as streaming_dataset
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     ArtifactCandidate,
     ArtifactKind,
@@ -31,6 +33,8 @@ from claimci.analysis.streaming_dataset import (
     DatasetScanAuditContext,
     stream_dataset_audit_context,
 )
+from claimci.analysis.adapters import extract_registered_source
+from claimci.analysis.adapters.dataset import PassiveJsonLinesDatasetAdapter
 from claimci.audit import audit_research
 from claimci.dataset_check import hash_sample
 from claimci.models import Impact, Verdict
@@ -73,6 +77,34 @@ def _sources(root: Path):
         "candidate_train": _source(root, "candidate/train.jsonl"),
         "candidate_eval": _source(root, "candidate/eval.jsonl"),
     }
+
+
+def test_passive_and_streaming_dataset_evidence_ids_have_exact_occurrence_parity(
+    tmp_path: Path,
+) -> None:
+    content = b'{"prompt":"a"}\n{"prompt":"b"}\n'
+    root = tmp_path / "dataset"
+    root.mkdir()
+    target = root / "train.jsonl"
+    target.write_bytes(content)
+    source = _source(root, "train.jsonl")
+    passive = passive_artifact(
+        source.candidate,
+        content,
+        repository=source.repository,
+        snapshot_role=source.snapshot_role,
+        commit=source.head_sha,
+    )
+    adapter = PassiveJsonLinesDatasetAdapter()
+    match = adapter.probe(passive)
+    streamed = extract_registered_source(source)
+
+    assert match is not None
+    assert streamed is not None
+    assert streamed.evidence is not None
+    passive_evidence = adapter.extract(passive, match)
+    assert passive_evidence.evidence_id.startswith("evidence-v2-")
+    assert streamed.evidence.evidence_id == passive_evidence.evidence_id
 
 
 def _write_rows(path: Path, rows: list[object], *, blank_lines: bool = False) -> None:

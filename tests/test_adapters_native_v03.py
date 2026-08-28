@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -42,7 +44,7 @@ def _passive(
     path: str,
     kind: ArtifactKind,
 ) -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=kind,
@@ -261,3 +263,26 @@ def test_native_adapters_return_none_for_non_native_shapes() -> None:
     assert NativeResultsAdapter().probe(generic_results) is None
     assert NativeConfigAdapter().probe(generic_config) is None
     assert NativeManifestAdapter().probe(wrong_manifest_name) is None
+
+
+def test_identical_native_configs_at_distinct_paths_have_distinct_v2_ids() -> None:
+    content = b"model: identical\nbatch_size: 8\nepochs: 4\ntraining_steps: 100\n"
+    adapter = NativeConfigAdapter()
+    baseline = _passive(content, path="baseline-config.yaml", kind=ArtifactKind.CONFIG)
+    candidate = _passive(content, path="candidate-config.yaml", kind=ArtifactKind.CONFIG)
+    baseline_match = adapter.probe(baseline)
+    candidate_match = adapter.probe(candidate)
+    reread = _passive(content, path="baseline-config.yaml", kind=ArtifactKind.CONFIG)
+    reread_match = adapter.probe(reread)
+
+    assert baseline_match is not None
+    assert candidate_match is not None
+    assert reread_match is not None
+    baseline_evidence = adapter.extract(baseline, baseline_match)
+    candidate_evidence = adapter.extract(candidate, candidate_match)
+    reread_evidence = adapter.extract(reread, reread_match)
+
+    assert baseline_evidence.evidence_id.startswith("evidence-v2-")
+    assert len(baseline_evidence.evidence_id) == 76
+    assert baseline_evidence.evidence_id != candidate_evidence.evidence_id
+    assert baseline_evidence.evidence_id == reread_evidence.evidence_id

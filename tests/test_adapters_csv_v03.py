@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -37,7 +39,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "adapters"
 
 
 def _passive(content: bytes, *, path: str = "results/runs.csv") -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=ArtifactKind.RESULTS,
@@ -92,6 +94,31 @@ def test_csv_probe_and_extract_unambiguous_seed_runs_in_source_order() -> None:
     assert all(item.experiment_role is ExperimentRole.UNSPECIFIED for item in observations)
     assert all(item.provenance.source_path == artifact.candidate.path for item in observations)
     assert all(artifact.candidate.sha256 in item.provenance.detail for item in observations)
+
+
+def test_csv_evidence_id_binds_full_non_table_selector_material() -> None:
+    artifact = _fixture("seed_runs.csv")
+    adapter = CsvAdapter()
+    match = adapter.probe(artifact)
+
+    assert match is not None
+    full = adapter.extract(artifact, match)
+    without_run_id = AdapterMatch(
+        adapter_id=match.adapter_id,
+        path=match.path,
+        confidence=match.confidence,
+        mappings=tuple(
+            mapping
+            for mapping in match.mappings
+            if mapping.target_field != "run_id"
+        ),
+        match_evidence=match.match_evidence,
+    )
+    reduced = adapter.extract(artifact, without_run_id)
+
+    assert full.evidence_id.startswith("evidence-v2-")
+    assert reduced.evidence_id.startswith("evidence-v2-")
+    assert full.evidence_id != reduced.evidence_id
 
 
 def test_ambiguous_csv_requires_exact_external_column_mapping() -> None:
@@ -262,4 +289,4 @@ def test_csv_rejects_unsupported_artifact_kind_without_parsing() -> None:
         relevant_claim_ids=(),
         provenance=FieldProvenance(ProvenanceKind.DETERMINISTIC_DISCOVERY, "dataset"),
     )
-    assert CsvAdapter().probe(PassiveArtifact(candidate, content)) is None
+    assert CsvAdapter().probe(passive_artifact(candidate, content)) is None

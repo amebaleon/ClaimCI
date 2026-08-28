@@ -155,6 +155,11 @@ class ArtifactKind(str, Enum):
     MANIFEST = "manifest"
 
 
+class ArtifactSnapshotRole(str, Enum):
+    HEAD = "head"
+    BASE = "base"
+
+
 class ExperimentRole(str, Enum):
     BASELINE = "baseline"
     CANDIDATE = "candidate"
@@ -462,23 +467,89 @@ class ArtifactCandidate:
             raise TypeError("artifact provenance must be FieldProvenance")
 
 
-@dataclass(frozen=True, slots=True)
-class PassiveArtifact:
+@dataclass(frozen=True, slots=True, init=False)
+class ArtifactOccurrence:
+    repository: RepositoryIdentity
+    snapshot_role: ArtifactSnapshotRole
+    commit: GitCommitSha
     candidate: ArtifactCandidate
+
+    def __init__(self) -> None:
+        raise TypeError(
+            "ArtifactOccurrence values require the trusted snapshot factory"
+        )
+
+    @classmethod
+    def _from_snapshot(
+        cls,
+        repository: RepositoryIdentity,
+        snapshot_role: ArtifactSnapshotRole,
+        commit: GitCommitSha,
+        candidate: ArtifactCandidate,
+    ) -> ArtifactOccurrence:
+        if type(repository) is not RepositoryIdentity:
+            raise TypeError("artifact occurrence repository must be RepositoryIdentity")
+        if type(snapshot_role) is not ArtifactSnapshotRole:
+            raise TypeError(
+                "artifact occurrence snapshot_role must be ArtifactSnapshotRole"
+            )
+        if type(commit) is not GitCommitSha:
+            raise TypeError("artifact occurrence commit must be GitCommitSha")
+        if type(candidate) is not ArtifactCandidate:
+            raise TypeError("artifact occurrence candidate must be ArtifactCandidate")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "repository", repository)
+        object.__setattr__(instance, "snapshot_role", snapshot_role)
+        object.__setattr__(instance, "commit", commit)
+        object.__setattr__(instance, "candidate", candidate)
+        return instance
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PassiveArtifact:
+    occurrence: ArtifactOccurrence
     content: bytes
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.candidate, ArtifactCandidate):
-            raise TypeError("passive artifact candidate must be ArtifactCandidate")
-        if not isinstance(self.content, bytes):
+    def __init__(self) -> None:
+        raise TypeError("PassiveArtifact values require the trusted snapshot factory")
+
+    @classmethod
+    def _from_snapshot(
+        cls,
+        occurrence: ArtifactOccurrence,
+        content: bytes,
+    ) -> PassiveArtifact:
+        if type(occurrence) is not ArtifactOccurrence:
+            raise TypeError("passive artifact occurrence must be ArtifactOccurrence")
+        if not isinstance(content, bytes):
             raise TypeError("passive artifact content must be immutable bytes")
-        if len(self.content) != self.candidate.size:
+        if len(content) != occurrence.candidate.size:
             raise AnalysisContractError("passive artifact size does not match candidate")
-        digest = hashlib.sha256(self.content).hexdigest()
-        if digest != self.candidate.sha256:
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != occurrence.candidate.sha256:
             raise AnalysisContractError(
                 "passive artifact sha256 digest does not match candidate"
             )
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "occurrence", occurrence)
+        object.__setattr__(instance, "content", content)
+        return instance
+
+    @property
+    def repository(self) -> RepositoryIdentity:
+        return self.occurrence.repository
+
+    @property
+    def snapshot_role(self) -> ArtifactSnapshotRole:
+        return self.occurrence.snapshot_role
+
+    @property
+    def commit(self) -> GitCommitSha:
+        return self.occurrence.commit
+
+    @property
+    def candidate(self) -> ArtifactCandidate:
+        return self.occurrence.candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +586,11 @@ class AdapterMatch:
 
 class Adapter(Protocol):
     """A deterministic parser of validated passive artifact bytes."""
+
+    @property
+    def semantic_version(self) -> str:
+        """Trusted adapter semantic version used in evidence identity."""
+        ...
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         ...
@@ -1040,6 +1116,50 @@ class RepositoryIdentity:
     @property
     def full_name(self) -> str:
         return f"{self.owner}/{self.name}"
+
+
+def artifact_occurrence_from_snapshot(
+    repository: RepositoryIdentity,
+    snapshot_role: ArtifactSnapshotRole,
+    commit: GitCommitSha,
+    candidate: ArtifactCandidate,
+) -> ArtifactOccurrence:
+    """Issue one immutable occurrence from trusted snapshot identity inputs."""
+
+    if type(repository) is not RepositoryIdentity:
+        raise TypeError("artifact occurrence repository must be RepositoryIdentity")
+    if type(snapshot_role) is not ArtifactSnapshotRole:
+        raise TypeError(
+            "artifact occurrence snapshot_role must be ArtifactSnapshotRole"
+        )
+    if type(commit) is not GitCommitSha:
+        raise TypeError("artifact occurrence commit must be GitCommitSha")
+    if type(candidate) is not ArtifactCandidate:
+        raise TypeError("artifact occurrence candidate must be ArtifactCandidate")
+    return ArtifactOccurrence._from_snapshot(
+        repository,
+        snapshot_role,
+        commit,
+        candidate,
+    )
+
+
+def passive_artifact_from_snapshot(
+    repository: RepositoryIdentity,
+    snapshot_role: ArtifactSnapshotRole,
+    commit: GitCommitSha,
+    candidate: ArtifactCandidate,
+    content: bytes,
+) -> PassiveArtifact:
+    """Issue one immutable passive artifact from trusted snapshot inputs."""
+
+    occurrence = artifact_occurrence_from_snapshot(
+        repository,
+        snapshot_role,
+        commit,
+        candidate,
+    )
+    return PassiveArtifact._from_snapshot(occurrence, content)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -1852,6 +1972,15 @@ def to_jsonable(value: object) -> object:
         from .trace import trace_to_jsonable
 
         return trace_to_jsonable(value)
+    if (
+        type(value).__module__ == "claimci.analysis.claim_types"
+        and type(value).__name__ == "CanonicalScientificClaim"
+    ):
+        return {
+            "reference": to_jsonable(value.reference),
+            "primary": to_jsonable(value.primary),
+            "constraints": to_jsonable(value.constraints),
+        }
     if type(value) is NormalizedEvidence:
         serialized = {
             "evidence_id": to_jsonable(value.evidence_id),

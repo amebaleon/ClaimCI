@@ -8,6 +8,8 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -67,7 +69,7 @@ def _passive(
             "fixture",
         ),
     )
-    return PassiveArtifact(candidate, content)
+    return passive_artifact(candidate, content)
 
 
 def test_integrity_is_recomputed_immediately_before_extraction() -> None:

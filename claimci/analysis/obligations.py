@@ -370,7 +370,14 @@ def claim_field_support(
     if type(field) is not ClaimFieldKind:
         raise TypeError("claim field support requires ClaimFieldKind")
     target = ClaimFieldTarget(field, constraint_kind)
-    recovered = recover_scientific_claim(claim.reference)
+    binding = claim._source_binding
+    recovered = recover_scientific_claim(
+        claim.reference,
+        trusted_source_document=None if binding is None else binding.document,
+        primary_span=None
+        if binding is None
+        else (binding.primary_start, binding.primary_end),
+    )
     if recovered != claim:
         raise AnalysisContractError(
             "canonical claim does not match independent source recovery"

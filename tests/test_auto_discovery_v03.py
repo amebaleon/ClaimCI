@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import FrozenInstanceError
 import hashlib
 from pathlib import Path
@@ -41,7 +42,12 @@ from claimci.analysis.discovery.repository import (
     inspect_artifact,
     read_artifact_text,
 )
-from claimci.analysis.discovery.claims import as_scientific_claim, discover_claims
+from claimci.analysis.discovery.claims import (
+    _provider_claims,
+    as_scientific_claim,
+    discover_claims,
+)
+import claimci.analysis.discovery.claims as discovery_claims
 from claimci.analysis.discovery.artifacts import discover_artifacts
 from claimci.analysis.discovery.mappings import resolve_mappings
 from claimci.models import Direction
@@ -536,6 +542,139 @@ def test_metric_claim_captures_unitless_explicit_absolute_threshold(
     assert claims[0].minimum_improvement.unit is None
 
 
+def test_subject_first_discovery_projects_canonical_metric_values(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = (
+        "The candidate improves accuracy from 0.60 to 0.70 under the same "
+        "configuration and evaluation dataset."
+    )
+
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity(
+            "amebaleon",
+            "claimci-production-smoke-fixture",
+        ),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+        pr_title="Production smoke: verify supported result",
+        pr_description=claim_text,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].reference.text == claim_text
+    assert result.claims[0].scientific_claim is not None
+    assert type(result.claims[0].scientific_claim.primary) is MetricImprovementClaim
+    assert result.claims[0].metric == "accuracy"
+    assert result.claims[0].direction is ClaimDirection.HIGHER
+    assert result.claims[0].baseline_value is not None
+    assert result.claims[0].baseline_value.value == 0.60
+    assert result.claims[0].candidate_value is not None
+    assert result.claims[0].candidate_value.value == 0.70
+    assert result.claims[0].minimum_improvement is None
+
+
+def test_deterministic_projection_uses_final_canonical_metric_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = "candidate improves accuracy from 0.60 to 0.70"
+    original_recovery = discovery_claims.recover_scientific_claim
+
+    def recover(reference: ClaimReference, **kwargs: object):
+        recovered = original_recovery(reference, **kwargs)
+        if reference.claim_id == "claim-provisional" and recovered is not None:
+            forged_primary = dataclasses.replace(
+                recovered.primary,
+                metric="forged",
+                direction=Direction.LOWER,
+            )
+            return dataclasses.replace(recovered, primary=forged_primary)
+        return recovered
+
+    monkeypatch.setattr(discovery_claims, "recover_scientific_claim", recover)
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity("amebaleon", "final-projection-test"),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+        pr_description=claim_text,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].metric == "accuracy"
+    assert result.claims[0].direction is ClaimDirection.HIGHER
+    assert result.claims[0].baseline_value is not None
+    assert result.claims[0].baseline_value.value == 0.60
+    assert result.claims[0].candidate_value is not None
+    assert result.claims[0].candidate_value.value == 0.70
+    assert result.claims[0].minimum_improvement is None
+
+
+def test_deterministic_confidence_uses_final_canonical_value_presence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = "candidate improves accuracy from 0.60 to 0.70"
+    original_recovery = discovery_claims.recover_scientific_claim
+
+    def recover(reference: ClaimReference, **kwargs: object):
+        recovered = original_recovery(reference, **kwargs)
+        if reference.claim_id == "claim-provisional" and recovered is not None:
+            forged_primary = dataclasses.replace(
+                recovered.primary,
+                baseline_value=None,
+                candidate_value=None,
+                minimum_improvement=None,
+            )
+            return dataclasses.replace(recovered, primary=forged_primary)
+        return recovered
+
+    monkeypatch.setattr(discovery_claims, "recover_scientific_claim", recover)
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity("amebaleon", "final-confidence-test"),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+        pr_description=claim_text,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].reference.confidence == Confidence(0.95)
+    assert result.claims[0].baseline_value is not None
+    assert result.claims[0].candidate_value is not None
+
+
+def test_deterministic_projection_preserves_absolute_canonical_metric(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    claim_text = "Candidate accuracy is at least 0.90."
+    (head / "README.md").write_text(claim_text, encoding="utf-8")
+
+    result = discover_repository(
+        head,
+        repository=RepositoryIdentity("amebaleon", "absolute-projection-test"),
+        head_sha=GitCommitSha("d" * 40),
+        pr_number=1,
+    )
+
+    assert len(result.claims) == 1
+    assert result.claims[0].scientific_claim is not None
+    assert type(result.claims[0].scientific_claim.primary) is AbsoluteMetricClaim
+    assert result.claims[0].metric == "accuracy"
+    assert result.claims[0].direction is ClaimDirection.NOT_APPLICABLE
+    assert result.claims[0].baseline_value is None
+    assert result.claims[0].candidate_value is None
+    assert result.claims[0].minimum_improvement is None
+
+
 def test_held_out_metric_improvement_discovery_keeps_primary_and_constraint(
     tmp_path: Path,
 ) -> None:
@@ -688,7 +827,7 @@ def _provider_claim_payload(
 def test_provider_claims_require_trusted_quotes_and_indexed_hints(tmp_path: Path) -> None:
     head = tmp_path / "head"
     head.mkdir()
-    source_text = "Reported accuracy values are 71 to 79."
+    source_text = "Candidate improves accuracy from 71 to 79."
     (head / "README.md").write_text(source_text, encoding="utf-8")
     (head / "results.json").write_text("{}\n", encoding="utf-8")
     context = collect_repository_context(head, limits=DiscoveryLimits())
@@ -699,10 +838,10 @@ def test_provider_claims_require_trusted_quotes_and_indexed_hints(tmp_path: Path
         evidence_hints=["results.json"],
     )
 
-    claims = discover_claims(
+    claims = _provider_claims(
         context,
-        provider_payload=payload,
-        limits=DiscoveryLimits(),
+        payload,
+        DiscoveryLimits(),
     )
 
     assert len(claims) == 1
@@ -720,10 +859,10 @@ def test_provider_claims_require_trusted_quotes_and_indexed_hints(tmp_path: Path
         evidence_hints=["../outside.json"],
     )
     with pytest.raises(DiscoveryError, match="provider"):
-        discover_claims(
+        _provider_claims(
             context,
-            provider_payload=unsafe,
-            limits=DiscoveryLimits(),
+            unsafe,
+            DiscoveryLimits(),
         )
 
 
@@ -783,18 +922,43 @@ def test_provider_claim_fields_cannot_retype_an_absolute_source_bound(
         },
     )
 
-    claims = discover_claims(
-        context,
-        provider_payload=payload,
-        limits=DiscoveryLimits(),
+    with pytest.raises(DiscoveryError, match="provider"):
+        discover_claims(
+            context,
+            provider_payload=payload,
+            limits=DiscoveryLimits(),
+        )
+
+
+def test_provider_projection_preserves_absolute_canonical_metric(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    head.mkdir()
+    source_text = "Candidate accuracy is at least 0.90."
+    (head / "README.md").write_text(source_text, encoding="utf-8")
+    context = collect_repository_context(head, limits=DiscoveryLimits())
+    source = context.source_bundle.sources[0]
+    payload = _provider_claim_payload(
+        source.source_id,
+        source_text=source_text,
+        extra={
+            "claim_type": "other_scientific",
+            "metric": "f1",
+            "direction": "lower",
+        },
     )
+
+    claims = _provider_claims(context, payload, DiscoveryLimits())
 
     assert len(claims) == 1
     assert claims[0].scientific_claim is not None
     assert type(claims[0].scientific_claim.primary) is AbsoluteMetricClaim
-    assert claims[0].scientific_claim.primary.metric == "accuracy"
-    assert claims[0].scientific_claim.primary.bound.value == 0.90
-    assert claims[0].reference.provenance.kind is ProvenanceKind.DETERMINISTIC_DISCOVERY
+    assert claims[0].metric == "accuracy"
+    assert claims[0].direction is ClaimDirection.NOT_APPLICABLE
+    assert claims[0].baseline_value is None
+    assert claims[0].candidate_value is None
+    assert claims[0].minimum_improvement is None
 
 
 def test_discover_artifacts_ranks_obvious_evidence_without_manifest(tmp_path: Path) -> None:
@@ -1390,6 +1554,43 @@ def test_provider_mapping_rejects_unsafe_selectors_and_authority_fields(
         )
 
 
+@pytest.mark.parametrize("location", ("mapping", "binding"))
+@pytest.mark.parametrize("field", ("occurrence", "repository", "snapshot_role", "commit"))
+def test_provider_mapping_schema_rejects_occurrence_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+    field: str,
+) -> None:
+    _, claims, discovered = _mapping_fixture(
+        tmp_path,
+        ("results/candidate_results.json",),
+    )
+    payload = _provider_mapping_payload("results/candidate_results.json")
+    target = (
+        payload["mappings"][0]
+        if location == "mapping"
+        else payload["mappings"][0]["bindings"][0]
+    )
+    target[field] = "hostile provider scope"
+
+    import claimci.analysis.contracts as contracts
+
+    def forbidden_factory(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("provider data must not issue an artifact occurrence")
+
+    monkeypatch.setattr(contracts, "artifact_occurrence_from_snapshot", forbidden_factory)
+    with pytest.raises(DiscoveryError, match="provider"):
+        resolve_mappings(
+            discovered.artifacts,
+            claims,
+            (),
+            repository=REPOSITORY,
+            provider_payload=payload,
+            limits=DiscoveryLimits(),
+        )
+
+
 def test_discover_repository_runs_zero_config_pipeline_without_manifest(
     tmp_path: Path,
 ) -> None:
@@ -1481,7 +1682,7 @@ def test_discovery_preserves_existing_review_source_claim_and_evidence_behavior(
 ) -> None:
     head = tmp_path / "head"
     head.mkdir()
-    source_text = "Reported accuracy values are 71 to 79."
+    source_text = "Candidate improves accuracy from 71 to 79."
     (head / "README.md").write_text(source_text, encoding="utf-8")
     (head / "results.json").write_text("{}\n", encoding="utf-8")
     before_sources = collect_review_sources(head)

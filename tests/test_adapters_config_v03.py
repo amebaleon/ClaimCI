@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -41,7 +43,7 @@ def _passive(
     path: str,
     kind: ArtifactKind = ArtifactKind.CONFIG,
 ) -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=kind,
@@ -240,3 +242,28 @@ def test_config_adapters_accept_only_config_kind_and_matching_suffix() -> None:
     toml = _passive(b"value=1\n", path="config.txt")
     assert YamlConfigAdapter().probe(yaml) is None
     assert TomlConfigAdapter().probe(toml) is None
+
+
+def test_identical_yaml_configs_at_distinct_paths_have_distinct_v2_ids() -> None:
+    content = b"model:\n  name: identical\n"
+    adapter = YamlConfigAdapter()
+    baseline = _passive(content, path="baseline-config.yaml")
+    candidate = _passive(content, path="candidate-config.yaml")
+    baseline_match = adapter.probe(baseline)
+    candidate_match = adapter.probe(candidate)
+    reread_match = adapter.probe(_passive(content, path="baseline-config.yaml"))
+
+    assert baseline_match is not None
+    assert candidate_match is not None
+    assert reread_match is not None
+    baseline_evidence = adapter.extract(baseline, baseline_match)
+    candidate_evidence = adapter.extract(candidate, candidate_match)
+    reread_evidence = adapter.extract(
+        _passive(content, path="baseline-config.yaml"),
+        reread_match,
+    )
+
+    assert baseline_evidence.evidence_id.startswith("evidence-v2-")
+    assert len(baseline_evidence.evidence_id) == 76
+    assert baseline_evidence.evidence_id != candidate_evidence.evidence_id
+    assert baseline_evidence.evidence_id == reread_evidence.evidence_id

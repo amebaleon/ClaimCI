@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -35,6 +37,8 @@ from claimci.analysis import (
     resolve_metric_binding,
 )
 from claimci.analysis.adapters import (
+    CsvAdapter,
+    TsvAdapter,
     scan_delimited_observations,
     scan_delimited_schema,
 )
@@ -146,11 +150,84 @@ def test_stream_and_bytes_table_candidates_have_exact_identity_parity(
         role=ExperimentRole.BASELINE,
     )
     bounded = extract_metric_candidates(
-        PassiveArtifact(source.candidate, content),
+        passive_artifact(source.candidate, content),
         role=ExperimentRole.BASELINE,
     )
 
     assert streamed.candidates == bounded
+
+
+@pytest.mark.parametrize(("suffix", "delimiter"), [("csv", ","), ("tsv", "\t")])
+def test_passive_and_streaming_table_evidence_ids_share_one_v2_selector_identity(
+    tmp_path: Path,
+    suffix: str,
+    delimiter: str,
+) -> None:
+    content = (
+        f"role{delimiter}run{delimiter}seed{delimiter}acc\n"
+        f"baseline{delimiter}baseline-run{delimiter}1{delimiter}0.70\n"
+        f"candidate{delimiter}candidate-run{delimiter}2{delimiter}0.80\n"
+    ).encode()
+    source = _source(tmp_path, content, suffix)
+    passive = passive_artifact(
+        source.candidate,
+        content,
+        repository=source.repository,
+        snapshot_role=source.snapshot_role,
+        commit=source.head_sha,
+    )
+    adapter = CsvAdapter() if suffix == "csv" else TsvAdapter()
+    adapter_id = adapter.adapter_id
+
+    def match_for(role: str) -> AdapterMatch:
+        provenance = FieldProvenance(
+            ProvenanceKind.PROVIDER_PROPOSAL,
+            f"shared table selector; sha256={source.candidate.sha256}",
+            source.candidate.path,
+            f"fixture:table:{role}",
+        )
+        return AdapterMatch(
+            adapter_id,
+            source.candidate.path,
+            Confidence(0.95),
+            (
+                FieldMapping(
+                    "metric_value",
+                    TableSelector(
+                        "acc",
+                        (TablePredicate("role", TableScalarType.STRING, role),),
+                        1,
+                        provenance,
+                    ),
+                    provenance,
+                ),
+                FieldMapping(
+                    "run_id",
+                    EvidenceSelector(SelectorKind.COLUMN, "run", provenance),
+                    provenance,
+                ),
+                FieldMapping(
+                    "seed",
+                    EvidenceSelector(SelectorKind.COLUMN, "seed", provenance),
+                    provenance,
+                ),
+            ),
+            (provenance,),
+        )
+
+    baseline_match = match_for("baseline")
+    candidate_match = match_for("candidate")
+    baseline = adapter.extract(passive, baseline_match)
+    candidate = adapter.extract(passive, candidate_match)
+    streamed = scan_delimited_observations(source, candidate_match)
+
+    assert baseline.evidence_id.startswith("evidence-v2-")
+    assert candidate.evidence_id.startswith("evidence-v2-")
+    assert baseline.evidence_id != candidate.evidence_id
+    assert streamed.evidence is not None
+    assert streamed.completeness.state is ScanState.COMPLETE
+    assert streamed.evidence.evidence_id == candidate.evidence_id
+    assert streamed.evidence.scan_completeness == streamed.completeness
 
 
 def test_table_selector_requires_complete_exact_cardinality(tmp_path: Path) -> None:

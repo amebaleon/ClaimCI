@@ -10,6 +10,7 @@ from claimci.analysis import (
     AnalysisContractError,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     Confidence,
     FieldProvenance,
     GitCommitSha,
@@ -99,6 +100,59 @@ def test_trusted_source_is_factory_only_and_verifies_incremental_integrity(
     assert report.integrity_bytes == len(content)
     assert report.expected_bytes == len(content)
     assert scan.maximum_read_request == 64 * 1024
+
+
+def test_source_occurrence_explicitly_distinguishes_base_and_head(
+    tmp_path: Path,
+) -> None:
+    content = b'{"run":1,"acc":0.9}\n'
+    target = tmp_path / "results" / "eval.jsonl"
+    target.parent.mkdir()
+    target.write_bytes(content)
+    candidate = _candidate(content)
+
+    default_head = artifact_source_from_snapshot(
+        REPOSITORY,
+        HEAD,
+        tmp_path,
+        candidate,
+    )
+    explicit_head = artifact_source_from_snapshot(
+        REPOSITORY,
+        HEAD,
+        tmp_path,
+        candidate,
+        snapshot_role=ArtifactSnapshotRole.HEAD,
+    )
+    base = artifact_source_from_snapshot(
+        REPOSITORY,
+        HEAD,
+        tmp_path,
+        candidate,
+        snapshot_role=ArtifactSnapshotRole.BASE,
+    )
+
+    assert default_head.snapshot_role is ArtifactSnapshotRole.HEAD
+    assert explicit_head.occurrence == default_head.occurrence
+    assert base.occurrence != default_head.occurrence
+    assert default_head.repository == REPOSITORY
+    assert default_head.head_sha == HEAD
+    assert default_head.candidate == candidate
+
+
+def test_source_factory_rejects_raw_commit_text(tmp_path: Path) -> None:
+    content = b'{"run":1,"acc":0.9}\n'
+    target = tmp_path / "results" / "eval.jsonl"
+    target.parent.mkdir()
+    target.write_bytes(content)
+
+    with pytest.raises(TypeError, match="GitCommitSha"):
+        artifact_source_from_snapshot(
+            REPOSITORY,
+            "3" * 40,  # type: ignore[arg-type]
+            tmp_path,
+            _candidate(content),
+        )
 
 
 def test_confined_inspection_hashes_large_file_without_returning_content(

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     Adapter,
     AdapterMatch,
@@ -22,6 +24,8 @@ from claimci.analysis import (
     ArtifactCandidate,
     ArtifactBinding,
     ArtifactKind,
+    ArtifactOccurrence,
+    ArtifactSnapshotRole,
     AuditClaimSpec,
     ClaimReference,
     ComputeEvidence,
@@ -50,6 +54,8 @@ from claimci.analysis import (
     SelectorKind,
     Sha256Digest,
     UnifiedAnalysisResult,
+    artifact_occurrence_from_snapshot,
+    passive_artifact_from_snapshot,
     to_jsonable,
 )
 from claimci.models import AuditResult, Direction, Finding, Impact, Severity, Verdict
@@ -367,7 +373,7 @@ def test_artifact_candidate_rejects_invalid_contract_fields(
 
 
 def test_passive_artifact_verifies_bytes_without_execution_surface() -> None:
-    artifact = PassiveArtifact(_candidate(), RAW_RESULTS)
+    artifact = passive_artifact(_candidate(), RAW_RESULTS)
 
     assert artifact.content is RAW_RESULTS
     assert not hasattr(artifact, "execute")
@@ -376,13 +382,89 @@ def test_passive_artifact_verifies_bytes_without_execution_surface() -> None:
         artifact.content = b"changed"  # type: ignore[misc]
 
 
+def test_artifact_occurrence_requires_trusted_factory() -> None:
+    with pytest.raises(TypeError, match="trusted snapshot factory"):
+        ArtifactOccurrence()
+
+
+def test_artifact_occurrence_factory_binds_exact_snapshot_scope() -> None:
+    repository = RepositoryIdentity("owner", "repo")
+    head = artifact_occurrence_from_snapshot(
+        repository,
+        ArtifactSnapshotRole.HEAD,
+        GitCommitSha("a" * 40),
+        _candidate(),
+    )
+    base = artifact_occurrence_from_snapshot(
+        repository,
+        ArtifactSnapshotRole.BASE,
+        GitCommitSha("a" * 40),
+        _candidate(),
+    )
+    different_commit = artifact_occurrence_from_snapshot(
+        repository,
+        ArtifactSnapshotRole.HEAD,
+        GitCommitSha("b" * 40),
+        _candidate(),
+    )
+
+    assert head.repository == repository
+    assert head.snapshot_role is ArtifactSnapshotRole.HEAD
+    assert head.commit == GitCommitSha("a" * 40)
+    assert head.candidate == _candidate()
+    assert head != base
+    assert head != different_commit
+
+
+def test_artifact_occurrence_factory_rejects_raw_commit_text() -> None:
+    with pytest.raises(TypeError, match="GitCommitSha"):
+        artifact_occurrence_from_snapshot(
+            RepositoryIdentity("owner", "repo"),
+            ArtifactSnapshotRole.HEAD,
+            "a" * 40,  # type: ignore[arg-type]
+            _candidate(),
+        )
+
+
+def test_passive_artifact_carries_factory_issued_occurrence() -> None:
+    artifact = passive_artifact_from_snapshot(
+        RepositoryIdentity("owner", "repo"),
+        ArtifactSnapshotRole.HEAD,
+        GitCommitSha("a" * 40),
+        _candidate(),
+        RAW_RESULTS,
+    )
+
+    assert artifact.repository == RepositoryIdentity("owner", "repo")
+    assert artifact.snapshot_role is ArtifactSnapshotRole.HEAD
+    assert artifact.commit == GitCommitSha("a" * 40)
+    assert artifact.candidate == _candidate()
+
+
+def test_passive_artifact_factory_rejects_raw_commit_text() -> None:
+    with pytest.raises(TypeError, match="GitCommitSha"):
+        passive_artifact_from_snapshot(
+            RepositoryIdentity("owner", "repo"),
+            ArtifactSnapshotRole.HEAD,
+            "a" * 40,  # type: ignore[arg-type]
+            _candidate(),
+            RAW_RESULTS,
+        )
+
+
 def test_passive_artifact_rejects_wrong_size_digest_and_mutable_content() -> None:
     with pytest.raises((TypeError, ValueError), match="size"):
-        PassiveArtifact(_candidate(size=1), RAW_RESULTS)
+        passive_artifact(_candidate(size=1), RAW_RESULTS)
     with pytest.raises((TypeError, ValueError), match="sha256|digest"):
-        PassiveArtifact(_candidate(sha256=Sha256Digest("b" * 64)), RAW_RESULTS)
+        passive_artifact(
+            _candidate(sha256=Sha256Digest("b" * 64)),
+            RAW_RESULTS,
+        )
     with pytest.raises((TypeError, ValueError)):
-        PassiveArtifact(_candidate(), bytearray(RAW_RESULTS))  # type: ignore[arg-type]
+        passive_artifact(  # type: ignore[arg-type]
+            _candidate(),
+            bytearray(RAW_RESULTS),
+        )
 
 
 def test_adapter_match_carries_validated_mappings_and_match_evidence() -> None:
@@ -616,6 +698,8 @@ def test_normalized_evidence_rejects_mismatched_path_or_empty_observations() -> 
 
 def test_trivial_adapter_operates_only_on_passive_bytes() -> None:
     class FakeAdapter:
+        semantic_version = "1"
+
         def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
             assert isinstance(artifact.content, bytes)
             return _adapter_match()
@@ -633,7 +717,7 @@ def test_trivial_adapter_operates_only_on_passive_bytes() -> None:
             )
 
     fake: Adapter = FakeAdapter()
-    passive = PassiveArtifact(_candidate(), RAW_RESULTS)
+    passive = passive_artifact(_candidate(), RAW_RESULTS)
     match = fake.probe(passive)
     assert match is not None
     assert fake.extract(passive, match).evidence_id == "fake-evidence"
@@ -1255,6 +1339,17 @@ def test_json_serialization_rejects_nonfinite_and_unsupported_values() -> None:
         to_jsonable(object())
     with pytest.raises((TypeError, ValueError), match="integer|JSON"):
         to_jsonable(10**5_000)
+
+
+def test_bounded_legacy_evidence_id_remains_constructible_and_serializable() -> None:
+    evidence = _normalized_evidence(evidence_id="evidence-legacy-completed-result")
+
+    assert evidence.evidence_id == "evidence-legacy-completed-result"
+    serialized = to_jsonable(evidence)
+    encoded = json.dumps(serialized, allow_nan=False, sort_keys=True)
+
+    assert serialized["evidence_id"] == "evidence-legacy-completed-result"  # type: ignore[index]
+    assert '"evidence_id": "evidence-legacy-completed-result"' in encoded
 
 
 def test_legacy_manifest_is_an_optional_high_confidence_mapping_hint() -> None:

@@ -6,6 +6,8 @@ import hashlib
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactCandidate,
@@ -48,7 +50,7 @@ def _passive(
     path: str,
     kind: ArtifactKind,
 ) -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=kind,

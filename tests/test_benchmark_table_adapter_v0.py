@@ -6,6 +6,8 @@ import hashlib
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     AnalysisContractError,
@@ -50,7 +52,7 @@ def _provenance() -> FieldProvenance:
 
 
 def _artifact(content: bytes, path: str = "benchmarks/vessl.csv") -> PassiveArtifact:
-    return PassiveArtifact(
+    return passive_artifact(
         ArtifactCandidate(
             path=RepositoryPath(path),
             kind=ArtifactKind.BENCHMARK,
@@ -284,6 +286,7 @@ def test_selector_scoped_evidence_identity_preserves_multi_match_sequence() -> N
     narrower = adapter.extract(artifact, one_row)
 
     assert tuple(item.metric_value for item in selected.observations) == (120.0, 150.0)
+    assert selected.evidence_id.startswith("evidence-v2-")
     assert selected.evidence_id == adapter.extract(artifact, two_rows).evidence_id
     assert selected.evidence_id != narrower.evidence_id
 

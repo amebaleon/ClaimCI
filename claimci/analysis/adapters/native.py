@@ -211,6 +211,7 @@ class NativeManifestAdapter:
 
     __slots__ = ()
     adapter_id = "claimci-native-manifest-v1"
+    semantic_version = "1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         if not _supports(
@@ -310,7 +311,12 @@ class NativeManifestAdapter:
             ),
         )
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=observations,
@@ -357,6 +363,7 @@ class NativeResultsAdapter:
 
     __slots__ = ()
     adapter_id = "claimci-native-results-v1"
+    semantic_version = "1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         if not _supports(
@@ -458,7 +465,12 @@ class NativeResultsAdapter:
                     )
                 )
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=tuple(observations),
@@ -470,6 +482,7 @@ class NativeConfigAdapter:
 
     __slots__ = ()
     adapter_id = "claimci-native-config-v1"
+    semantic_version = "1"
 
     def probe(self, artifact: PassiveArtifact) -> AdapterMatch | None:
         if not _supports(
@@ -567,7 +580,12 @@ class NativeConfigAdapter:
             compute_evidence=tuple(compute),
         )
         return NormalizedEvidence(
-            evidence_id=_evidence_id(self.adapter_id, artifact),
+            evidence_id=_evidence_id(
+                self.adapter_id,
+                self.semantic_version,
+                artifact,
+                match.mappings,
+            ),
             artifact=artifact.candidate,
             adapter_match=match,
             observations=(observation,),

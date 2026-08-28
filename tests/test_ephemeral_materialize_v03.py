@@ -10,11 +10,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     AuditClaimSpec,
     BoundedValueRepresentation,
     ClaimReference,
@@ -182,7 +185,15 @@ def _normalized_dataset(
     artifact: ArtifactCandidate,
     content: bytes,
 ) -> NormalizedEvidence:
-    evidence = extract_registered_artifact(PassiveArtifact(artifact, content))
+    evidence = extract_registered_artifact(
+        passive_artifact(
+            artifact,
+            content,
+            repository=REPOSITORY,
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=HEAD_SHA,
+        )
+    )
     assert evidence is not None
     assert evidence.adapter_match.adapter_id == "claimci-jsonl-dataset-v1"
     return evidence
@@ -442,7 +453,13 @@ def test_shared_benchmark_table_is_recaptured_once_and_each_selector_is_revalida
         ArtifactKind.RESULTS,
         content,
     )
-    passive = PassiveArtifact(artifact, content)
+    passive = passive_artifact(
+        artifact,
+        content,
+        repository=REPOSITORY,
+        snapshot_role=ArtifactSnapshotRole.HEAD,
+        commit=HEAD_SHA,
+    )
     adapter = CsvAdapter()
 
     def selected(key: str) -> NormalizedEvidence:
@@ -1019,6 +1036,58 @@ def test_changed_artifact_hash_fails_unavailable_and_cleans_plan_tree(
         execute_ephemeral_audit(plan, runtime)
 
     assert not (scratch / plan.plan_id).exists()
+
+
+def test_passive_v2_evidence_from_another_repository_fails_revalidation(
+    tmp_path: Path,
+) -> None:
+    plan, runtime, _checkout, scratch = _plan_fixture(tmp_path)
+    planned = next(
+        item
+        for item in plan.candidate_evidence
+        if item.artifact.path == RepositoryPath("results/candidate.json")
+    )
+    foreign = extract_registered_artifact(
+        passive_artifact(
+            planned.artifact,
+            (runtime.checkout_root / Path(str(planned.artifact.path))).read_bytes(),
+            repository=RepositoryIdentity("foreign-owner", "foreign-repository"),
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=HEAD_SHA,
+        )
+    )
+    assert foreign is not None
+    assert foreign.evidence_id.startswith("evidence-v2-")
+    assert foreign.evidence_id != planned.evidence_id
+
+    assert isinstance(plan.selected_mapping, MappingCandidate)
+    selected_mapping = dataclasses.replace(
+        plan.selected_mapping,
+        bindings=tuple(
+            _binding(foreign, ExperimentRole.CANDIDATE)
+            if item.path == planned.artifact.path
+            and item.kind is ArtifactKind.RESULTS
+            else item
+            for item in plan.selected_mapping.bindings
+        ),
+    )
+    changed_plan = dataclasses.replace(
+        plan,
+        candidate_evidence=tuple(
+            foreign if item is planned else item for item in plan.candidate_evidence
+        ),
+        selected_mapping=selected_mapping,
+        mapping_provenance=(selected_mapping.provenance,),
+    )
+    changed_plan = dataclasses.replace(
+        changed_plan,
+        plan_id=derive_ephemeral_plan_id(changed_plan),
+    )
+
+    with pytest.raises(MaterializationUnavailable, match="adapter|identity|normalized"):
+        execute_ephemeral_audit(changed_plan, runtime)
+
+    assert not (scratch / changed_plan.plan_id).exists()
 
 
 def test_symlink_substitution_is_unavailable_without_following_target(

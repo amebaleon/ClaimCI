@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
+    AnalysisContractError,
     ArtifactCandidate,
     ArtifactKind,
     Confidence,
@@ -33,6 +37,7 @@ from claimci.analysis import (
 )
 from claimci.analysis.adapters import (
     MAX_LOGICAL_RECORD_BYTES,
+    JsonLinesAdapter,
     extract_registered_source,
     scan_jsonl_observations,
     scan_jsonl_schema,
@@ -159,7 +164,7 @@ def test_stream_and_bytes_metric_candidates_have_exact_identity_parity(
         b'{"seed":2,"acc":0.83,"loss":0.3}\n'
     )
     source = _source(tmp_path, content)
-    passive = PassiveArtifact(source.candidate, content)
+    passive = passive_artifact(source.candidate, content)
 
     streamed = extract_metric_candidate_scan(
         source,
@@ -172,6 +177,64 @@ def test_stream_and_bytes_metric_candidates_have_exact_identity_parity(
 
     assert streamed.candidates == bounded
     assert streamed.completeness.state is ScanState.COMPLETE
+
+
+def test_passive_and_streaming_jsonl_evidence_ids_have_exact_occurrence_parity(
+    tmp_path: Path,
+) -> None:
+    content = (
+        b'{"run":1,"acc":0.81}\n'
+        b'{"run":2,"acc":0.83}\n'
+    )
+    source = _source(tmp_path, content)
+    passive = passive_artifact(
+        source.candidate,
+        content,
+        repository=source.repository,
+        snapshot_role=source.snapshot_role,
+        commit=source.head_sha,
+    )
+    adapter = JsonLinesAdapter()
+    passive_match = adapter.probe(passive)
+    schema = scan_jsonl_schema(source)
+
+    assert passive_match is not None
+    assert schema.match is not None
+    passive_evidence = adapter.extract(passive, passive_match)
+    streamed = scan_jsonl_observations(source, schema.match)
+
+    assert passive_evidence.evidence_id.startswith("evidence-v2-")
+    assert streamed.evidence is not None
+    assert streamed.completeness.state is ScanState.COMPLETE
+    assert streamed.evidence.evidence_id == passive_evidence.evidence_id
+
+
+def test_streaming_integrity_fields_do_not_change_evidence_identity(
+    tmp_path: Path,
+) -> None:
+    content = b'{"acc":0.81}\n'
+    source = _source(tmp_path, content)
+    schema = scan_jsonl_schema(source)
+    assert schema.match is not None
+    outcome = scan_jsonl_observations(source, schema.match)
+    assert outcome.evidence is not None
+    evidence = outcome.evidence
+    assert evidence.scan_completeness is not None
+
+    altered_trace = replace(
+        evidence,
+        source_trace_sha256=Sha256Digest("0" * 64),
+    )
+    assert altered_trace.evidence_id == evidence.evidence_id
+
+    unverified = replace(
+        evidence.scan_completeness,
+        state=ScanState.FAILED,
+        reason=ScanReason.SHA_MISMATCH,
+        integrity_verified=False,
+    )
+    with pytest.raises(AnalysisContractError, match="verified streaming integrity"):
+        replace(evidence, scan_completeness=unverified)
 
 
 @pytest.mark.parametrize(

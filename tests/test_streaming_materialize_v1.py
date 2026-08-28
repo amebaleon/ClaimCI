@@ -9,11 +9,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.analysis_occurrence_support import passive_artifact
+
 from claimci.analysis import (
     AdapterMatch,
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     AuditClaimSpec,
     ClaimReference,
     Confidence,
@@ -157,7 +160,15 @@ def _dataset_evidence(
         )
         assert outcome is not None and outcome.evidence is not None
         return outcome.evidence
-    evidence = extract_registered_artifact(PassiveArtifact(artifact, content))
+    evidence = extract_registered_artifact(
+        passive_artifact(
+            artifact,
+            content,
+            repository=REPOSITORY,
+            snapshot_role=ArtifactSnapshotRole.HEAD,
+            commit=HEAD,
+        )
+    )
     assert evidence is not None
     return evidence
 

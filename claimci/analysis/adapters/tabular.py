@@ -534,24 +534,12 @@ class CsvAdapter:
                 raise AdapterSelectorError(
                     f"selected {self._label} identifier is invalid: {exc}"
                 ) from exc
-        scoped_selector_identity = tuple(
-            (
-                mapping.target_field,
-                selector_identity(mapping.selector),
-            )
-            for mapping in canonical_match.mappings
-            if type(mapping.selector) is TableSelector
-        )
         return NormalizedEvidence(
             evidence_id=_evidence_id(
                 self.adapter_id,
+                self.semantic_version,
                 artifact,
-                adapter_semantic_version=(
-                    self.semantic_version if scoped_selector_identity else None
-                ),
-                selector_identity=(
-                    scoped_selector_identity if scoped_selector_identity else None
-                ),
+                canonical_match.mappings,
             ),
             artifact=artifact.candidate,
             adapter_match=canonical_match,

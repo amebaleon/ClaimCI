@@ -31,6 +31,7 @@ from .contracts import (
     ArtifactBinding,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactSnapshotRole,
     ConfigValue,
     DatasetSplit,
     EphemeralAuditPlan,
@@ -47,6 +48,7 @@ from .contracts import (
     RepositoryPath,
     SelectorKind,
     TableSelector,
+    passive_artifact_from_snapshot,
     field_mapping_identity,
 )
 from .evidence_identity import (
@@ -354,6 +356,7 @@ def _capture_artifact(
                 runtime.head_sha,
                 runtime.checkout_root,
                 candidate,
+                snapshot_role=ArtifactSnapshotRole.HEAD,
             )
         except (
             AnalysisContractError,
@@ -440,7 +443,13 @@ def _capture_artifact(
     if hashlib.sha256(content).hexdigest() != candidate.sha256:
         raise MaterializationUnavailable("artifact snapshot hash no longer matches")
     try:
-        return PassiveArtifact(candidate, content)
+        return passive_artifact_from_snapshot(
+            runtime.repository,
+            ArtifactSnapshotRole.HEAD,
+            runtime.head_sha,
+            candidate,
+            content,
+        )
     except (TypeError, ValueError) as error:
         raise MaterializationUnavailable(
             f"artifact snapshot validation failed: {error}"
@@ -702,7 +711,11 @@ def _capture_plan_artifacts(
             revalidated_tables.add(evidence.evidence_id)
         elif (
             path not in metric_bound_paths
-            and (revalidate_fixed_adapters or type(source) is ArtifactSource)
+            and (
+                revalidate_fixed_adapters
+                or type(source) is ArtifactSource
+                or evidence.evidence_id.startswith("evidence-v2-")
+            )
             and evidence.artifact.kind is not ArtifactKind.DATASET
             and evidence.evidence_id not in revalidated_evidence
         ):
@@ -1127,6 +1140,7 @@ def _streaming_dataset_sources(
                 runtime.head_sha,
                 runtime.checkout_root,
                 source.candidate,
+                snapshot_role=ArtifactSnapshotRole.HEAD,
             )
         except (
             AnalysisContractError,

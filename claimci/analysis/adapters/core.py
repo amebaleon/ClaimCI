@@ -20,6 +20,7 @@ from claimci.analysis import (
     AnalysisContractError,
     ArtifactCandidate,
     ArtifactKind,
+    ArtifactOccurrence,
     EvidenceSelector,
     FieldMapping,
     FieldProvenance,
@@ -28,6 +29,8 @@ from claimci.analysis import (
     SelectorKind,
 )
 from claimci.parsing import unique_json_object
+
+from ..evidence_identity import canonical_selector_material
 
 
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
@@ -42,6 +45,7 @@ _CANONICAL_ARRAY_INDEX = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 
 
 class _ArtifactEnvelope(Protocol):
+    occurrence: ArtifactOccurrence
     candidate: ArtifactCandidate
 
 
@@ -390,44 +394,53 @@ def _validate_match(
 
 def _evidence_id(
     adapter_id: str,
+    adapter_semantic_version: str,
     artifact: _ArtifactEnvelope,
-    *,
-    adapter_semantic_version: str | None = None,
-    selector_identity: object | None = None,
+    mappings: tuple[FieldMapping, ...],
 ) -> str:
-    """Return a stable bounded identity for normalized evidence."""
+    """Return the exact v2 identity for one trusted occurrence and selector."""
 
-    if selector_identity is not None:
-        if (
-            not isinstance(adapter_semantic_version, str)
-            or not adapter_semantic_version
-        ):
-            raise TypeError(
-                "selector-scoped evidence requires an adapter semantic version"
-            )
-        material = json.dumps(
-            {
-                "schema": "claimci-selector-scoped-evidence-v1",
-                "artifact": {
-                    "path": str(artifact.candidate.path),
-                    "kind": artifact.candidate.kind.value,
-                    "sha256": str(artifact.candidate.sha256),
-                    "size": artifact.candidate.size,
-                },
-                "adapter_id": adapter_id,
-                "adapter_semantic_version": adapter_semantic_version,
-                "selector": selector_identity,
-            },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        return (
-            f"evidence-{adapter_id}-table-"
-            + hashlib.sha256(material).hexdigest()[:16]
+    if not isinstance(adapter_id, str) or not adapter_id:
+        raise TypeError("adapter ID must be a non-empty string")
+    if not isinstance(adapter_semantic_version, str) or not adapter_semantic_version:
+        raise TypeError("adapter semantic version must be a non-empty string")
+    occurrence = getattr(artifact, "occurrence", None)
+    if type(occurrence) is not ArtifactOccurrence:
+        raise TypeError(
+            "evidence v2 identity requires a concrete ArtifactOccurrence"
         )
-    return f"evidence-{adapter_id}-{str(artifact.candidate.sha256)[:16]}"
+    if getattr(artifact, "candidate", None) is not occurrence.candidate:
+        raise TypeError(
+            "evidence v2 identity requires the candidate bound to the occurrence"
+        )
+    candidate = occurrence.candidate
+    material = {
+        "schema_version": 2,
+        "repository": {
+            "owner": occurrence.repository.owner,
+            "name": occurrence.repository.name,
+        },
+        "snapshot": {
+            "role": occurrence.snapshot_role.value,
+            "commit": str(occurrence.commit),
+        },
+        "artifact": {
+            "path": str(candidate.path),
+            "kind": candidate.kind.value,
+            "sha256": str(candidate.sha256),
+            "size": candidate.size,
+        },
+        "adapter": {"id": adapter_id, "version": adapter_semantic_version},
+        "selector": list(canonical_selector_material(mappings)),
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "evidence-v2-" + hashlib.sha256(encoded).hexdigest()
 
 
 __all__ = [
