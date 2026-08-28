@@ -501,7 +501,13 @@ def _document_lines(text: str) -> tuple[tuple[int, int], ...]:
     offset = 0
     for raw_line in text.splitlines(keepends=True):
         end = offset + len(raw_line)
-        line_end = end - 1 if raw_line.endswith("\n") else end
+        line_end = (
+            end - 2
+            if raw_line.endswith("\r\n")
+            else end - 1
+            if raw_line.endswith(("\n", "\r"))
+            else end
+        )
         if line_end > offset:
             spans.append((offset, line_end))
         offset = end

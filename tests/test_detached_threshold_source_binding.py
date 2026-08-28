@@ -14,6 +14,9 @@ from claimci.analysis import (
     to_jsonable,
 )
 from claimci.analysis.discovery import discover_repository
+from claimci.analysis.discovery.claims import _deterministic_claims
+from claimci.analysis.discovery.repository import RepositoryContext
+from claimci.review import SourceBundle, SourceKind, SourceRecord
 
 
 REPOSITORY = RepositoryIdentity("amebaleon", "detached-threshold-fixture")
@@ -34,6 +37,26 @@ def _discover(tmp_path: Path, document: str):
         pr_title="Production smoke: verify supported result",
         pr_description=document,
     )
+
+
+def _discover_raw_source(tmp_path: Path, document: str):
+    """Exercise deterministic discovery before Review's normal line-ending fold."""
+
+    record = SourceRecord(
+        source_id="source-line-ending-normalization",
+        kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+        path=None,
+        text=document,
+        sha256=hashlib.sha256(document.encode("utf-8")).hexdigest(),
+    )
+    context = RepositoryContext(
+        head_root=tmp_path,
+        base_root=None,
+        source_bundle=SourceBundle(sources=(record,), total_chars=len(document)),
+        repository_paths=(),
+        changed_paths=(),
+    )
+    return _deterministic_claims(context)
 
 
 @pytest.mark.parametrize(
@@ -184,3 +207,45 @@ def test_existing_exact_production_smoke_claim_id_remains_unchanged(
 
     assert len(discovery.claims) == 1
     assert discovery.claims[0].reference.claim_id == "claim-79792fed7eb306e5"
+
+
+@pytest.mark.parametrize("line_ending", ("\r\n", "\r"))
+def test_detached_threshold_normalizes_crlf_and_lone_cr_without_changing_spans(
+    tmp_path: Path,
+    line_ending: str,
+) -> None:
+    """Break caught: CR line endings change IDs or make a valid declaration fail."""
+
+    document = line_ending.join(
+        (
+            EXACT_PRODUCTION_SMOKE_CLAIM,
+            "Declared minimum improvement: 0.05",
+        )
+    )
+    baseline = _discover_raw_source(
+        tmp_path,
+        "\n".join(
+            (
+                EXACT_PRODUCTION_SMOKE_CLAIM,
+                "Declared minimum improvement: 0.05",
+            )
+        ),
+    )
+    claims = _discover_raw_source(tmp_path, document)
+
+    assert len(baseline) == 1
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim.reference.text == EXACT_PRODUCTION_SMOKE_CLAIM
+    assert claim.reference.claim_id == baseline[0].reference.claim_id
+    assert claim.minimum_improvement is not None
+    assert claim.minimum_improvement.value == 0.05
+    assert claim.scientific_claim is not None
+    binding = claim.scientific_claim._source_binding
+    assert binding is not None
+    assert binding.document.text[binding.primary_start : binding.primary_end] == (
+        EXACT_PRODUCTION_SMOKE_CLAIM
+    )
+    assert binding.document.text[
+        binding.declaration_start : binding.declaration_end
+    ] == "Declared minimum improvement: 0.05"
