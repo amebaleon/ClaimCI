@@ -198,6 +198,55 @@ def test_detached_threshold_binding_is_immutable_source_certified_and_not_public
     assert "declaration_start" not in serialized
 
 
+def test_detached_threshold_terminal_period_is_preserved_in_private_binding(
+    tmp_path: Path,
+) -> None:
+    """Break caught: the exact fixture punctuation becomes non-authoritative."""
+
+    declaration = "Declared minimum improvement: 0.05."
+    discovery = _discover(
+        tmp_path,
+        EXACT_PRODUCTION_SMOKE_CLAIM + "\n" + declaration,
+    )
+
+    assert len(discovery.claims) == 1
+    claim = discovery.claims[0]
+    assert claim.minimum_improvement is not None
+    assert claim.minimum_improvement.value == 0.05
+    assert claim.scientific_claim is not None
+    primary = claim.scientific_claim.primary
+    assert primary.minimum_improvement is not None
+    assert primary.minimum_improvement.raw == "0.05"
+    binding = claim.scientific_claim._source_binding
+    assert binding is not None
+    assert binding.document.text[
+        binding.declaration_start : binding.declaration_end
+    ] == declaration
+
+
+def test_invalid_second_recognized_declaration_fails_closed_cardinality(
+    tmp_path: Path,
+) -> None:
+    """Break caught: filtering a negative declaration masks a duplicate label."""
+
+    discovery = _discover(
+        tmp_path,
+        "\n".join(
+            (
+                EXACT_PRODUCTION_SMOKE_CLAIM,
+                "Declared minimum improvement: 0.05",
+                "Minimum improvement: -0.01",
+            )
+        ),
+    )
+
+    assert len(discovery.claims) == 1
+    claim = discovery.claims[0]
+    assert claim.minimum_improvement is None
+    assert claim.scientific_claim is not None
+    assert claim.scientific_claim._source_binding is None
+
+
 def test_existing_exact_production_smoke_claim_id_remains_unchanged(
     tmp_path: Path,
 ) -> None:

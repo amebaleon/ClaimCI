@@ -262,7 +262,7 @@ not added to provider schemas and is explicitly excluded from `to_jsonable`,
 so public JSON retains its historical shape.
 
 The controlled fixture keeps the original scientific claim line byte-for-byte
-unchanged and adds `Declared minimum improvement: 0.05` as the next line of
+unchanged and adds `Declared minimum improvement: 0.05.` as the next line of
 the same trusted PR-description document. It must now reach `READY` and the
 existing native Audit must return `SUPPORTED`; no provider, mapping, or
 manifest field becomes claim-threshold authority.

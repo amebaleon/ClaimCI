@@ -59,7 +59,7 @@ _DETACHED_MINIMUM_DECLARATION = re.compile(
     rf"^[ \t]*(?:declared minimum improvement:|minimum improvement:|"
     rf"required minimum improvement:)[ \t]*"
     rf"(?P<value>{_NUMBER})"
-    rf"(?:[ \t]*(?P<unit>%|percentage[ \t]+points?|points?))?[ \t]*$",
+    rf"(?:[ \t]*(?P<unit>%|percentage[ \t]+points?|points?))?\.?[ \t]*$",
     flags=re.IGNORECASE | re.ASCII,
 )
 _THRESHOLD_TRAILING = re.compile(
@@ -519,8 +519,10 @@ def _document_lines(text: str) -> tuple[tuple[int, int], ...]:
 def _detached_declarations(
     document: _TrustedSourceDocument,
     provenance: FieldProvenance,
-) -> tuple[tuple[int, int, ClaimQuantity], ...]:
-    declarations: list[tuple[int, int, ClaimQuantity]] = []
+) -> tuple[tuple[int, int, ClaimQuantity | None], ...]:
+    """Return every recognized declaration; invalid values remain cardinality."""
+
+    declarations: list[tuple[int, int, ClaimQuantity | None]] = []
     for start, end in _document_lines(document.text):
         match = _DETACHED_MINIMUM_DECLARATION.fullmatch(document.text[start:end])
         if match is None:
@@ -528,9 +530,9 @@ def _detached_declarations(
         try:
             quantity = _quantity(match, provenance)
         except (OverflowError, ValueError, ClaimTypeContractError):
-            continue
-        if quantity.value < 0:
-            continue
+            quantity = None
+        if quantity is not None and quantity.value < 0:
+            quantity = None
         declarations.append((start, end, quantity))
     return tuple(declarations)
 
@@ -593,6 +595,8 @@ def _bound_detached_threshold(
     if len(declarations) != 1:
         return primary, None
     declaration_start, declaration_end, detached = declarations[0]
+    if detached is None:
+        return primary, None
     binding = _TrustedSourceBinding(
         document=trusted_source_document,
         primary_start=primary_start,

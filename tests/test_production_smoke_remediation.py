@@ -30,7 +30,7 @@ EXACT_CLAIM = (
     "The candidate improves accuracy from 0.60 to 0.70 under the same "
     "configuration and evaluation dataset."
 )
-SOURCE_CERTIFIED_PR_BODY = EXACT_CLAIM + "\nDeclared minimum improvement: 0.05"
+SOURCE_CERTIFIED_PR_BODY = EXACT_CLAIM + "\nDeclared minimum improvement: 0.05."
 EXPECTED_HEAD_SHA256 = {
     "README.md": "245906ae491e68f661e4b4571122bb3a9372211708af56bb07f28db87981e1bb",
     "research.yaml": "8c7121eeb7603b816de26699640cd28be1ca2192ecfc057a1a8a0daf4cdd3d16",

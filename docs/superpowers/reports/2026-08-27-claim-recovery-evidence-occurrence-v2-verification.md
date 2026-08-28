@@ -514,7 +514,7 @@ discovery, planning, obligations, contracts, and review bridge passed with
 
 The exact original smoke claim line remains byte-for-byte unchanged. The
 same Review-issued PR-description document adds the next full line
-`Declared minimum improvement: 0.05`; real evidence extraction, planning, and
+`Declared minimum improvement: 0.05.`; real evidence extraction, planning, and
 native Audit reached `READY` and `SUPPORTED`.
 
 `python -m pytest -q` was launched as the required full Core run. The desktop
@@ -539,3 +539,27 @@ JSON emits only historical canonical-claim fields. The durable security scan
 could not be started because its selected uncommitted-diff digest was reported
 stale immediately, and TAC status was unavailable in this environment. No
 durable-scan result is represented as having passed.
+
+### Fix round 2 — terminal period and declaration cardinality (2026-08-28)
+
+The controlled source body is exactly the unchanged scientific claim line plus
+`Declared minimum improvement: 0.05.`. The detached grammar accepts one
+terminal ASCII period after its existing numeric/unit grammar, keeps the private
+declaration span including that period, and keeps the quantity's raw numeric
+text as `0.05`. It continues to reject extra prose, fuzzy labels, unsupported
+units, and additional punctuation.
+
+The fail-closed cardinality rule now counts every fixed-label declaration that
+matches the numeric/unit grammar even when its quantity is invalid. A negative
+or non-finite matched quantity is not attached, but cannot be filtered away to
+make a second declaration disappear. Therefore one valid declaration plus
+`Minimum improvement: -0.01` does not bind.
+
+Before the change,
+`python -m pytest -q tests/test_detached_threshold_source_binding.py tests/test_production_smoke_remediation.py`
+exited `1` with `3 failed, 13 passed`: terminal-period source binding and the
+exact fixture did not recover a threshold, and the negative duplicate was
+masked. After the bounded parser change it passed with `16 passed in 0.81s`;
+after the raw-numeric assertion it passed with `16 passed in 1.31s`. The
+broader impacted Core command passed with `440 passed, 1 skipped in 13.17s`.
+`python -m compileall claimci tests` and `git diff --check` also passed.
