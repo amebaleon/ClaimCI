@@ -1972,6 +1972,15 @@ def to_jsonable(value: object) -> object:
         from .trace import trace_to_jsonable
 
         return trace_to_jsonable(value)
+    if (
+        type(value).__module__ == "claimci.analysis.claim_types"
+        and type(value).__name__ == "CanonicalScientificClaim"
+    ):
+        return {
+            "reference": to_jsonable(value.reference),
+            "primary": to_jsonable(value.primary),
+            "constraints": to_jsonable(value.constraints),
+        }
     if type(value) is NormalizedEvidence:
         serialized = {
             "evidence_id": to_jsonable(value.evidence_id),

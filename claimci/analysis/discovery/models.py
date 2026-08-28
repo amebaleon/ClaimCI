@@ -198,13 +198,27 @@ class DiscoveredClaim:
                 )
         elif self.reference.source_path is not None:
             raise DiscoveryError("pull-request claim reference cannot carry a path")
-        recovered = recover_scientific_claim(self.reference)
-        if self.scientific_claim is None:
-            object.__setattr__(self, "scientific_claim", recovered)
-        elif type(self.scientific_claim) is not CanonicalScientificClaim:
+        if (
+            self.scientific_claim is not None
+            and type(self.scientific_claim) is not CanonicalScientificClaim
+        ):
             raise TypeError(
                 "discovered scientific_claim must be CanonicalScientificClaim or null"
             )
+        binding = (
+            None
+            if self.scientific_claim is None
+            else self.scientific_claim._source_binding
+        )
+        recovered = recover_scientific_claim(
+            self.reference,
+            trusted_source_document=None if binding is None else binding.document,
+            primary_span=None
+            if binding is None
+            else (binding.primary_start, binding.primary_end),
+        )
+        if self.scientific_claim is None:
+            object.__setattr__(self, "scientific_claim", recovered)
         elif self.scientific_claim != recovered:
             raise DiscoveryError(
                 "discovered scientific claim conflicts with source recovery"

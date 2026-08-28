@@ -487,3 +487,55 @@ The companion PR must pin the exact final Core commit, remove or align Hosted's
 duplicated natural-language grammar, preserve deterministic results under
 provider uncertainty, and settle Pilot credit only from a persisted
 deterministic Audit authority signal.
+
+## Addendum — detached minimum-improvement Task 1 verification (2026-08-28)
+
+This task-level addendum verifies the detached-threshold implementation against
+the existing sealed branch. It does not replace the controller's final
+whole-branch gate.
+
+The focused RED command was run before production edits:
+
+```powershell
+python -m pytest -q tests/test_detached_threshold_source_binding.py tests/test_production_smoke_remediation.py
+```
+
+It exited `1` with `5 failed, 7 passed`: the three approved declarations were
+not recovered, no private source binding existed, and the source-certified
+native-Audit smoke case was not ready. A second pre-production matrix-only RED
+run exited `1` with `4 failed, 4 passed, 2 deselected`; it additionally proved
+that incompatible inline and detached values did not fail closed.
+
+After implementation, the same focused command passed with `12 passed`. The
+broader Core regression command covering claim types, deterministic/provider
+discovery, planning, obligations, contracts, and review bridge passed with
+`436 passed, 1 skipped`. The scoped trust-boundary subset passed with
+`67 passed`.
+
+The exact original smoke claim line remains byte-for-byte unchanged. The
+same Review-issued PR-description document adds the next full line
+`Declared minimum improvement: 0.05`; real evidence extraction, planning, and
+native Audit reached `READY` and `SUPPORTED`.
+
+`python -m pytest -q` was launched as the required full Core run. The desktop
+terminal transport detached before returning its final summary, while the
+pytest child completed; `.pytest_cache/v/cache/lastfailed` was empty
+afterwards. No exit code or pass count is claimed for that invocation. The
+focused evidence above is the task's conclusive executable result; the
+controller must retain its one final captured whole-branch gate.
+
+Additional integrity commands succeeded: `python -m compileall claimci tests`,
+`python -m pip check` (`No broken requirements found`), and `git diff --check`.
+The repository exposes no configured lint or type-check command: the checked
+configuration files and `pyproject.toml`, workflow, and scripts references
+contained none.
+
+Scoped manual security review found no issue. It confirmed that only
+deterministic discovery can issue the private document certificate; provider
+schemas remain certificate/document/span-free; the canonical parser verifies
+source id, hash, exact primary span, one metric, one declaration, and compatible
+inline values; compiler/obligation revalidation reuse the binding; and public
+JSON emits only historical canonical-claim fields. The durable security scan
+could not be started because its selected uncommitted-diff digest was reported
+stale immediately, and TAC status was unavailable in this environment. No
+durable-scan result is represented as having passed.

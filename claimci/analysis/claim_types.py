@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
 
@@ -53,6 +54,13 @@ _MINIMUM_CONTINUATION = re.compile(
     rf"(?P<value>{_NUMBER})"
     rf"(?:\s*(?P<unit>%|percentage\s+points?|points?))?\s*\.?\s*$",
     flags=re.IGNORECASE,
+)
+_DETACHED_MINIMUM_DECLARATION = re.compile(
+    rf"^[ \t]*(?:declared minimum improvement:|minimum improvement:|"
+    rf"required minimum improvement:)[ \t]*"
+    rf"(?P<value>{_NUMBER})"
+    rf"(?:[ \t]*(?P<unit>%|percentage[ \t]+points?|points?))?[ \t]*$",
+    flags=re.IGNORECASE | re.ASCII,
 )
 _THRESHOLD_TRAILING = re.compile(
     rf"^\s*(?:(?:across|aggregated|as|for|in|on|over|under|using|via|with)\b"
@@ -103,6 +111,7 @@ _LOWER_VERBS = frozenset(
         "drops",
     }
 )
+_TRUSTED_SOURCE_ISSUANCE_TOKEN = object()
 
 
 class ClaimTypeContractError(ValueError):
@@ -147,6 +156,79 @@ def _finite(value: object, label: str) -> float:
     if not math.isfinite(normalized):
         raise ClaimTypeContractError(f"{label} must be finite")
     return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedSourceDocument:
+    """Private certificate for one Review-issued immutable source document."""
+
+    source_id: str
+    sha256: str
+    text: str
+    _issuance_token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._issuance_token is not _TRUSTED_SOURCE_ISSUANCE_TOKEN:
+            raise TypeError("trusted source documents require internal issuance")
+        _bounded_text(self.source_id, "trusted source id", maximum=128)
+        if (
+            not isinstance(self.sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None
+        ):
+            raise ClaimTypeContractError("trusted source sha256 must be canonical")
+        if (
+            not isinstance(self.text, str)
+            or not self.text
+            or len(self.text) > 60_000
+        ):
+            raise ClaimTypeContractError("trusted source text must be bounded")
+        if hashlib.sha256(self.text.encode("utf-8")).hexdigest() != self.sha256:
+            raise ClaimTypeContractError("trusted source hash does not match text")
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedSourceBinding:
+    """Private immutable primary/declaration span binding for canonical recovery."""
+
+    document: _TrustedSourceDocument
+    primary_start: int
+    primary_end: int
+    declaration_start: int
+    declaration_end: int
+
+    def __post_init__(self) -> None:
+        if type(self.document) is not _TrustedSourceDocument:
+            raise TypeError("trusted source binding requires an issued document")
+        for start, end, label in (
+            (self.primary_start, self.primary_end, "primary"),
+            (self.declaration_start, self.declaration_end, "declaration"),
+        ):
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or not 0 <= start < end <= len(self.document.text)
+            ):
+                raise ClaimTypeContractError(
+                    f"trusted source {label} span is invalid"
+                )
+
+
+def _issue_trusted_source_document(
+    *,
+    source_id: str,
+    sha256: str,
+    text: str,
+) -> _TrustedSourceDocument:
+    """Issue a private document certificate at deterministic discovery only."""
+
+    return _TrustedSourceDocument(
+        source_id=source_id,
+        sha256=sha256,
+        text=text,
+        _issuance_token=_TRUSTED_SOURCE_ISSUANCE_TOKEN,
+    )
 
 
 def _unit(raw: str | None) -> str | None:
@@ -308,6 +390,11 @@ class CanonicalScientificClaim:
     reference: ClaimReference
     primary: PrimaryScientificClaim
     constraints: tuple[ClaimConstraint, ...] = ()
+    _source_binding: _TrustedSourceBinding | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if type(self.reference) is not ClaimReference:
@@ -326,6 +413,11 @@ class CanonicalScientificClaim:
         kinds = tuple(item.kind for item in self.constraints)
         if len(set(kinds)) != len(kinds):
             raise ClaimTypeContractError("canonical claim constraints must be unique")
+        if (
+            self._source_binding is not None
+            and type(self._source_binding) is not _TrustedSourceBinding
+        ):
+            raise TypeError("canonical claim source binding must be privately issued")
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +492,114 @@ def _paired_quantity(
     unit = _unit(raw_unit)
     raw = raw_value if not raw_unit else f"{raw_value} {raw_unit}"
     return ClaimQuantity(float(raw_value), unit, raw, provenance)
+
+
+def _document_lines(text: str) -> tuple[tuple[int, int], ...]:
+    """Return exact source-line spans without changing trusted document bytes."""
+
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        end = offset + len(raw_line)
+        line_end = end - 1 if raw_line.endswith("\n") else end
+        if line_end > offset:
+            spans.append((offset, line_end))
+        offset = end
+    if offset < len(text):
+        spans.append((offset, len(text)))
+    return tuple(spans)
+
+
+def _detached_declarations(
+    document: _TrustedSourceDocument,
+    provenance: FieldProvenance,
+) -> tuple[tuple[int, int, ClaimQuantity], ...]:
+    declarations: list[tuple[int, int, ClaimQuantity]] = []
+    for start, end in _document_lines(document.text):
+        match = _DETACHED_MINIMUM_DECLARATION.fullmatch(document.text[start:end])
+        if match is None:
+            continue
+        try:
+            quantity = _quantity(match, provenance)
+        except (OverflowError, ValueError, ClaimTypeContractError):
+            continue
+        if quantity.value < 0:
+            continue
+        declarations.append((start, end, quantity))
+    return tuple(declarations)
+
+
+def _recoverable_metric_count(
+    document: _TrustedSourceDocument,
+    provenance: FieldProvenance,
+) -> int:
+    count = 0
+    for start, end in _document_lines(document.text):
+        text = _WHITESPACE.sub(" ", document.text[start:end].strip())
+        if not text:
+            continue
+        primary = _recover_primary(text, provenance)
+        if type(primary) is MetricImprovementClaim:
+            count += 1
+    return count
+
+
+def _bound_detached_threshold(
+    reference: ClaimReference,
+    primary: PrimaryScientificClaim,
+    *,
+    trusted_source_document: _TrustedSourceDocument | None,
+    primary_span: tuple[int, int] | None,
+) -> tuple[PrimaryScientificClaim | None, _TrustedSourceBinding | None]:
+    """Attach one declaration only when one trusted document proves locality."""
+
+    if trusted_source_document is None or primary_span is None:
+        return primary, None
+    if type(trusted_source_document) is not _TrustedSourceDocument:
+        raise TypeError("trusted source document must be internally issued")
+    if (
+        reference.provenance.kind.value != "deterministic_discovery"
+        or reference.provenance.source_id != trusted_source_document.source_id
+    ):
+        return primary, None
+    if (
+        not isinstance(primary_span, tuple)
+        or len(primary_span) != 2
+        or any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in primary_span
+        )
+    ):
+        return primary, None
+    primary_start, primary_end = primary_span
+    if not 0 <= primary_start < primary_end <= len(trusted_source_document.text):
+        return primary, None
+    if trusted_source_document.text[primary_start:primary_end] != reference.text:
+        return primary, None
+    if type(primary) is not MetricImprovementClaim:
+        return primary, None
+    if _recoverable_metric_count(trusted_source_document, reference.provenance) != 1:
+        return primary, None
+    declarations = _detached_declarations(
+        trusted_source_document,
+        reference.provenance,
+    )
+    if len(declarations) != 1:
+        return primary, None
+    declaration_start, declaration_end, detached = declarations[0]
+    binding = _TrustedSourceBinding(
+        document=trusted_source_document,
+        primary_start=primary_start,
+        primary_end=primary_end,
+        declaration_start=declaration_start,
+        declaration_end=declaration_end,
+    )
+    inline = primary.minimum_improvement
+    if inline is not None:
+        if (inline.value, inline.unit) != (detached.value, detached.unit):
+            return None, binding
+        return primary, binding
+    return replace(primary, minimum_improvement=detached), binding
 
 
 def _constraints(
@@ -550,6 +750,9 @@ def _recover_primary(
 
 def recover_scientific_claim(
     reference: ClaimReference,
+    *,
+    trusted_source_document: _TrustedSourceDocument | None = None,
+    primary_span: tuple[int, int] | None = None,
 ) -> CanonicalScientificClaim | None:
     """Recover one canonical claim solely from a validated source reference."""
 
@@ -563,11 +766,22 @@ def recover_scientific_claim(
     primary = _recover_primary(text, reference.provenance)
     if primary is None:
         return None
-    return CanonicalScientificClaim(
+    primary, binding = _bound_detached_threshold(
+        reference,
+        primary,
+        trusted_source_document=trusted_source_document,
+        primary_span=primary_span,
+    )
+    if primary is None:
+        return None
+    recovered = CanonicalScientificClaim(
         reference=reference,
         primary=primary,
         constraints=_constraints(text, reference.provenance),
     )
+    if binding is not None:
+        object.__setattr__(recovered, "_source_binding", binding)
+    return recovered
 
 
 def claim_evidence_policy(claim: CanonicalScientificClaim) -> ClaimEvidencePolicy:
@@ -630,7 +844,14 @@ def compile_audit_claim(claim: CanonicalScientificClaim) -> AuditClaimSpec:
 
     if type(claim) is not CanonicalScientificClaim:
         raise TypeError("deterministic claim compiler requires CanonicalScientificClaim")
-    recovered = recover_scientific_claim(claim.reference)
+    binding = claim._source_binding
+    recovered = recover_scientific_claim(
+        claim.reference,
+        trusted_source_document=None if binding is None else binding.document,
+        primary_span=None
+        if binding is None
+        else (binding.primary_start, binding.primary_end),
+    )
     if recovered != claim:
         raise ClaimTypeContractError(
             "canonical claim does not match independent source recovery"

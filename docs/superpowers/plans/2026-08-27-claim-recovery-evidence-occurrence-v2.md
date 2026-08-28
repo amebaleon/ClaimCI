@@ -724,3 +724,19 @@ git diff --stat origin/main...HEAD
 ```
 
 Before running, inspect `pyproject.toml` and repository automation for configured lint/type commands. Execute each configured repository-supported lint/type command once and record it; if none exists, record the negative configuration search rather than inventing a checker. The scoped security review must cover provider/mapping authority, factory-only snapshot issuance, path/commit trust, selector canonicalization, collision behavior, legacy decoding, and fail-closed materialization. Stage and commit only the named report after its contents and hashes are independently reviewed.
+
+## Addendum — detached minimum-improvement source binding (2026-08-28)
+
+- [x] Add focused RED coverage for the A–H detached-declaration matrix, private
+  source document/span certificate, non-public serialization, historical claim
+  ID, and the real production-smoke extraction → planning → native Audit lane.
+- [x] Keep the three full-line labels and all locality, multiplicity,
+  compatibility, finite/nonnegative, and no-provider-authority checks inside
+  `recover_scientific_claim()` plus private deterministic-discovery plumbing.
+- [x] Carry the private certificate through compiler and obligation
+  re-validation without changing provider schemas or public JSON.
+- [x] Update the exact fixture so its original claim line remains unchanged,
+  has a same-document `0.05` declaration, reaches `READY`, and receives the
+  existing Audit `SUPPORTED` verdict.
+- [x] Record the single final Core suite, compile, dependency, lint/typecheck
+  audit, diff, and scoped security evidence in the verification addendum.

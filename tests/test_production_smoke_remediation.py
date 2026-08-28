@@ -8,15 +8,16 @@ from pathlib import Path
 
 from claimci.analysis import (
     ArtifactSnapshotRole,
-    EvidenceObligationReason,
-    EvidenceObligationState,
     GitCommitSha,
     PlanningState,
     RepositoryIdentity,
+    RuntimeExecutionContext,
+    execute_ephemeral_audit,
     passive_artifact_from_snapshot,
     plan_ephemeral_audit,
     planning_request_from_discovery,
 )
+from claimci.models import Verdict
 from claimci.analysis.adapters import extract_registered_artifact
 from claimci.analysis.discovery import discover_repository
 from claimci.review.models import ClaimDirection
@@ -29,6 +30,7 @@ EXACT_CLAIM = (
     "The candidate improves accuracy from 0.60 to 0.70 under the same "
     "configuration and evaluation dataset."
 )
+SOURCE_CERTIFIED_PR_BODY = EXACT_CLAIM + "\nDeclared minimum improvement: 0.05"
 EXPECTED_HEAD_SHA256 = {
     "README.md": "245906ae491e68f661e4b4571122bb3a9372211708af56bb07f28db87981e1bb",
     "research.yaml": "8c7121eeb7603b816de26699640cd28be1ca2192ecfc057a1a8a0daf4cdd3d16",
@@ -69,7 +71,7 @@ def _reconstruct_tree(root: Path, *, base: bool) -> None:
             destination.write_bytes(source.read_bytes())
 
 
-def test_controlled_fixture_reaches_honest_threshold_free_planning_boundary(
+def test_controlled_fixture_reaches_source_certified_native_audit(
     tmp_path: Path,
 ) -> None:
     base_root = tmp_path / "base"
@@ -86,7 +88,7 @@ def test_controlled_fixture_reaches_honest_threshold_free_planning_boundary(
         head_sha=HEAD_SHA,
         pr_number=1,
         pr_title="Production smoke: verify supported result",
-        pr_description=EXACT_CLAIM,
+        pr_description=SOURCE_CERTIFIED_PR_BODY,
     )
 
     assert len(discovery.claims) == 1
@@ -97,7 +99,8 @@ def test_controlled_fixture_reaches_honest_threshold_free_planning_boundary(
     assert discovery.claims[0].baseline_value.value == 0.60
     assert discovery.claims[0].candidate_value is not None
     assert discovery.claims[0].candidate_value.value == 0.70
-    assert discovery.claims[0].minimum_improvement is None
+    assert discovery.claims[0].minimum_improvement is not None
+    assert discovery.claims[0].minimum_improvement.value == 0.05
 
     evidence = []
     for candidate in discovery.artifacts:
@@ -136,18 +139,19 @@ def test_controlled_fixture_reaches_honest_threshold_free_planning_boundary(
     )
     outcome = plan_ephemeral_audit(request)
 
-    assert outcome.state is PlanningState.PARTIAL
-    assert outcome.reason == "required_threshold_not_recovered"
-    assert outcome.plan is None
+    assert outcome.state is PlanningState.READY
+    assert outcome.reason is None
+    assert outcome.plan is not None
     assert outcome.mapping_question is None
-    assert outcome.evidence_obligations is not None
-    assert outcome.evidence_obligations.blocking_obligation_ids == (
-        "claim.threshold",
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    audit = execute_ephemeral_audit(
+        outcome.plan,
+        RuntimeExecutionContext(
+            repository=REPOSITORY,
+            checkout_root=head_root,
+            head_sha=HEAD_SHA,
+            scratch_root=scratch_root,
+        ),
     )
-    threshold = next(
-        item
-        for item in outcome.evidence_obligations.obligations
-        if item.obligation_id == "claim.threshold"
-    )
-    assert threshold.state is EvidenceObligationState.MISSING
-    assert threshold.reason is EvidenceObligationReason.REQUIRED_THRESHOLD_NOT_RECOVERED
+    assert audit.verdict is Verdict.SUPPORTED

@@ -231,3 +231,38 @@ Final Core verification runs once after the branch is complete:
 - D1 migrations;
 - production deployment or production runs;
 - `/app` gate changes.
+
+## Addendum — detached minimum-improvement source binding (2026-08-28)
+
+`recover_scientific_claim()` remains the sole grammar authority. Deterministic
+discovery may supply it an invocation-private certificate for the exact
+Review-issued source document and the exact primary line span. The parser alone
+recognizes a detached declaration only when its entire source line has one of
+these ASCII-case-insensitive labels, with horizontal whitespace allowed only
+around the declaration:
+
+```text
+Declared minimum improvement:
+Minimum improvement:
+Required minimum improvement:
+```
+
+The value/unit grammar is the existing Core numeric grammar. A declaration
+must be finite and nonnegative, has no trailing prose, and is associated only
+when its document has exactly one recoverable `MetricImprovement` and exactly
+one valid declaration. Multiple claims or declarations leave the normal claim
+unattached. An inline and detached threshold must have the same value and
+unit; disagreement makes canonical recovery fail closed.
+
+The parser retains an immutable private binding containing the issued document
+identity/hash/text, primary span, and declaration span. Its `ClaimQuantity`
+keeps the deterministic source provenance. Re-validation by the compiler and
+claim-field-obligation path reuses that private certificate. The binding is
+not added to provider schemas and is explicitly excluded from `to_jsonable`,
+so public JSON retains its historical shape.
+
+The controlled fixture keeps the original scientific claim line byte-for-byte
+unchanged and adds `Declared minimum improvement: 0.05` as the next line of
+the same trusted PR-description document. It must now reach `READY` and the
+existing native Audit must return `SUPPORTED`; no provider, mapping, or
+manifest field becomes claim-threshold authority.

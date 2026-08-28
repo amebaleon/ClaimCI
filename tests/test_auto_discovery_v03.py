@@ -584,8 +584,8 @@ def test_deterministic_projection_uses_final_canonical_metric_fields(
     claim_text = "candidate improves accuracy from 0.60 to 0.70"
     original_recovery = discovery_claims.recover_scientific_claim
 
-    def recover(reference: ClaimReference):
-        recovered = original_recovery(reference)
+    def recover(reference: ClaimReference, **kwargs: object):
+        recovered = original_recovery(reference, **kwargs)
         if reference.claim_id == "claim-provisional" and recovered is not None:
             forged_primary = dataclasses.replace(
                 recovered.primary,
@@ -623,8 +623,8 @@ def test_deterministic_confidence_uses_final_canonical_value_presence(
     claim_text = "candidate improves accuracy from 0.60 to 0.70"
     original_recovery = discovery_claims.recover_scientific_claim
 
-    def recover(reference: ClaimReference):
-        recovered = original_recovery(reference)
+    def recover(reference: ClaimReference, **kwargs: object):
+        recovered = original_recovery(reference, **kwargs)
         if reference.claim_id == "claim-provisional" and recovered is not None:
             forged_primary = dataclasses.replace(
                 recovered.primary,

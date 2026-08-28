@@ -15,6 +15,8 @@ from claimci.analysis.claim_types import (
     ClaimQuantity,
     MetricImprovementClaim,
     PrimaryClaimKind,
+    _TrustedSourceDocument,
+    _issue_trusted_source_document,
     recover_scientific_claim,
 )
 from claimci.analysis.contracts import (
@@ -232,14 +234,25 @@ def _canonical_confidence(canonical: CanonicalScientificClaim) -> Confidence:
 
 def _recover_final_reference(
     reference: ClaimReference,
+    *,
+    trusted_source_document: _TrustedSourceDocument | None = None,
+    primary_span: tuple[int, int] | None = None,
 ) -> tuple[ClaimReference, CanonicalScientificClaim | None]:
-    canonical = recover_scientific_claim(reference)
+    canonical = recover_scientific_claim(
+        reference,
+        trusted_source_document=trusted_source_document,
+        primary_span=primary_span,
+    )
     if canonical is None:
         return reference, None
     confidence = _canonical_confidence(canonical)
     if confidence != reference.confidence:
         reference = replace(reference, confidence=confidence)
-        canonical = recover_scientific_claim(reference)
+        canonical = recover_scientific_claim(
+            reference,
+            trusted_source_document=trusted_source_document,
+            primary_span=primary_span,
+        )
     return reference, canonical
 
 
@@ -297,11 +310,33 @@ def _claimed_value(quantity: ClaimQuantity | None) -> ClaimedValue | None:
     return ClaimedValue(quantity.value, quantity.unit, quantity.provenance)
 
 
+def _source_lines(text: str) -> tuple[tuple[int, int, str], ...]:
+    """Return original source lines with the exact spans used for certification."""
+
+    lines: list[tuple[int, int, str]] = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        end = offset + len(raw_line)
+        line_end = end - 1 if raw_line.endswith("\n") else end
+        lines.append((offset, line_end, text[offset:line_end]))
+        offset = end
+    if offset < len(text):
+        lines.append((offset, len(text), text[offset:]))
+    return tuple(lines)
+
+
 def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
     claims: list[DiscoveredClaim] = []
     for record in context.source_bundle.sources:
-        lines = record.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        for line_number, source_text in enumerate(lines, start=1):
+        trusted_source_document = _issue_trusted_source_document(
+            source_id=record.source_id,
+            sha256=record.sha256,
+            text=record.text,
+        )
+        for line_number, (start, end, source_text) in enumerate(
+            _source_lines(record.text),
+            start=1,
+        ):
             if not source_text.strip():
                 continue
             matched = _canonical_fallback_match(source_text, record)
@@ -335,7 +370,11 @@ def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
                 confidence=Confidence(matched.confidence),
                 provenance=provenance,
             )
-            reference, canonical = _recover_final_reference(reference)
+            reference, canonical = _recover_final_reference(
+                reference,
+                trusted_source_document=trusted_source_document,
+                primary_span=(start, end),
+            )
             primary = (
                 canonical.primary
                 if canonical is not None
@@ -372,6 +411,7 @@ def _deterministic_claims(context: RepositoryContext) -> list[DiscoveredClaim]:
                         if primary is not None
                         else None
                     ),
+                    scientific_claim=canonical,
                 )
             )
             if len(claims) >= MAX_DISCOVERED_CLAIMS:
