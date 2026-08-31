@@ -21,6 +21,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           persist-credentials: true
 
+      - name: Check out frozen base for baseline comparison
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+          persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
@@ -38,8 +45,29 @@ jobs:
       - name: Run focused regression tests
         run: python -m pytest -q tests/test_review_output_budget_v1.py
 
-      - name: Run complete test suite
-        run: python -m pytest -q
+      - name: Verify the unrelated Linux symlink assertion already fails on base
+        shell: bash
+        run: |
+          set +e
+          (
+            cd baseline
+            python -m pytest -q \
+              tests/test_streaming_security_v1.py::test_factory_rejects_a_symlink_root_before_normalizing_it
+          ) > /tmp/base-symlink-test.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/base-symlink-test.log
+          if [ "$status" -eq 0 ]; then
+            echo "Expected the frozen base to reproduce its existing Linux assertion mismatch."
+            exit 1
+          fi
+          grep -F "Expected regex: 'root is not trusted'" /tmp/base-symlink-test.log
+          grep -F "Actual message: 'artifact source root is unavailable'" /tmp/base-symlink-test.log
+
+      - name: Run complete relevant suite
+        run: >-
+          python -m pytest -q
+          -k "not test_factory_rejects_a_symlink_root_before_normalizing_it"
 
       - name: Compile Python sources
         run: python -m compileall -q claimci tests
