@@ -25,6 +25,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Preserve literal newline escapes in the one-shot patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/apply_review_candidate_recovery_patch.py")
+          text = path.read_text(encoding="utf-8")
+          old = "        '''@dataclass(frozen=True)\nclass ClaimCandidateValidation:"
+          new = "        r'''@dataclass(frozen=True)\nclass ClaimCandidateValidation:"
+          if text.count(old) != 1:
+              raise SystemExit("could not locate semantic recovery replacement block")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+          PY
+
       - name: Apply one-shot semantic recovery patch
         run: python scripts/apply_review_candidate_recovery_patch.py
 
