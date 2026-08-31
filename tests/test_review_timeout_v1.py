@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from claimci.review.models import ReviewLimits
 from claimci.review.openai_provider import OpenAIReviewerProvider
 from claimci.review.provider import StructuredRequest
@@ -32,6 +34,11 @@ def test_review_limits_allow_a_90_second_claim_heavy_request() -> None:
     limits = ReviewLimits(timeout_seconds=90)
 
     assert limits.timeout_seconds == 90
+
+
+def test_review_limits_reject_timeout_above_the_120_second_ceiling() -> None:
+    with pytest.raises(ValueError, match="120"):
+        ReviewLimits(timeout_seconds=121)
 
 
 def test_openai_adapter_passes_a_90_second_timeout_to_the_request() -> None:
