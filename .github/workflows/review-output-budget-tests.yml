@@ -1,0 +1,37 @@
+name: Review output budget tests
+
+on:
+  pull_request:
+    paths:
+      - ".claimci/review.yaml"
+      - "claimci/review/**"
+      - "tests/test_review_*"
+      - ".github/workflows/review-output-budget-tests.yml"
+      - "README.md"
+
+permissions:
+  contents: read
+
+jobs:
+  review-output-budgets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+
+      - name: Install ClaimCI with test dependencies
+        run: python -m pip install -e ".[dev,llm]"
+
+      - name: Run focused regression tests
+        run: python -m pytest -q tests/test_review_output_budget_v1.py
+
+      - name: Run complete test suite
+        run: python -m pytest -q
+
+      - name: Compile Python sources
+        run: python -m compileall -q claimci tests
