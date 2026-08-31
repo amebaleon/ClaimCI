@@ -47,10 +47,12 @@ def test_review_limits_default_to_the_frozen_safe_budget() -> None:
     limits = models.ReviewLimits()
     assert limits.max_calls == 2
     assert limits.max_context_chars == 60_000
-    assert limits.max_output_chars == 12_000
+    assert limits.max_output_chars == 24_000
     assert limits.max_files == 24
     assert limits.max_file_chars == 16_000
-    assert limits.max_output_tokens_per_call == 2_000
+    assert limits.max_claims == 16
+    assert limits.extraction_max_output_tokens == 5_000
+    assert limits.synthesis_max_output_tokens == 4_000
     assert limits.timeout_seconds == 30
 
     if dataclasses.is_dataclass(limits) and getattr(limits, "__dataclass_params__").frozen:
@@ -70,7 +72,9 @@ def test_review_limits_default_to_the_frozen_safe_budget() -> None:
         ("max_output_chars", 0),
         ("max_files", 0),
         ("max_file_chars", 0),
-        ("max_output_tokens_per_call", 0),
+        ("max_claims", 0),
+        ("extraction_max_output_tokens", 0),
+        ("synthesis_max_output_tokens", 0),
         ("timeout_seconds", 0),
         ("timeout_seconds", 10**400),
     ],
@@ -114,10 +118,12 @@ def test_enabled_review_config_requires_the_complete_frozen_shape(tmp_path: Path
             "limits": {
                 "max_calls": 2,
                 "max_context_chars": 60_000,
-                "max_output_chars": 12_000,
+                "max_output_chars": 24_000,
                 "max_files": 24,
                 "max_file_chars": 16_000,
-                "max_output_tokens_per_call": 2_000,
+                "max_claims": 16,
+                "extraction_max_output_tokens": 5_000,
+                "synthesis_max_output_tokens": 4_000,
                 "timeout_seconds": 30,
             },
         },
@@ -204,10 +210,12 @@ def test_environment_model_override_cannot_hide_invalid_yaml_model_type(
             "limits": {
                 "max_calls": 2,
                 "max_context_chars": 60_000,
-                "max_output_chars": 12_000,
+                "max_output_chars": 24_000,
                 "max_files": 24,
                 "max_file_chars": 16_000,
-                "max_output_tokens_per_call": 2_000,
+                "max_claims": 16,
+                "extraction_max_output_tokens": 5_000,
+                "synthesis_max_output_tokens": 4_000,
                 "timeout_seconds": 30,
             },
         },

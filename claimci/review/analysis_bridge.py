@@ -319,7 +319,7 @@ def run_analysis_review(
         provider = OpenAIReviewerProvider(
             model=config.model,
             timeout_seconds=config.limits.timeout_seconds,
-            max_output_tokens=config.limits.max_output_tokens_per_call,
+            max_output_tokens=config.limits.synthesis_max_output_tokens,
         )
     deterministic = None
     if context.deterministic is not None:
@@ -362,7 +362,7 @@ def run_analysis_review(
         task="synthesize_review",
         payload=payload,
         schema=_ANALYSIS_SYNTHESIS_SCHEMA,
-        max_output_tokens=config.limits.max_output_tokens_per_call,
+        max_output_tokens=config.limits.synthesis_max_output_tokens,
     )
     try:
         response = provider.synthesize_review(request)
@@ -372,6 +372,10 @@ def run_analysis_review(
         ) from error
     if type(response) is not ProviderResponse:
         raise ReviewError("analysis synthesis provider returned an invalid response")
+    if not response.complete:
+        if response.incomplete_reason == "max_output_tokens":
+            raise ReviewError("analysis synthesis reached the provider output-token limit")
+        raise ReviewError("analysis synthesis did not return a complete structured response")
     if len(response.output_text) > config.limits.max_output_chars:
         raise ReviewError("analysis synthesis output exceeds the configured limit")
     return _parse_advisory(_strict_json(response.output_text))

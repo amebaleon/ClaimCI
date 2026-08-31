@@ -98,23 +98,31 @@ def _positive_int(value: object, label: str, maximum: int) -> int:
 class ReviewLimits:
     max_calls: int = 2
     max_context_chars: int = 60_000
-    max_output_chars: int = 12_000
+    max_output_chars: int = 24_000
     max_files: int = 24
     max_file_chars: int = 16_000
-    max_output_tokens_per_call: int = 2_000
+    max_claims: int = 16
+    extraction_max_output_tokens: int = 5_000
+    synthesis_max_output_tokens: int = 4_000
     timeout_seconds: float = 30.0
     retries: int = 0
 
     def __post_init__(self) -> None:
         _positive_int(self.max_calls, "max_calls", 2)
         _positive_int(self.max_context_chars, "max_context_chars", 60_000)
-        _positive_int(self.max_output_chars, "max_output_chars", 12_000)
+        _positive_int(self.max_output_chars, "max_output_chars", 24_000)
         _positive_int(self.max_files, "max_files", 24)
         _positive_int(self.max_file_chars, "max_file_chars", 16_000)
+        _positive_int(self.max_claims, "max_claims", 16)
         _positive_int(
-            self.max_output_tokens_per_call,
-            "max_output_tokens_per_call",
-            2_000,
+            self.extraction_max_output_tokens,
+            "extraction_max_output_tokens",
+            5_000,
+        )
+        _positive_int(
+            self.synthesis_max_output_tokens,
+            "synthesis_max_output_tokens",
+            4_000,
         )
         if isinstance(self.timeout_seconds, bool) or not isinstance(
             self.timeout_seconds, (int, float)

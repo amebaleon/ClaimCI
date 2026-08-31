@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -89,6 +90,12 @@ _EXTRACTION_CONTRACT: dict[str, str] = {
         "Extract only explicit, scientifically verifiable statements present "
         "in an issued source. Do not emit duplicate claims."
     ),
+    "claim_prioritization": (
+        "Return at most max_claims material claims. Prioritize claims affecting "
+        "correctness, benchmark or performance conclusions, experimental fairness, "
+        "production or deployment conclusions, and causal conclusions. Ignore minor "
+        "implementation statements unless they materially support one of those claims."
+    ),
     "source_location": (
         "Use only an issued source_id and 1-based inclusive start_line/end_line "
         "values that are inside that source."
@@ -138,7 +145,7 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
     "properties": {
         "claims": {
             "type": "array",
-            "maxItems": 64,
+            "maxItems": 16,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -212,6 +219,19 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
         }
     },
 }
+
+
+def _extraction_schema(max_claims: int) -> dict[str, Any]:
+    if (
+        isinstance(max_claims, bool)
+        or not isinstance(max_claims, int)
+        or not 1 <= max_claims <= 16
+    ):
+        raise ReviewError("max_claims must be an integer from 1 through 16")
+    schema = copy.deepcopy(_EXTRACTION_SCHEMA)
+    schema["properties"]["claims"]["maxItems"] = max_claims
+    return schema
+
 
 _SYNTHESIS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -571,7 +591,10 @@ def run_review(
         provider = OpenAIReviewerProvider(
             model=config.model,
             timeout_seconds=config.limits.timeout_seconds,
-            max_output_tokens=config.limits.max_output_tokens_per_call,
+            max_output_tokens=max(
+                config.limits.extraction_max_output_tokens,
+                config.limits.synthesis_max_output_tokens,
+            ),
         )
 
     calls: list[ProviderCallRecord] = []
@@ -598,6 +621,7 @@ def run_review(
             audit_plans,
             max_files=config.limits.max_files,
         )
+        extraction_schema = _extraction_schema(config.limits.max_claims)
         extraction_payload = {
             "policy": {
                 "mode": "advisory",
@@ -605,11 +629,12 @@ def run_review(
                 "deterministic_authority": "ClaimCI Audit only",
             },
             "extraction_contract": dict(_EXTRACTION_CONTRACT),
+            "max_claims": config.limits.max_claims,
             "sources": _plain(sources.sources),
             "repository_paths": _plain(sources.repository_paths),
         }
         extraction_chars = _request_chars(
-            "extract_claims", extraction_payload, _EXTRACTION_SCHEMA
+            "extract_claims", extraction_payload, extraction_schema
         )
         if extraction_chars > config.limits.max_context_chars:
             return _result(
@@ -620,18 +645,37 @@ def run_review(
         extraction_request = StructuredRequest(
             task="extract_claims",
             payload=extraction_payload,
-            schema=_EXTRACTION_SCHEMA,
-            max_output_tokens=config.limits.max_output_tokens_per_call,
+            schema=extraction_schema,
+            max_output_tokens=config.limits.extraction_max_output_tokens,
         )
         extraction_response = provider.extract_claims(extraction_request)
         extraction_call = _record_call(
             "extract_claims", extraction_response, extraction_chars
         )
         calls.append(extraction_call)
+        if not extraction_response.complete:
+            truncated = extraction_response.incomplete_reason == "max_output_tokens"
+            return _result(
+                ReviewStatus.PARTIAL,
+                calls=calls,
+                error_code=(
+                    "CLAIM_EXTRACTION_TRUNCATED"
+                    if truncated
+                    else "CLAIM_EXTRACTION_INCOMPLETE"
+                ),
+                error_message=(
+                    "Claim extraction reached the provider output-token limit before "
+                    "a complete structured response was returned."
+                    if truncated
+                    else "Claim extraction did not return a complete structured response."
+                ),
+            )
         if extraction_call.output_chars > config.limits.max_output_chars:
             raise ReviewError("provider extraction output exceeds configured limit")
         claims = validate_claim_candidates(
-            _parse_json(extraction_response.output_text), sources
+            _parse_json(extraction_response.output_text),
+            sources,
+            max_claims=config.limits.max_claims,
         )
         deterministic_audits = run_manifest_audits(
             inputs.repository_root,
@@ -707,13 +751,29 @@ def run_review(
             task="synthesize_review",
             payload=synthesis_payload,
             schema=_SYNTHESIS_SCHEMA,
-            max_output_tokens=config.limits.max_output_tokens_per_call,
+            max_output_tokens=config.limits.synthesis_max_output_tokens,
         )
         synthesis_response = provider.synthesize_review(synthesis_request)
         synthesis_call = _record_call(
             "synthesize_review", synthesis_response, synthesis_chars
         )
         calls.append(synthesis_call)
+        if not synthesis_response.complete:
+            truncated = synthesis_response.incomplete_reason == "max_output_tokens"
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code=("SYNTHESIS_TRUNCATED" if truncated else "SYNTHESIS_INCOMPLETE"),
+                error_message=(
+                    "Review synthesis reached the provider output-token limit before "
+                    "a complete structured response was returned."
+                    if truncated
+                    else "Review synthesis did not return a complete structured response."
+                ),
+            )
         if sum(call.output_chars for call in calls) > config.limits.max_output_chars:
             raise ReviewError("provider output exceeds configured total limit")
         interpretations = _parse_interpretations(

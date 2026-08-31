@@ -33,7 +33,7 @@ MAX_REPOSITORY_DEPTH = 64
 MAX_CHANGE_COMPARISON_FILES = 512
 MAX_CHANGE_COMPARISON_BYTES = 16 * 1024 * 1024
 MAX_CHANGE_COMPARISON_FILE_BYTES = 1024 * 1024
-MAX_CLAIMS = 64
+MAX_CLAIMS = 16
 MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
 
 
@@ -353,14 +353,22 @@ def _quote(record: SourceRecord, start_line: int, end_line: int) -> str:
 def validate_claim_candidates(
     payload: object,
     sources: SourceBundle,
+    *,
+    max_claims: int = MAX_CLAIMS,
 ) -> tuple[ScientificClaim, ...]:
     """Validate extraction output and assign trusted deterministic claim IDs."""
 
     if not isinstance(sources, SourceBundle):
         raise ReviewError("sources must be a SourceBundle")
+    if (
+        isinstance(max_claims, bool)
+        or not isinstance(max_claims, int)
+        or not 1 <= max_claims <= MAX_CLAIMS
+    ):
+        raise ReviewError("max_claims must be an integer from 1 through 16")
     root = _strict_fields(payload, {"claims"}, "claim extraction response")
     candidates = root["claims"]
-    if not isinstance(candidates, list) or len(candidates) > MAX_CLAIMS:
+    if not isinstance(candidates, list) or len(candidates) > max_claims:
         raise ReviewError("claims must be a bounded list")
     records = {source.source_id: source for source in sources.sources}
     expected = {

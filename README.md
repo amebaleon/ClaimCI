@@ -166,10 +166,12 @@ model: gpt-5.6-terra
 limits:
   max_calls: 2
   max_context_chars: 60000
-  max_output_chars: 12000
+  max_output_chars: 24000
   max_files: 24
   max_file_chars: 16000
-  max_output_tokens_per_call: 2000
+  max_claims: 16
+  extraction_max_output_tokens: 5000
+  synthesis_max_output_tokens: 4000
   timeout_seconds: 30
 ```
 
@@ -179,9 +181,12 @@ serialized, or committed. The default provider is OpenAI's `gpt-5.6-terra`;
 trusted runtime configuration may set `CLAIMCI_OPENAI_MODEL` to a compatible
 model. Automated tests use mocked providers and never make paid API calls.
 Each review uses at most two provider calls (claim extraction and evidence-
-grounded synthesis), a 60,000-character total context budget, and a 12,000-
-character output budget. Provider input/output/total tokens and estimated
-cost, when supplied, are recorded for observability only.
+grounded synthesis), a 60,000-character total context budget, a 16-claim
+materiality cap, task-specific output budgets of 5,000 and 4,000 tokens, and a
+24,000-character audit-wide output budget. Legacy trusted configurations using
+`max_output_tokens_per_call` remain readable and map that value to both calls.
+Provider input/output/total tokens and estimated cost, when supplied, are
+recorded for observability only.
 
 Selected private repository content may therefore be sent to the configured
 external provider when an owner enables this configuration. This boundary is

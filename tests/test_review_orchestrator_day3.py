@@ -32,10 +32,12 @@ def _config(**limit_updates: Any) -> ReviewConfig:
     defaults: dict[str, Any] = {
         "max_calls": 2,
         "max_context_chars": 60_000,
-        "max_output_chars": 12_000,
+        "max_output_chars": 24_000,
         "max_files": 24,
         "max_file_chars": 16_000,
-        "max_output_tokens_per_call": 2_000,
+        "max_claims": 16,
+        "extraction_max_output_tokens": 5_000,
+        "synthesis_max_output_tokens": 4_000,
         "timeout_seconds": 30.0,
     }
     defaults.update(limit_updates)
@@ -228,7 +230,7 @@ def test_run_review_uses_exact_extract_discover_tools_synthesize_sequence(
     assert len(provider.calls) == 2
     assert provider.calls[0].task == "extract_claims"
     assert provider.calls[1].task == "synthesize_review"
-    assert all(request.max_output_tokens == 2_000 for request in provider.calls)
+    assert [request.max_output_tokens for request in provider.calls] == [5_000, 4_000]
     # The second request is a reduced, trusted view; it does not hand the
     # provider a repository root or arbitrary tool/function capabilities.
     assert "repository_root" not in provider.calls[1].payload
