@@ -201,14 +201,15 @@ def test_all_invalid_candidates_remain_unavailable_and_skip_synthesis(
     assert [request.task for request in provider.calls] == ["extract_claims"]
 
 
-def test_invalid_synthesis_remains_unavailable_and_fail_closed(
+def test_invalid_synthesis_is_partial_and_fail_closed(
     tmp_path: Path,
 ) -> None:
     provider = _MixedExtractionProvider(invalid_synthesis=True)
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
-    assert result.error_code == "REVIEW_UNAVAILABLE"
-    assert result.claims == ()
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "SYNTHESIS_INVALID"
+    assert len(result.claims) == 1
+    assert result.interpretations == ()
     assert len(result.provider_calls) == 2

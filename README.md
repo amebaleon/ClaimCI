@@ -205,8 +205,11 @@ structured extraction response mixes valid claims with isolated malformed
 candidates, ClaimCI excludes only the invalid candidates, reviews every
 retained claim, and reports an explicit `PARTIAL` result. A uniquely
 recoverable exact full-line quote may have its line location repaired
-deterministically; paraphrases, ambiguous occurrences, all-invalid extraction,
-and malformed synthesis still fail closed. Its Markdown labels distinguish
+deterministically; paraphrases and ambiguous occurrences remain invalid, and
+all-invalid extraction still fails closed. Once extraction and deterministic
+evidence discovery have succeeded, malformed or semantically invalid synthesis
+is reported as `PARTIAL` with no invalid interpretation accepted. Its Markdown
+labels distinguish
 deterministic evidence, LLM interpretation, missing evidence, and unsupported
 inference. Only the separate deterministic
 **ClaimCI Audit** Check can block a PR; enabling or disabling review does not

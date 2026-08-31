@@ -791,10 +791,35 @@ def run_review(
                 ),
             )
         if sum(call.output_chars for call in calls) > config.limits.max_output_chars:
-            raise ReviewError("provider output exceeds configured total limit")
-        interpretations = _parse_interpretations(
-            _parse_json(synthesis_response.output_text), claims, evidence
-        )
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="SYNTHESIS_OUTPUT_LIMIT",
+                error_message=(
+                    "Review synthesis exceeded the configured aggregate output limit; "
+                    "no synthesis interpretation was accepted."
+                ),
+            )
+        try:
+            interpretations = _parse_interpretations(
+                _parse_json(synthesis_response.output_text), claims, evidence
+            )
+        except ReviewError:
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="SYNTHESIS_INVALID",
+                error_message=(
+                    "Review synthesis returned complete output that failed deterministic "
+                    "claim or citation validation; no synthesis interpretation was accepted."
+                ),
+            )
         if rejected_claim_candidates:
             return _result(
                 ReviewStatus.PARTIAL,

@@ -394,7 +394,7 @@ def test_unknown_claim_id_in_synthesis_is_rejected_without_authority_mutation(
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
     assert result.deterministic_audits == ()
 
@@ -408,7 +408,7 @@ def test_unknown_evidence_citation_is_rejected(tmp_path: Path) -> None:
     provider = FakeProvider(synthesis=unknown_citation)
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -481,7 +481,7 @@ def test_evidence_citation_must_be_issued_for_the_interpreted_claim(
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -501,7 +501,7 @@ def test_malformed_synthesis_output_is_unavailable_without_a_third_call(
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert [request.task for request in provider.calls] == [
         "extract_claims",
         "synthesize_review",
@@ -518,7 +518,7 @@ def test_synthesis_rejects_lone_unicode_surrogates_before_rendering(
 
     result = _run(tmp_path, FakeProvider(synthesis=surrogate_text))
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
 
 
 def test_authority_field_injection_in_synthesis_is_rejected(tmp_path: Path) -> None:
@@ -535,7 +535,7 @@ def test_authority_field_injection_in_synthesis_is_rejected(tmp_path: Path) -> N
     provider = FakeProvider(synthesis=invented_authority)
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -549,7 +549,7 @@ def test_oversized_synthesis_output_is_unavailable_without_retry(tmp_path: Path)
     # aggregate generated output across both calls.
     result = _run(tmp_path, provider, config=_config(max_output_chars=500))
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 

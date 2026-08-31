@@ -425,7 +425,7 @@ def test_synthesis_must_cover_each_accepted_claim_exactly_once(tmp_path: Path) -
     provider = OmittingProvider()
     result = run_review(ReviewInputs(repository_root=repository), _enabled_config(), provider=provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert [request.task for request in provider.calls] == ["extract_claims", "synthesize_review"]
 
 
