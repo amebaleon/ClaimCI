@@ -191,7 +191,7 @@ def _wrap_pipeline(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
 
     names = {
         "collect_review_sources": "sources",
-        "validate_claim_candidates": "validate",
+        "validate_claim_candidates_best_effort": "validate",
         "discover_evidence": "evidence",
         "discover_manifests": "manifests",
         "plan_manifest_audits": "plans",

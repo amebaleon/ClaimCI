@@ -200,9 +200,15 @@ bounded base/head change index. This boundary is especially important for
 data, while configuration and code come from the trusted base branch. Disable
 or omit `.claimci/review.yaml` when external data egress is not acceptable.
 
-The review check is always `neutral` and is never a quality gate. Its Markdown
-labels distinguish deterministic evidence, LLM interpretation, missing
-evidence, and unsupported inference. Only the separate deterministic
+The review check is always `neutral` and is never a quality gate. When one
+structured extraction response mixes valid claims with isolated malformed
+candidates, ClaimCI excludes only the invalid candidates, reviews every
+retained claim, and reports an explicit `PARTIAL` result. A uniquely
+recoverable exact full-line quote may have its line location repaired
+deterministically; paraphrases, ambiguous occurrences, all-invalid extraction,
+and malformed synthesis still fail closed. Its Markdown labels distinguish
+deterministic evidence, LLM interpretation, missing evidence, and unsupported
+inference. Only the separate deterministic
 **ClaimCI Audit** Check can block a PR; enabling or disabling review does not
 change deterministic audit bytes, verdicts, or exit codes. A future strict
 organization policy may make unresolved review findings non-passing on this

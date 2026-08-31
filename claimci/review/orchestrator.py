@@ -32,7 +32,10 @@ from .provider import (
     ReviewerProvider,
     StructuredRequest,
 )
-from .sources import collect_review_sources, validate_claim_candidates
+from .sources import (
+    collect_review_sources,
+    validate_claim_candidates_best_effort,
+)
 from .tools import (
     DeterministicAuditSnapshot,
     ManifestAuditBundle,
@@ -679,11 +682,17 @@ def run_review(
             )
         if extraction_call.output_chars > config.limits.max_output_chars:
             raise ReviewError("provider extraction output exceeds configured limit")
-        claims = validate_claim_candidates(
+        claim_validation = validate_claim_candidates_best_effort(
             _parse_json(extraction_response.output_text),
             sources,
             max_claims=config.limits.max_claims,
         )
+        claims = claim_validation.claims
+        rejected_claim_candidates = claim_validation.rejected_count
+        if rejected_claim_candidates and not claims:
+            raise ReviewError(
+                "all extracted claim candidates failed deterministic source validation"
+            )
         deterministic_audits = run_manifest_audits(
             inputs.repository_root,
             manifest_candidates,
@@ -786,6 +795,21 @@ def run_review(
         interpretations = _parse_interpretations(
             _parse_json(synthesis_response.output_text), claims, evidence
         )
+        if rejected_claim_candidates:
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                interpretations=interpretations,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="CLAIM_CANDIDATES_REJECTED",
+                error_message=(
+                    f"{rejected_claim_candidates} extracted claim candidate(s) failed "
+                    "deterministic source validation and were excluded; every retained "
+                    "claim was reviewed."
+                ),
+            )
         return _result(
             ReviewStatus.COMPLETE,
             claims=claims,
