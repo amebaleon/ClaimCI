@@ -1,4 +1,4 @@
-"""Regression tests for semantic claim-extraction and synthesis failures."""
+"""Regression tests for semantic claim-extraction recovery."""
 
 from __future__ import annotations
 
@@ -101,7 +101,13 @@ def test_best_effort_validation_rejects_only_the_bad_candidate(
 
 
 class _MixedExtractionProvider:
-    def __init__(self, *, invalid_synthesis: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        all_invalid: bool = False,
+        invalid_synthesis: bool = False,
+    ) -> None:
+        self.all_invalid = all_invalid
         self.invalid_synthesis = invalid_synthesis
         self.calls: list[StructuredRequest] = []
 
@@ -120,19 +126,13 @@ class _MixedExtractionProvider:
         source = request.payload["sources"][0]
         source_id = source["source_id"]
         text = source["text"]
-        return self._response(
-            request.task,
-            {
-                "claims": [
-                    _candidate(source_id, text),
-                    _candidate(
-                        source_id,
-                        "This paraphrase does not occur in the issued source.",
-                        subject="invalid paraphrase",
-                    ),
-                ]
-            },
+        invalid = _candidate(
+            source_id,
+            "This paraphrase does not occur in the issued source.",
+            subject="invalid paraphrase",
         )
+        claims = [invalid] if self.all_invalid else [_candidate(source_id, text), invalid]
+        return self._response(request.task, {"claims": claims})
 
     def synthesize_review(self, request: StructuredRequest) -> ProviderResponse:
         self.calls.append(request)
@@ -188,15 +188,27 @@ def test_orchestrator_reviews_valid_claims_and_reports_rejected_candidates(
     assert len(result.provider_calls) == 2
 
 
-def test_invalid_synthesis_is_partial_and_preserves_valid_extraction(
+def test_all_invalid_candidates_remain_unavailable_and_skip_synthesis(
+    tmp_path: Path,
+) -> None:
+    provider = _MixedExtractionProvider(all_invalid=True)
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "REVIEW_UNAVAILABLE"
+    assert result.claims == ()
+    assert [request.task for request in provider.calls] == ["extract_claims"]
+
+
+def test_invalid_synthesis_remains_unavailable_and_fail_closed(
     tmp_path: Path,
 ) -> None:
     provider = _MixedExtractionProvider(invalid_synthesis=True)
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.PARTIAL
-    assert result.error_code == "SYNTHESIS_INVALID"
-    assert len(result.claims) == 1
-    assert result.interpretations == ()
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "REVIEW_UNAVAILABLE"
+    assert result.claims == ()
     assert len(result.provider_calls) == 2
