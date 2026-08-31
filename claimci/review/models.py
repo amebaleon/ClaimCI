@@ -127,15 +127,15 @@ class ReviewLimits:
         if isinstance(self.timeout_seconds, bool) or not isinstance(
             self.timeout_seconds, (int, float)
         ):
-            raise ReviewError("timeout_seconds must be a finite number from 0 through 30")
+            raise ReviewError("timeout_seconds must be a finite number from 0 through 120")
         try:
             timeout = float(self.timeout_seconds)
         except (OverflowError, TypeError, ValueError) as exc:
             raise ReviewError(
-                "timeout_seconds must be a finite number from 0 through 30"
+                "timeout_seconds must be a finite number from 0 through 120"
             ) from exc
-        if not math.isfinite(timeout) or not 0 < timeout <= 30:
-            raise ReviewError("timeout_seconds must be a finite number from 0 through 30")
+        if not math.isfinite(timeout) or not 0 < timeout <= 120:
+            raise ReviewError("timeout_seconds must be a finite number from 0 through 120")
         if isinstance(self.retries, bool) or self.retries != 0:
             raise ReviewError("provider retries must be zero")
 

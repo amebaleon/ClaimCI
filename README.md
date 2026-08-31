@@ -172,7 +172,7 @@ limits:
   max_claims: 16
   extraction_max_output_tokens: 5000
   synthesis_max_output_tokens: 4000
-  timeout_seconds: 30
+  timeout_seconds: 90
 ```
 
 The workflow supplies `OPENAI_API_KEY` only to the trusted review step. ClaimCI
@@ -186,7 +186,7 @@ materiality cap, task-specific output budgets of 5,000 and 4,000 tokens, and a
 24,000-character audit-wide output budget. Legacy trusted configurations using
 `max_output_tokens_per_call` remain readable and map that value to both calls.
 Provider input/output/total tokens and estimated cost, when supplied, are
-recorded for observability only.
+recorded for observability only. The checked-in configuration allows 90 seconds per provider call; trusted configurations may choose any finite timeout up to 120 seconds.
 
 Selected private repository content may therefore be sent to the configured
 external provider when an owner enables this configuration. This boundary is

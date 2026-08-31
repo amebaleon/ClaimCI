@@ -13,4 +13,4 @@ limits:
   max_claims: 16
   extraction_max_output_tokens: 5000
   synthesis_max_output_tokens: 4000
-  timeout_seconds: 30
+  timeout_seconds: 90

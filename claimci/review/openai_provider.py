@@ -75,9 +75,9 @@ class OpenAIReviewerProvider:
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(float(timeout_seconds))
-            or not 0 < float(timeout_seconds) <= 30
+            or not 0 < float(timeout_seconds) <= 120
         ):
-            raise ReviewError("OpenAI timeout must be finite and from 0 through 30")
+            raise ReviewError("OpenAI timeout must be finite and from 0 through 120")
         if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 1:
             raise ReviewError("OpenAI max_output_tokens must be positive")
         self.model = model.strip()
