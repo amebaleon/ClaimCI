@@ -6,16 +6,16 @@ import apply_review_output_budget_patch as patch
 
 
 def _patch_analysis_bridge() -> None:
-    patch._replace_once(
+    replaced = patch._replace_all(
         "claimci/review/analysis_bridge.py",
         "max_output_tokens=config.limits.max_output_tokens_per_call,",
         "max_output_tokens=config.limits.synthesis_max_output_tokens,",
     )
-    patch._replace_once(
-        "claimci/review/analysis_bridge.py",
-        "max_output_tokens=config.limits.max_output_tokens_per_call,",
-        "max_output_tokens=config.limits.synthesis_max_output_tokens,",
-    )
+    if replaced != 2:
+        raise RuntimeError(
+            "claimci/review/analysis_bridge.py: expected two output budget references, "
+            f"found {replaced}"
+        )
     patch._replace_once(
         "claimci/review/analysis_bridge.py",
         '''    if type(response) is not ProviderResponse:
