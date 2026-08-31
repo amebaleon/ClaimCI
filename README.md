@@ -189,11 +189,16 @@ Provider input/output/total tokens and estimated cost, when supplied, are
 recorded for observability only. The checked-in configuration allows 90 seconds per provider call; trusted configurations may choose any finite timeout up to 120 seconds.
 
 Selected private repository content may therefore be sent to the configured
-external provider when an owner enables this configuration. This boundary is
-especially important for `pull_request_target` and fork pull requests: the
-head checkout is passive data, while configuration and code come from the
-trusted base branch. Disable or omit `.claimci/review.yaml` when external data
-egress is not acceptable.
+external provider when an owner enables this configuration. With a trusted
+base checkout, heuristic evidence discovery is confined to files changed by
+the pull request. Unchanged files enter review only through a relevant
+`research.yaml` whose manifest or declared artifact changed, or through an
+exact route-valid evidence path recovered from the issued sources. Structured
+research artifacts such as SQL, JSON, YAML, CSV, and TOML participate in the
+bounded base/head change index. This boundary is especially important for
+`pull_request_target` and fork pull requests: the head checkout is passive
+data, while configuration and code come from the trusted base branch. Disable
+or omit `.claimci/review.yaml` when external data egress is not acceptable.
 
 The review check is always `neutral` and is never a quality gate. Its Markdown
 labels distinguish deterministic evidence, LLM interpretation, missing

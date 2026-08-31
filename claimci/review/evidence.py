@@ -358,6 +358,16 @@ def discover_evidence(
             if normalized is None or normalized not in normalized_index:
                 raise ReviewError("changed evidence path is unsafe or not indexed")
             changed.add(normalized)
+    # With a trusted base checkout, heuristic discovery is confined to
+    # files changed by the pull request. Unchanged files remain reachable only
+    # through trusted manifest priority or an exact, route-valid provider hint.
+    # Without a base checkout, every indexed path is treated as changed.
+    heuristic_index = (
+        sorted_index
+        if changed_paths is None
+        else tuple(path for path in sorted_index if path in changed)
+    )
+
     by_path: dict[str, set[str]] = defaultdict(set)
     priority_order: list[str] = []
     missing: list[MissingEvidence] = []
@@ -385,7 +395,7 @@ def discover_evidence(
                     priority_order.append(normalized)
 
     for claim in claims:
-        for path in sorted_index:
+        for path in heuristic_index:
             if _matches(claim, path, changed):
                 by_path[path].add(claim.claim_id)
         hints = tuple(claim.evidence_hints)

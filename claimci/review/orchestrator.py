@@ -40,6 +40,7 @@ from .tools import (
     discover_manifests,
     plan_manifest_audits,
     run_manifest_audits,
+    select_relevant_manifest_audit_plans,
 )
 
 
@@ -611,10 +612,16 @@ def run_review(
             sources.repository_paths,
             max_manifests=min(4, config.limits.max_files),
         )
-        audit_plans = plan_manifest_audits(
-            inputs.repository_root,
-            manifest_candidates,
-            limits=config.limits,
+        audit_plans = select_relevant_manifest_audit_plans(
+            plan_manifest_audits(
+                inputs.repository_root,
+                manifest_candidates,
+                limits=config.limits,
+            ),
+            changed_paths=sources.changed_paths,
+        )
+        manifest_candidates = tuple(
+            plan.manifest_path for plan in audit_plans
         )
         sources = _sources_after_manifest_reservation(
             sources,

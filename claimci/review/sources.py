@@ -135,15 +135,32 @@ def _eligible_document(path: str) -> bool:
     return suffix in {".md", ".markdown"} or name == "paper.tex"
 
 
+_CHANGE_EVIDENCE_SUFFIXES = {
+    ".py",
+    ".js",
+    ".ts",
+    ".rs",
+    ".go",
+    ".sql",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".csv",
+    ".tsv",
+}
+
+
 def _change_candidate(path: str) -> bool:
-    """Return paths whose base/head status can affect review file selection."""
+    """Return paths whose base/head status can affect review evidence."""
 
     relative = Path(path)
     lowered = relative.as_posix().casefold()
     name = relative.name.casefold()
     return (
         _eligible_document(path)
-        or relative.suffix.casefold() in {".py", ".js", ".ts", ".rs", ".go"}
+        or relative.suffix.casefold() in _CHANGE_EVIDENCE_SUFFIXES
         or lowered.startswith(("src/", "lib/", "claimci/", "tests/"))
         or name.startswith("test_")
     )
