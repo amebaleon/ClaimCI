@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "scripts/apply_review_output_budget_patch.py"
+      - "scripts/apply_review_output_budget_patch_v2.py"
       - ".github/workflows/apply-review-output-budget-patch.yml"
 
 permissions:
@@ -26,7 +27,7 @@ jobs:
           python-version: "3.11"
 
       - name: Apply one-shot patch
-        run: python scripts/apply_review_output_budget_patch.py
+        run: python scripts/apply_review_output_budget_patch_v2.py
 
       - name: Reject malformed diffs
         run: git diff --check
