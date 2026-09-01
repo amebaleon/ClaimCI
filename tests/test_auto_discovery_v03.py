@@ -353,7 +353,10 @@ def test_repository_context_reuses_bounded_review_index_and_changed_sources(
         RepositoryPath("README.md"),
         RepositoryPath("candidate_results.json"),
     )
-    assert context.changed_paths == (RepositoryPath("README.md"),)
+    assert context.changed_paths == (
+        RepositoryPath("README.md"),
+        RepositoryPath("candidate_results.json"),
+    )
     assert tuple(source.text for source in context.source_bundle.sources) == (
         "Candidate study",
         "Bounded description",
