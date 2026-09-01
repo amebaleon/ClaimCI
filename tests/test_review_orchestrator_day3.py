@@ -585,6 +585,98 @@ def test_context_limit_stops_before_provider_call(tmp_path: Path) -> None:
     assert provider.calls == []
 
 
+def test_context_is_bounded_per_provider_request(tmp_path: Path) -> None:
+    provider = FakeProvider()
+
+    result = _run(tmp_path, provider, config=_config(max_context_chars=4_000))
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+    assert len(result.provider_calls) == 2
+    input_chars = [call.input_chars for call in result.provider_calls]
+    assert all(value <= 4_000 for value in input_chars)
+    assert sum(input_chars) > 4_000
+
+
+def test_context_limit_rejects_oversized_extraction_request_without_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    observed: dict[str, int] = {}
+    original = orchestrator._request_chars
+
+    def traced_request_chars(task: str, payload: object, schema: object) -> int:
+        chars = original(task, payload, schema)
+        observed[task] = chars
+        return chars
+
+    monkeypatch.setattr(orchestrator, "_request_chars", traced_request_chars)
+    base_inputs = _inputs(tmp_path)
+    inputs = ReviewInputs(
+        repository_root=base_inputs.repository_root,
+        pr_title=base_inputs.pr_title,
+        pr_description="x" * 60_000,
+    )
+    provider = FakeProvider()
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert observed["extract_claims"] > 60_000
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "CONTEXT_LIMIT"
+    assert provider.calls == []
+
+
+def test_context_limit_rejects_oversized_synthesis_request_without_second_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    base_inputs = _inputs(tmp_path)
+    for index in range(4):
+        (base_inputs.repository_root / f"result-{index}.json").write_text(
+            "x" * 16_000,
+            encoding="utf-8",
+        )
+
+    observed: dict[str, int] = {}
+    original = orchestrator._request_chars
+
+    def traced_request_chars(task: str, payload: object, schema: object) -> int:
+        chars = original(task, payload, schema)
+        observed[task] = chars
+        return chars
+
+    monkeypatch.setattr(orchestrator, "_request_chars", traced_request_chars)
+    provider = FakeProvider()
+
+    result = run_review(base_inputs, _config(), provider=provider)
+
+    assert observed["extract_claims"] <= 60_000
+    assert observed["synthesize_review"] > 60_000
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "CONTEXT_LIMIT"
+    assert len(provider.calls) == 1
+    assert [request.task for request in provider.calls] == ["extract_claims"]
+    assert len(result.provider_calls) == 1
+    assert [reference.path for reference in result.evidence.references] == [
+        "result-0.json",
+        "result-1.json",
+        "result-2.json",
+        "result-3.json",
+    ]
+    assert [reference.size for reference in result.evidence.references] == [
+        16_000,
+        16_000,
+        16_000,
+        16_000,
+    ]
+
+
 def test_file_limit_is_global_across_sources_evidence_and_manifests(
     tmp_path: Path,
 ) -> None:

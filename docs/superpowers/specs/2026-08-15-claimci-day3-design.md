@@ -139,9 +139,9 @@ documents are compared by content hash; no PR code or build hook is executed.
 
 Only regular files confined beneath the checked-out repository may be read.
 Selection applies deterministic ordering, extension/name allowlists, file
-count, per-file character, total context, nesting, and decoding limits before
-provider construction. A bounded relative-path repository index may be sent;
-file content is not sent until selected.
+count, per-file character, per-provider-request logical context, nesting, and
+decoding limits before provider construction. A bounded relative-path repository
+index may be sent; file content is not sent until selected.
 
 ## Structured claims
 
@@ -246,7 +246,7 @@ configuration.
 Default hard limits are:
 
 - maximum provider calls: 2;
-- maximum total serialized provider context: 60,000 characters;
+- maximum serialized logical context per provider request: 60,000 characters;
 - maximum provider output across the audit: 12,000 characters;
 - maximum selected files: 24;
 - maximum characters from one file: 16,000;
@@ -254,9 +254,9 @@ Default hard limits are:
 - timeout per call: 30 seconds;
 - retries: 0.
 
-The orchestrator accounts for serialized input and raw output before accepting
-responses. Limit exhaustion produces an advisory unavailable/partial status and
-cannot affect deterministic findings.
+The orchestrator accounts for each provider request's serialized input and raw
+output before accepting responses. Limit exhaustion produces an advisory
+unavailable/partial status and cannot affect deterministic findings.
 
 Every live provider response records, when supplied by the provider:
 
