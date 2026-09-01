@@ -105,10 +105,12 @@ model: gpt-5.6-terra
 limits:
   max_calls: 2
   max_context_chars: 60000
-  max_output_chars: 12000
+  max_output_chars: 24000
   max_files: 24
   max_file_chars: 16000
-  max_output_tokens_per_call: 2000
+  max_claims: 16
+  extraction_max_output_tokens: 5000
+  synthesis_max_output_tokens: 4000
   timeout_seconds: 30
 ```
 
