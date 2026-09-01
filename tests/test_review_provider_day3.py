@@ -217,7 +217,7 @@ def test_openai_adapter_missing_sdk_is_lazy_and_controlled(monkeypatch: pytest.M
         provider.extract_claims(_request())
 
 
-@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf, 31.0])
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf, 121.0])
 def test_openai_adapter_rejects_nonfinite_or_out_of_policy_timeout(
     timeout: float,
 ) -> None:

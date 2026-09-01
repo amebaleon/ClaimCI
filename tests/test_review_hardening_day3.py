@@ -54,10 +54,12 @@ def _enabled_config(**updates: Any) -> ReviewConfig:
     limits: dict[str, Any] = {
         "max_calls": 2,
         "max_context_chars": 60_000,
-        "max_output_chars": 12_000,
+        "max_output_chars": 24_000,
         "max_files": 24,
         "max_file_chars": 16_000,
-        "max_output_tokens_per_call": 2_000,
+        "max_claims": 16,
+        "extraction_max_output_tokens": 5_000,
+        "synthesis_max_output_tokens": 4_000,
         "timeout_seconds": 30.0,
     }
     limits.update(updates)
@@ -423,7 +425,7 @@ def test_synthesis_must_cover_each_accepted_claim_exactly_once(tmp_path: Path) -
     provider = OmittingProvider()
     result = run_review(ReviewInputs(repository_root=repository), _enabled_config(), provider=provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert [request.task for request in provider.calls] == ["extract_claims", "synthesize_review"]
 
 
@@ -614,10 +616,12 @@ def _write_enabled_config(root: Path, *, max_context_chars: int = 60_000) -> Pat
                 "limits": {
                     "max_calls": 2,
                     "max_context_chars": max_context_chars,
-                    "max_output_chars": 12_000,
+                    "max_output_chars": 24_000,
                     "max_files": 24,
                     "max_file_chars": 16_000,
-                    "max_output_tokens_per_call": 2_000,
+                    "max_claims": 16,
+                    "extraction_max_output_tokens": 5_000,
+                    "synthesis_max_output_tokens": 4_000,
                     "timeout_seconds": 30,
                 },
             },

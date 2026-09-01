@@ -166,11 +166,13 @@ model: gpt-5.6-terra
 limits:
   max_calls: 2
   max_context_chars: 60000
-  max_output_chars: 12000
+  max_output_chars: 24000
   max_files: 24
   max_file_chars: 16000
-  max_output_tokens_per_call: 2000
-  timeout_seconds: 30
+  max_claims: 16
+  extraction_max_output_tokens: 5000
+  synthesis_max_output_tokens: 4000
+  timeout_seconds: 90
 ```
 
 The workflow supplies `OPENAI_API_KEY` only to the trusted review step. ClaimCI
@@ -179,20 +181,38 @@ serialized, or committed. The default provider is OpenAI's `gpt-5.6-terra`;
 trusted runtime configuration may set `CLAIMCI_OPENAI_MODEL` to a compatible
 model. Automated tests use mocked providers and never make paid API calls.
 Each review uses at most two provider calls (claim extraction and evidence-
-grounded synthesis), a 60,000-character total context budget, and a 12,000-
-character output budget. Provider input/output/total tokens and estimated
-cost, when supplied, are recorded for observability only.
+grounded synthesis), with a 60,000-character context budget applied
+independently to each provider request, a 16-claim materiality cap, task-specific
+output budgets of 5,000 and 4,000 tokens, and a 24,000-character audit-wide
+output budget. Legacy trusted configurations using
+`max_output_tokens_per_call` remain readable and map that value to both calls.
+Provider input/output/total tokens and estimated cost, when supplied, are
+recorded for observability only. The checked-in configuration allows 90 seconds per provider call; trusted configurations may choose any finite timeout up to 120 seconds.
 
 Selected private repository content may therefore be sent to the configured
-external provider when an owner enables this configuration. This boundary is
-especially important for `pull_request_target` and fork pull requests: the
-head checkout is passive data, while configuration and code come from the
-trusted base branch. Disable or omit `.claimci/review.yaml` when external data
-egress is not acceptable.
+external provider when an owner enables this configuration. With a trusted
+base checkout, heuristic evidence discovery is confined to files changed by
+the pull request. Unchanged files enter review only through a relevant
+`research.yaml` whose manifest or declared artifact changed, or through an
+exact route-valid evidence path recovered from the issued sources. Structured
+research artifacts such as SQL, JSON, YAML, CSV, and TOML participate in the
+bounded base/head change index. This boundary is especially important for
+`pull_request_target` and fork pull requests: the head checkout is passive
+data, while configuration and code come from the trusted base branch. Disable
+or omit `.claimci/review.yaml` when external data egress is not acceptable.
 
-The review check is always `neutral` and is never a quality gate. Its Markdown
-labels distinguish deterministic evidence, LLM interpretation, missing
-evidence, and unsupported inference. Only the separate deterministic
+The review check is always `neutral` and is never a quality gate. When one
+structured extraction response mixes valid claims with isolated malformed
+candidates, ClaimCI excludes only the invalid candidates, reviews every
+retained claim, and reports an explicit `PARTIAL` result. A uniquely
+recoverable exact full-line quote may have its line location repaired
+deterministically; paraphrases and ambiguous occurrences remain invalid, and
+all-invalid extraction still fails closed. Once extraction and deterministic
+evidence discovery have succeeded, malformed or semantically invalid synthesis
+is reported as `PARTIAL` with no invalid interpretation accepted. Its Markdown
+labels distinguish
+deterministic evidence, LLM interpretation, missing evidence, and unsupported
+inference. Only the separate deterministic
 **ClaimCI Audit** Check can block a PR; enabling or disabling review does not
 change deterministic audit bytes, verdicts, or exit codes. A future strict
 organization policy may make unresolved review findings non-passing on this

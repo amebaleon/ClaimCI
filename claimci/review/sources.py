@@ -7,6 +7,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ MAX_REPOSITORY_DEPTH = 64
 MAX_CHANGE_COMPARISON_FILES = 512
 MAX_CHANGE_COMPARISON_BYTES = 16 * 1024 * 1024
 MAX_CHANGE_COMPARISON_FILE_BYTES = 1024 * 1024
-MAX_CLAIMS = 64
+MAX_CLAIMS = 16
 MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
 
 
@@ -135,15 +136,32 @@ def _eligible_document(path: str) -> bool:
     return suffix in {".md", ".markdown"} or name == "paper.tex"
 
 
+_CHANGE_EVIDENCE_SUFFIXES = {
+    ".py",
+    ".js",
+    ".ts",
+    ".rs",
+    ".go",
+    ".sql",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".csv",
+    ".tsv",
+}
+
+
 def _change_candidate(path: str) -> bool:
-    """Return paths whose base/head status can affect review file selection."""
+    """Return paths whose base/head status can affect review evidence."""
 
     relative = Path(path)
     lowered = relative.as_posix().casefold()
     name = relative.name.casefold()
     return (
         _eligible_document(path)
-        or relative.suffix.casefold() in {".py", ".js", ".ts", ".rs", ".go"}
+        or relative.suffix.casefold() in _CHANGE_EVIDENCE_SUFFIXES
         or lowered.startswith(("src/", "lib/", "claimci/", "tests/"))
         or name.startswith("test_")
     )
@@ -350,17 +368,164 @@ def _quote(record: SourceRecord, start_line: int, end_line: int) -> str:
     return "\n".join(lines[start_line - 1 : end_line])
 
 
+@dataclass(frozen=True)
+class ClaimCandidateValidation:
+    """Trusted claims retained from one untrusted extraction response."""
+
+    claims: tuple[ScientificClaim, ...]
+    rejection_reasons: tuple[str, ...] = ()
+
+    @property
+    def rejected_count(self) -> int:
+        return len(self.rejection_reasons)
+
+
+def _recover_exact_quote_location(
+    candidate_value: object,
+    records: Mapping[str, SourceRecord],
+) -> object:
+    """Repair only a uniquely recoverable exact full-line quote location.
+
+    Recovery cannot bless invented text. It succeeds only when the provider's
+    exact quote occurs once as complete consecutive lines inside the already
+    issued source. Paraphrases and repeated ambiguous text remain invalid.
+    """
+
+    if not isinstance(candidate_value, Mapping):
+        return candidate_value
+    source_value = candidate_value.get("source")
+    source_text = candidate_value.get("source_text")
+    if not isinstance(source_value, Mapping) or not isinstance(source_text, str):
+        return candidate_value
+    source_id = source_value.get("source_id")
+    if not isinstance(source_id, str) or source_id not in records or not source_text:
+        return candidate_value
+
+    record = records[source_id]
+    start_line = source_value.get("start_line")
+    end_line = source_value.get("end_line")
+    if (
+        isinstance(start_line, int)
+        and not isinstance(start_line, bool)
+        and isinstance(end_line, int)
+        and not isinstance(end_line, bool)
+    ):
+        try:
+            if source_text == _quote(record, start_line, end_line):
+                return candidate_value
+        except ReviewError:
+            pass
+
+    source_lines = record.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    quote_lines = source_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not quote_lines or any(line == "" for line in quote_lines):
+        return candidate_value
+    width = len(quote_lines)
+    matches = [
+        index
+        for index in range(0, len(source_lines) - width + 1)
+        if source_lines[index : index + width] == quote_lines
+    ]
+    if len(matches) != 1:
+        return candidate_value
+
+    recovered = dict(candidate_value)
+    recovered_source = dict(source_value)
+    recovered_source["start_line"] = matches[0] + 1
+    recovered_source["end_line"] = matches[0] + width
+    recovered["source"] = recovered_source
+    return recovered
+
+
+def _claim_rejection_reason(exc: ReviewError) -> str:
+    message = str(exc)
+    if "source quote does not match" in message:
+        return "source_quote_mismatch"
+    if (
+        "outside the selected source" in message
+        or "cites an unknown source" in message
+        or "claim source" in message
+    ):
+        return "source_location_invalid"
+    if "duplicates an earlier claim" in message:
+        return "duplicate_claim"
+    return "invalid_claim_candidate"
+
+
+def validate_claim_candidates_best_effort(
+    payload: object,
+    sources: SourceBundle,
+    *,
+    max_claims: int = MAX_CLAIMS,
+) -> ClaimCandidateValidation:
+    """Retain valid claims while excluding isolated malformed candidates.
+
+    Top-level response corruption still raises and fails closed. Each candidate
+    is then checked by the unchanged strict validator. This permits a mixed
+    response to retain good advisory claims without weakening source identity,
+    field, authority, or citation boundaries.
+    """
+
+    if not isinstance(sources, SourceBundle):
+        raise ReviewError("sources must be a SourceBundle")
+    if (
+        isinstance(max_claims, bool)
+        or not isinstance(max_claims, int)
+        or not 1 <= max_claims <= MAX_CLAIMS
+    ):
+        raise ReviewError("max_claims must be an integer from 1 through 16")
+    root = _strict_fields(payload, {"claims"}, "claim extraction response")
+    candidates = root["claims"]
+    if not isinstance(candidates, list) or len(candidates) > max_claims:
+        raise ReviewError("claims must be a bounded list")
+
+    records = {source.source_id: source for source in sources.sources}
+    accepted: list[ScientificClaim] = []
+    accepted_ids: set[str] = set()
+    rejection_reasons: list[str] = []
+    for candidate in candidates:
+        recovered = _recover_exact_quote_location(candidate, records)
+        try:
+            validated = validate_claim_candidates(
+                {"claims": [recovered]},
+                sources,
+                max_claims=1,
+            )
+        except ReviewError as exc:
+            rejection_reasons.append(_claim_rejection_reason(exc))
+            continue
+        claim = validated[0]
+        if claim.claim_id in accepted_ids:
+            rejection_reasons.append("duplicate_claim")
+            continue
+        accepted.append(claim)
+        accepted_ids.add(claim.claim_id)
+
+    return ClaimCandidateValidation(
+        claims=tuple(accepted),
+        rejection_reasons=tuple(rejection_reasons),
+    )
+
+
 def validate_claim_candidates(
     payload: object,
     sources: SourceBundle,
+    *,
+    max_claims: int = MAX_CLAIMS,
 ) -> tuple[ScientificClaim, ...]:
     """Validate extraction output and assign trusted deterministic claim IDs."""
 
     if not isinstance(sources, SourceBundle):
         raise ReviewError("sources must be a SourceBundle")
+    if (
+        isinstance(max_claims, bool)
+        or not isinstance(max_claims, int)
+        or not 1 <= max_claims <= MAX_CLAIMS
+    ):
+        raise ReviewError("max_claims must be an integer from 1 through 16")
     root = _strict_fields(payload, {"claims"}, "claim extraction response")
     candidates = root["claims"]
-    if not isinstance(candidates, list) or len(candidates) > MAX_CLAIMS:
+    if not isinstance(candidates, list) or len(candidates) > max_claims:
         raise ReviewError("claims must be a bounded list")
     records = {source.source_id: source for source in sources.sources}
     expected = {

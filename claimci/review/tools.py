@@ -68,6 +68,42 @@ class ManifestAuditPlan:
     paths: tuple[str, ...]
 
 
+def select_relevant_manifest_audit_plans(
+    plans: Sequence[ManifestAuditPlan],
+    *,
+    changed_paths: Sequence[str],
+) -> tuple[ManifestAuditPlan, ...]:
+    """Keep audits whose manifest or declared artifact changed in this PR.
+
+    An unrelated study elsewhere in a large repository must not reserve the
+    review file budget, appear as deterministic authority, or enter synthesis.
+    A no-base local review still marks every eligible file as changed, so this
+    filter does not weaken standalone inspection.
+    """
+
+    if not isinstance(plans, Sequence) or isinstance(plans, (str, bytes)):
+        raise ReviewError("manifest audit plans must be a sequence")
+    if not all(isinstance(plan, ManifestAuditPlan) for plan in plans):
+        raise ReviewError("manifest audit plans contain an invalid value")
+    if not isinstance(changed_paths, Sequence) or isinstance(
+        changed_paths, (str, bytes)
+    ):
+        raise ReviewError("changed manifest paths must be a sequence")
+
+    changed: set[str] = set()
+    for raw in changed_paths:
+        relative = _relative(raw)
+        if relative is None:
+            raise ReviewError("changed manifest path is unsafe")
+        changed.add(relative)
+
+    return tuple(
+        plan
+        for plan in plans
+        if any(path in changed for path in plan.paths)
+    )
+
+
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})

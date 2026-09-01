@@ -22,15 +22,25 @@ _TOP_LEVEL_FIELDS = {
     "model",
     "limits",
 }
-_LIMIT_FIELDS = {
+_COMMON_LIMIT_FIELDS = {
     "max_calls",
     "max_context_chars",
     "max_output_chars",
     "max_files",
     "max_file_chars",
-    "max_output_tokens_per_call",
     "timeout_seconds",
 }
+_TASK_OUTPUT_LIMIT_FIELDS = {
+    "max_claims",
+    "extraction_max_output_tokens",
+    "synthesis_max_output_tokens",
+}
+_LEGACY_OUTPUT_LIMIT_FIELD = "max_output_tokens_per_call"
+_LIMIT_FIELDS = (
+    _COMMON_LIMIT_FIELDS
+    | _TASK_OUTPUT_LIMIT_FIELDS
+    | {_LEGACY_OUTPUT_LIMIT_FIELD}
+)
 
 
 def _resolve_config_path(repository_root: Path, config_path: Path | None) -> Path:
@@ -42,6 +52,47 @@ def _resolve_config_path(repository_root: Path, config_path: Path | None) -> Pat
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         raise ReviewError(f"review configuration path is invalid or outside repository: {exc}") from exc
     return resolved
+
+
+def _normalize_limits(
+    raw_limits: Mapping[object, object],
+    *,
+    enabled: bool,
+) -> dict[str, object]:
+    fields = set(raw_limits)
+    unknown_limits = fields - _LIMIT_FIELDS
+    if unknown_limits:
+        raise ReviewError(
+            f"review limits have unknown fields: {sorted(map(str, unknown_limits))}"
+        )
+
+    uses_legacy = _LEGACY_OUTPUT_LIMIT_FIELD in fields
+    task_fields = fields & _TASK_OUTPUT_LIMIT_FIELDS
+    if uses_legacy and task_fields:
+        raise ReviewError(
+            "legacy max_output_tokens_per_call cannot be combined with "
+            "task-specific output limits"
+        )
+
+    if enabled:
+        required = _COMMON_LIMIT_FIELDS | (
+            {_LEGACY_OUTPUT_LIMIT_FIELD}
+            if uses_legacy
+            else _TASK_OUTPUT_LIMIT_FIELDS
+        )
+        missing_limits = required - fields
+        if missing_limits:
+            raise ReviewError(
+                f"enabled review limits are missing fields: {sorted(missing_limits)}"
+            )
+
+    normalized = dict(raw_limits)
+    if uses_legacy:
+        legacy_value = normalized.pop(_LEGACY_OUTPUT_LIMIT_FIELD)
+        normalized.setdefault("max_claims", 16)
+        normalized["extraction_max_output_tokens"] = legacy_value
+        normalized["synthesis_max_output_tokens"] = legacy_value
+    return normalized
 
 
 def load_review_config(
@@ -85,15 +136,9 @@ def load_review_config(
     raw_limits = payload.get("limits", {})
     if not isinstance(raw_limits, Mapping):
         raise ReviewError("review configuration limits must be a mapping")
-    unknown_limits = set(raw_limits) - _LIMIT_FIELDS
-    if unknown_limits:
-        raise ReviewError(f"review limits have unknown fields: {sorted(map(str, unknown_limits))}")
-    if enabled:
-        missing_limits = _LIMIT_FIELDS - set(raw_limits)
-        if missing_limits:
-            raise ReviewError(f"enabled review limits are missing fields: {sorted(missing_limits)}")
+    normalized_limits = _normalize_limits(raw_limits, enabled=enabled)
     try:
-        limits = ReviewLimits(**dict(raw_limits))
+        limits = ReviewLimits(**normalized_limits)
         configured = ReviewConfig(
             schema_version=payload["schema_version"],
             enabled=enabled,

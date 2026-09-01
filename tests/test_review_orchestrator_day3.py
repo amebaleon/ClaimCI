@@ -32,10 +32,12 @@ def _config(**limit_updates: Any) -> ReviewConfig:
     defaults: dict[str, Any] = {
         "max_calls": 2,
         "max_context_chars": 60_000,
-        "max_output_chars": 12_000,
+        "max_output_chars": 24_000,
         "max_files": 24,
         "max_file_chars": 16_000,
-        "max_output_tokens_per_call": 2_000,
+        "max_claims": 16,
+        "extraction_max_output_tokens": 5_000,
+        "synthesis_max_output_tokens": 4_000,
         "timeout_seconds": 30.0,
     }
     defaults.update(limit_updates)
@@ -189,7 +191,7 @@ def _wrap_pipeline(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
 
     names = {
         "collect_review_sources": "sources",
-        "validate_claim_candidates": "validate",
+        "validate_claim_candidates_best_effort": "validate",
         "discover_evidence": "evidence",
         "discover_manifests": "manifests",
         "plan_manifest_audits": "plans",
@@ -228,7 +230,7 @@ def test_run_review_uses_exact_extract_discover_tools_synthesize_sequence(
     assert len(provider.calls) == 2
     assert provider.calls[0].task == "extract_claims"
     assert provider.calls[1].task == "synthesize_review"
-    assert all(request.max_output_tokens == 2_000 for request in provider.calls)
+    assert [request.max_output_tokens for request in provider.calls] == [5_000, 4_000]
     # The second request is a reduced, trusted view; it does not hand the
     # provider a repository root or arbitrary tool/function capabilities.
     assert "repository_root" not in provider.calls[1].payload
@@ -275,6 +277,12 @@ def test_synthesis_request_matches_the_trusted_interpretation_validator_contract
         assert "assigned to that claim" in contract["citations"]
         assert "Do not cite rule IDs" in contract["citations"]
         assert "empty list" in contract["missing_evidence"]
+        assert "analyzed snapshot" in contract["missing_evidence"]
+        assert "original repository" in contract["missing_evidence"]
+        assert "reported_measurement" in contract["evidence_provenance"]
+        assert "not proof of execution" in contract["evidence_provenance"]
+        assert "executable_benchmark_definition" in contract["evidence_provenance"]
+        assert "executed_result_artifact" in contract["evidence_provenance"]
         assert "advisory interpretation" in contract["authority"]
         return _synthesis_output(request)
 
@@ -392,7 +400,7 @@ def test_unknown_claim_id_in_synthesis_is_rejected_without_authority_mutation(
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
     assert result.deterministic_audits == ()
 
@@ -406,7 +414,7 @@ def test_unknown_evidence_citation_is_rejected(tmp_path: Path) -> None:
     provider = FakeProvider(synthesis=unknown_citation)
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -479,7 +487,7 @@ def test_evidence_citation_must_be_issued_for_the_interpreted_claim(
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -499,7 +507,7 @@ def test_malformed_synthesis_output_is_unavailable_without_a_third_call(
 
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert [request.task for request in provider.calls] == [
         "extract_claims",
         "synthesize_review",
@@ -516,7 +524,7 @@ def test_synthesis_rejects_lone_unicode_surrogates_before_rendering(
 
     result = _run(tmp_path, FakeProvider(synthesis=surrogate_text))
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
 
 
 def test_authority_field_injection_in_synthesis_is_rejected(tmp_path: Path) -> None:
@@ -533,7 +541,7 @@ def test_authority_field_injection_in_synthesis_is_rejected(tmp_path: Path) -> N
     provider = FakeProvider(synthesis=invented_authority)
     result = _run(tmp_path, provider)
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -547,7 +555,7 @@ def test_oversized_synthesis_output_is_unavailable_without_retry(tmp_path: Path)
     # aggregate generated output across both calls.
     result = _run(tmp_path, provider, config=_config(max_output_chars=500))
 
-    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
 
 
@@ -575,6 +583,98 @@ def test_context_limit_stops_before_provider_call(tmp_path: Path) -> None:
 
     assert result.status is ReviewStatus.UNAVAILABLE
     assert provider.calls == []
+
+
+def test_context_is_bounded_per_provider_request(tmp_path: Path) -> None:
+    provider = FakeProvider()
+
+    result = _run(tmp_path, provider, config=_config(max_context_chars=4_000))
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+    assert len(result.provider_calls) == 2
+    input_chars = [call.input_chars for call in result.provider_calls]
+    assert all(value <= 4_000 for value in input_chars)
+    assert sum(input_chars) > 4_000
+
+
+def test_context_limit_rejects_oversized_extraction_request_without_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    observed: dict[str, int] = {}
+    original = orchestrator._request_chars
+
+    def traced_request_chars(task: str, payload: object, schema: object) -> int:
+        chars = original(task, payload, schema)
+        observed[task] = chars
+        return chars
+
+    monkeypatch.setattr(orchestrator, "_request_chars", traced_request_chars)
+    base_inputs = _inputs(tmp_path)
+    inputs = ReviewInputs(
+        repository_root=base_inputs.repository_root,
+        pr_title=base_inputs.pr_title,
+        pr_description="x" * 60_000,
+    )
+    provider = FakeProvider()
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert observed["extract_claims"] > 60_000
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "CONTEXT_LIMIT"
+    assert provider.calls == []
+
+
+def test_context_limit_rejects_oversized_synthesis_request_without_second_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    base_inputs = _inputs(tmp_path)
+    for index in range(4):
+        (base_inputs.repository_root / f"result-{index}.json").write_text(
+            "x" * 16_000,
+            encoding="utf-8",
+        )
+
+    observed: dict[str, int] = {}
+    original = orchestrator._request_chars
+
+    def traced_request_chars(task: str, payload: object, schema: object) -> int:
+        chars = original(task, payload, schema)
+        observed[task] = chars
+        return chars
+
+    monkeypatch.setattr(orchestrator, "_request_chars", traced_request_chars)
+    provider = FakeProvider()
+
+    result = run_review(base_inputs, _config(), provider=provider)
+
+    assert observed["extract_claims"] <= 60_000
+    assert observed["synthesize_review"] > 60_000
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "CONTEXT_LIMIT"
+    assert len(provider.calls) == 1
+    assert [request.task for request in provider.calls] == ["extract_claims"]
+    assert len(result.provider_calls) == 1
+    assert [reference.path for reference in result.evidence.references] == [
+        "result-0.json",
+        "result-1.json",
+        "result-2.json",
+        "result-3.json",
+    ]
+    assert [reference.size for reference in result.evidence.references] == [
+        16_000,
+        16_000,
+        16_000,
+        16_000,
+    ]
 
 
 def test_file_limit_is_global_across_sources_evidence_and_manifests(

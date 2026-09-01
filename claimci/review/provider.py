@@ -47,6 +47,8 @@ class ProviderResponse:
     model: str
     request_id: str | None = None
     usage: ProviderUsage = field(default_factory=ProviderUsage)
+    complete: bool = True
+    incomplete_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.output_text, str):
@@ -59,6 +61,16 @@ class ProviderResponse:
             raise ReviewError("provider request_id must be text or null")
         if not isinstance(self.usage, ProviderUsage):
             raise ReviewError("provider usage must be ProviderUsage")
+        if not isinstance(self.complete, bool):
+            raise ReviewError("provider completion state must be a boolean")
+        if self.incomplete_reason is not None and (
+            not isinstance(self.incomplete_reason, str)
+            or not self.incomplete_reason.strip()
+            or len(self.incomplete_reason) > 128
+        ):
+            raise ReviewError("provider incomplete reason must be bounded text or null")
+        if self.complete and self.incomplete_reason is not None:
+            raise ReviewError("a complete provider response cannot have an incomplete reason")
 
 
 class ReviewerProvider(Protocol):

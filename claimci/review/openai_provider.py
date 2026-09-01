@@ -75,9 +75,9 @@ class OpenAIReviewerProvider:
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(float(timeout_seconds))
-            or not 0 < float(timeout_seconds) <= 30
+            or not 0 < float(timeout_seconds) <= 120
         ):
-            raise ReviewError("OpenAI timeout must be finite and from 0 through 30")
+            raise ReviewError("OpenAI timeout must be finite and from 0 through 120")
         if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 1:
             raise ReviewError("OpenAI max_output_tokens must be positive")
         self.model = model.strip()
@@ -149,6 +149,23 @@ class OpenAIReviewerProvider:
         output_text = getattr(response, "output_text", None)
         if not isinstance(output_text, str):
             raise ReviewError("OpenAI provider returned no structured text output")
+
+        status = getattr(response, "status", None)
+        if status in (None, "completed"):
+            complete = True
+            incomplete_reason = None
+        elif status == "incomplete":
+            complete = False
+            details = getattr(response, "incomplete_details", None)
+            raw_reason = getattr(details, "reason", None)
+            incomplete_reason = (
+                raw_reason
+                if isinstance(raw_reason, str) and raw_reason.strip() and len(raw_reason) <= 128
+                else "unknown"
+            )
+        else:
+            raise ReviewError("OpenAI provider returned a non-completed response")
+
         raw_usage = getattr(response, "usage", None)
         input_tokens = _usage_value(raw_usage, "input_tokens")
         output_count = _usage_value(raw_usage, "output_tokens")
@@ -165,6 +182,8 @@ class OpenAIReviewerProvider:
             model=self.model,
             request_id=getattr(response, "id", None),
             usage=usage,
+            complete=complete,
+            incomplete_reason=incomplete_reason,
         )
 
     def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
