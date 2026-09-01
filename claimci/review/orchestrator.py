@@ -356,7 +356,7 @@ def _serialized_chars(value: object) -> int:
 
 
 def _request_chars(task: str, payload: object, schema: object) -> int:
-    """Count the complete logical provider context, not only repository data."""
+    """Count the complete logical context for this provider request."""
 
     return _serialized_chars(
         {
@@ -813,7 +813,7 @@ def run_review(
         synthesis_chars = _request_chars(
             "synthesize_review", synthesis_payload, synthesis_schema
         )
-        if extraction_chars + synthesis_chars > config.limits.max_context_chars:
+        if synthesis_chars > config.limits.max_context_chars:
             return _result(
                 ReviewStatus.PARTIAL,
                 claims=claims,

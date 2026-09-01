@@ -105,10 +105,12 @@ model: gpt-5.6-terra
 limits:
   max_calls: 2
   max_context_chars: 60000
-  max_output_chars: 12000
+  max_output_chars: 24000
   max_files: 24
   max_file_chars: 16000
-  max_output_tokens_per_call: 2000
+  max_claims: 16
+  extraction_max_output_tokens: 5000
+  synthesis_max_output_tokens: 4000
   timeout_seconds: 30
 ```
 
@@ -139,9 +141,9 @@ documents are compared by content hash; no PR code or build hook is executed.
 
 Only regular files confined beneath the checked-out repository may be read.
 Selection applies deterministic ordering, extension/name allowlists, file
-count, per-file character, total context, nesting, and decoding limits before
-provider construction. A bounded relative-path repository index may be sent;
-file content is not sent until selected.
+count, per-file character, per-provider-request logical context, nesting, and
+decoding limits before provider construction. A bounded relative-path repository
+index may be sent; file content is not sent until selected.
 
 ## Structured claims
 
@@ -246,17 +248,18 @@ configuration.
 Default hard limits are:
 
 - maximum provider calls: 2;
-- maximum total serialized provider context: 60,000 characters;
-- maximum provider output across the audit: 12,000 characters;
+- maximum serialized logical context per provider request: 60,000 characters;
+- maximum provider output across the audit: 24,000 characters;
 - maximum selected files: 24;
 - maximum characters from one file: 16,000;
-- maximum output tokens per call: 2,000;
+- maximum extraction output tokens: 5,000;
+- maximum synthesis output tokens: 4,000;
 - timeout per call: 30 seconds;
 - retries: 0.
 
-The orchestrator accounts for serialized input and raw output before accepting
-responses. Limit exhaustion produces an advisory unavailable/partial status and
-cannot affect deterministic findings.
+The orchestrator accounts for each provider request's serialized input and raw
+output before accepting responses. Limit exhaustion produces an advisory
+unavailable/partial status and cannot affect deterministic findings.
 
 Every live provider response records, when supplied by the provider:
 

@@ -181,9 +181,10 @@ serialized, or committed. The default provider is OpenAI's `gpt-5.6-terra`;
 trusted runtime configuration may set `CLAIMCI_OPENAI_MODEL` to a compatible
 model. Automated tests use mocked providers and never make paid API calls.
 Each review uses at most two provider calls (claim extraction and evidence-
-grounded synthesis), a 60,000-character total context budget, a 16-claim
-materiality cap, task-specific output budgets of 5,000 and 4,000 tokens, and a
-24,000-character audit-wide output budget. Legacy trusted configurations using
+grounded synthesis), with a 60,000-character context budget applied
+independently to each provider request, a 16-claim materiality cap, task-specific
+output budgets of 5,000 and 4,000 tokens, and a 24,000-character audit-wide
+output budget. Legacy trusted configurations using
 `max_output_tokens_per_call` remain readable and map that value to both calls.
 Provider input/output/total tokens and estimated cost, when supplied, are
 recorded for observability only. The checked-in configuration allows 90 seconds per provider call; trusted configurations may choose any finite timeout up to 120 seconds.
