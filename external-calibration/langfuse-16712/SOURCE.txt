@@ -1,0 +1,5 @@
+Public source: langfuse/langfuse pull request #16712
+Source head: dacfbb14be0ecf380b5460dedac706fae60d89e3
+Feature base: 2cf36fd398db9048dd63127e407399bb12bbd31f
+Run marker: final-repeat
+Snapshot purpose: passive ClaimCI Research Review calibration only
