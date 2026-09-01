@@ -122,6 +122,7 @@ jobs:
 
   research_review:
     name: ClaimCI research review
+    if: github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     # The provider can inspect repository contents but cannot create or update
     # Checks. The job-level map narrows the inherited workflow permissions.

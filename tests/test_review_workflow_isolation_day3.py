@@ -12,10 +12,33 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 
 WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "claimci.yml"
+
+_REPOSITORY = "amebaleon/ClaimCI"
+_EXTERNAL_HEAD_REPOSITORY = "amebaleon/ClaimCI-fork"
+_PULL_REQUEST_EVENTS = ("opened", "synchronize", "reopened", "ready_for_review")
+_RESEARCH_REVIEW_GUARD = (
+    "github.event.pull_request.head.repo.full_name != github.repository"
+)
+
+# Keep this matrix deliberately bounded: each supported pull-request event is
+# exercised once for an exact internal head-repository identity and once for
+# an external identity.  Expected dispatch values are hand-derived from the
+# security policy, not from the workflow condition under test.
+_RESEARCH_REVIEW_DISPATCH_MATRIX = (
+    ("opened", _REPOSITORY, False),
+    ("opened", _EXTERNAL_HEAD_REPOSITORY, True),
+    ("synchronize", _REPOSITORY, False),
+    ("synchronize", _EXTERNAL_HEAD_REPOSITORY, True),
+    ("reopened", _REPOSITORY, False),
+    ("reopened", _EXTERNAL_HEAD_REPOSITORY, True),
+    ("ready_for_review", _REPOSITORY, False),
+    ("ready_for_review", _EXTERNAL_HEAD_REPOSITORY, True),
+)
 
 
 def _workflow() -> tuple[str, dict[str, Any]]:
@@ -161,6 +184,72 @@ def _has_github_token(workflow: Mapping[str, Any], job: Mapping[str, Any]) -> bo
             text,
         )
     )
+
+
+def _pull_request_target_types(workflow: Mapping[str, Any]) -> tuple[str, ...]:
+    """Resolve the four supported target events from YAML 1.1/1.2 parsing."""
+
+    raw_on = workflow.get("on")
+    if raw_on is None:
+        # PyYAML 6 parses the YAML 1.2 ``on`` key as ``True`` under its
+        # YAML 1.1 resolver, while GitHub still consumes the literal key.
+        raw_on = workflow.get(True)
+    assert isinstance(raw_on, Mapping)
+    pull_request_target = raw_on.get("pull_request_target")
+    assert isinstance(pull_request_target, Mapping)
+    raw_types = pull_request_target.get("types")
+    assert isinstance(raw_types, list)
+    assert all(isinstance(event, str) for event in raw_types)
+    return tuple(raw_types)
+
+
+def _evaluate_research_review_condition(
+    condition: object,
+    *,
+    head_repository: str,
+    repository: str,
+) -> bool:
+    """Evaluate only the exact repository-identity expression we require.
+
+    This small evaluator keeps the event matrix local and deterministic while
+    rejecting branch, actor, fuzzy, and secret-based substitutes for the
+    repository identity guard.
+    """
+
+    assert condition == _RESEARCH_REVIEW_GUARD
+    return head_repository != repository
+
+
+@pytest.mark.parametrize(
+    ("event", "head_repository", "expected_provider_dispatch"),
+    _RESEARCH_REVIEW_DISPATCH_MATRIX,
+)
+def test_research_review_dispatches_only_for_external_heads_on_all_target_events(
+    event: str,
+    head_repository: str,
+    expected_provider_dispatch: bool,
+) -> None:
+    """Internal PRs never reach the provider; external PRs remain enabled."""
+
+    _workflow_text, workflow = _workflow()
+    jobs = _jobs(workflow)
+    assert _pull_request_target_types(workflow) == _PULL_REQUEST_EVENTS
+
+    review = jobs.get("research_review")
+    assert review is not None
+    assert event in _PULL_REQUEST_EVENTS
+    assert event in _pull_request_target_types(workflow)
+
+    dispatches = _evaluate_research_review_condition(
+        review.get("if"),
+        head_repository=head_repository,
+        repository=_REPOSITORY,
+    )
+    assert dispatches is expected_provider_dispatch
+
+    # The deterministic audit remains unconditional for every event in the
+    # matrix; only the optional provider job is identity-gated.
+    assert jobs["claimci"].get("if") is None
 
 
 def test_provider_execution_is_in_a_read_only_job_without_check_credentials() -> None:
