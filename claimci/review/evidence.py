@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from claimci.passive_files import PassiveFileError, capture_confined_regular_file
 
 from .models import ClaimType, ReviewError, ReviewLimits, ScientificClaim
+from .path_policy import is_source_file, is_test_source_file
 
 
 MAX_EVIDENCE_FILE_BYTES = 16 * 1024 * 1024
@@ -67,6 +68,7 @@ class EvidenceBundle:
     references: tuple[EvidenceReference, ...] = ()
     missing: tuple[MissingEvidence, ...] = ()
     total_chars: int = 0
+    routing_incomplete: bool = False
 
 
 _ROUTES: dict[ClaimType, tuple[str, ...]] = {
@@ -126,11 +128,6 @@ _ROUTES: dict[ClaimType, tuple[str, ...]] = {
         "claimci/",
         "tests/",
         "test_",
-        ".py",
-        ".js",
-        ".ts",
-        ".rs",
-        ".go",
     ),
     ClaimType.OTHER_SCIENTIFIC: (
         "research.yaml",
@@ -232,9 +229,13 @@ def _kind(path: str) -> EvidenceKind:
     # File format is authoritative for implementation evidence.  A source
     # filename such as ``config.py`` must not bypass the changed-file policy
     # merely because its stem also names another evidence category.
-    if lowered.startswith("tests/") or name.startswith("test_"):
+    if (
+        lowered.startswith("tests/")
+        or name.startswith("test_")
+        or is_test_source_file(path)
+    ):
         return EvidenceKind.TEST
-    if PurePosixPath(path).suffix.casefold() in {".py", ".js", ".ts", ".rs", ".go"}:
+    if is_source_file(path):
         return EvidenceKind.SOURCE
     if tokens & {"result", "results", "metric", "metrics", "score", "scores"}:
         return EvidenceKind.RESULTS
@@ -539,13 +540,20 @@ def _matches(
     name = PurePosixPath(lowered).name
     segments = tuple(part for part in PurePosixPath(lowered).parts if part not in {"/", ""})
     tokens = _tokens(lowered)
+    kind = _kind(path)
 
     if (
         claim.claim_type in _CHANGED_SOURCE_CLAIMS
-        and _kind(path) in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+        and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
         and path not in changed_paths
     ):
         return False
+
+    if (
+        claim.claim_type is ClaimType.IMPLEMENTATION_CLAIM
+        and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+    ):
+        return True
 
     def route_term_matches(term: str) -> bool:
         term = term.casefold()
@@ -682,6 +690,7 @@ def discover_evidence(
     by_path: dict[str, set[str]] = defaultdict(set)
     priority_order: list[str] = []
     missing: list[MissingEvidence] = []
+    unresolved_hint_claim_ids: set[str] = set()
 
     claims_by_id = {claim.claim_id: claim for claim in claims}
     claim_ids = set(claims_by_id)
@@ -719,6 +728,7 @@ def discover_evidence(
         for raw_hint in hints:
             normalized = _safe_relative(raw_hint)
             if normalized is None:
+                unresolved_hint_claim_ids.add(claim.claim_id)
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -728,7 +738,23 @@ def discover_evidence(
                     )
                 )
                 continue
+            if normalized not in normalized_index:
+                unresolved_hint_claim_ids.add(claim.claim_id)
+                missing.append(
+                    MissingEvidence(
+                        claim_id=claim.claim_id,
+                        requested_path=str(raw_hint),
+                        reason="unresolved_provider_hint",
+                        description=(
+                            "Provider-suggested evidence hint was unresolved because "
+                            "it did not exactly match an indexed repository path; no "
+                            "repository file availability conclusion was made."
+                        ),
+                    )
+                )
+                continue
             if not _matches(claim, normalized, changed):
+                unresolved_hint_claim_ids.add(claim.claim_id)
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -742,12 +768,12 @@ def discover_evidence(
                 )
                 continue
             resolved, reason = _validate_regular(root, normalized)
-            if normalized not in normalized_index or resolved is None:
+            if resolved is None:
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
                         requested_path=str(raw_hint),
-                        reason="not_available" if resolved is None else "not_indexed",
+                        reason="not_available",
                         description=(
                             reason
                             or "Suggested path was not available in ClaimCI's bounded analyzed snapshot."
@@ -994,4 +1020,5 @@ def discover_evidence(
             )
         ),
         total_chars=sum(len(reference.excerpt) for reference in references),
+        routing_incomplete=bool(unresolved_hint_claim_ids - covered),
     )

@@ -114,6 +114,10 @@ _EXTRACTION_CONTRACT: dict[str, str] = {
         "text/unit, qualifier, and evidence hint. Use null or [] instead of "
         "empty strings."
     ),
+    "evidence_hints": (
+        "Use only exact repository-relative paths from repository_paths; "
+        "otherwise use an empty list. Never return descriptions or invented paths."
+    ),
     "authority": (
         "Do not emit verdicts, findings, severity, impact, thresholds, or "
         "deterministic evidence."
@@ -908,6 +912,21 @@ def run_review(
                     f"{rejected_claim_candidates} extracted claim candidate(s) failed "
                     "deterministic source validation and were excluded; every retained "
                     "claim was reviewed."
+                ),
+            )
+        if evidence.routing_incomplete:
+            return _result(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                interpretations=interpretations,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="EVIDENCE_ROUTING_INCOMPLETE",
+                error_message=(
+                    "One or more provider-suggested evidence hints remained "
+                    "unresolved after deterministic evidence routing; every retained "
+                    "claim was interpreted, but the advisory review is incomplete."
                 ),
             )
         return _result(
