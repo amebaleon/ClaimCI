@@ -26,6 +26,7 @@ from .models import (
     SourceLocation,
     SourceRecord,
 )
+from .path_policy import is_source_file
 
 
 MAX_REPOSITORY_PATHS = 2_048
@@ -137,11 +138,6 @@ def _eligible_document(path: str) -> bool:
 
 
 _CHANGE_EVIDENCE_SUFFIXES = {
-    ".py",
-    ".js",
-    ".ts",
-    ".rs",
-    ".go",
     ".sql",
     ".json",
     ".jsonl",
@@ -161,6 +157,7 @@ def _change_candidate(path: str) -> bool:
     name = relative.name.casefold()
     return (
         _eligible_document(path)
+        or is_source_file(path)
         or relative.suffix.casefold() in _CHANGE_EVIDENCE_SUFFIXES
         or lowered.startswith(("src/", "lib/", "claimci/", "tests/"))
         or name.startswith("test_")
