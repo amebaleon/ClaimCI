@@ -5,18 +5,26 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal, DecimalException
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from claimci.parsing import unique_json_object
 
-from .evidence import EvidenceBundle, discover_evidence
+from .evidence import (
+    EvidenceBundle,
+    EvidenceKind,
+    EvidenceLocality,
+    EvidenceReference,
+    discover_evidence,
+)
 from .models import (
     ClaimType,
+    MagnitudeKind,
     ProviderCallRecord,
     ProviderUsage,
     ReviewConfig,
@@ -148,6 +156,17 @@ _SYNTHESIS_CONTRACT: dict[str, str] = {
         "executable_benchmark_definition describes a runnable method, not a completed "
         "run. Only executed_result_artifact represents an available executed-result "
         "artifact; never upgrade another provenance category."
+    ),
+    "excerpt_locality": (
+        "excerpt_complete and excerpt_locality describe only the issued bytes. "
+        "An unlocalized_prefix is informational report data, is omitted from "
+        "provider evidence, is not citable, and cannot positively establish a "
+        "whole-file or exact-local implementation claim."
+    ),
+    "interpretation_constraints": (
+        "When interpretation_constraints_by_claim_id contains a claim_id, copy "
+        "that row's required_interpretation and required_citations exactly. These "
+        "constraints are deterministic advisory source facts, not Audit verdicts."
     ),
     "authority": (
         "Produce advisory interpretation only. Deterministic audit snapshots are "
@@ -283,6 +302,264 @@ _SYNTHESIS_SCHEMA: dict[str, Any] = {
 }
 
 
+def _citable_reference(reference: EvidenceReference) -> bool:
+    return reference.excerpt_locality is not EvidenceLocality.UNLOCALIZED_PREFIX
+
+
+_STANDALONE_TEST_ANNOTATION = re.compile(r"[ \t]*@Test[ \t]*\Z")
+_TEST_COUNT_METRICS = frozenset(
+    {
+        "test",
+        "tests",
+        "test count",
+        "test case",
+        "test cases",
+        "test case count",
+    }
+)
+_TEST_COUNT_UNITS = frozenset(
+    {"case", "cases", "test", "tests", "test case", "test cases"}
+)
+
+
+def _normalized_words(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return " ".join(value.casefold().split())
+
+
+def _is_test_count_metric(value: str | None) -> bool:
+    normalized = _normalized_words(value)
+    if normalized in _TEST_COUNT_METRICS:
+        return True
+    return bool(
+        normalized
+        and (
+            normalized.startswith("test cases covering ")
+            or normalized.startswith("tests covering ")
+        )
+    )
+
+
+def _java_standalone_test_count(text: str) -> int | None:
+    """Count standalone ``@Test`` code lines with a narrow lexical scan.
+
+    This is deliberately not a Java parser. Comments and literals are masked,
+    and malformed or unterminated lexical state yields no whole-file fact.
+    """
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Java translates Unicode escapes before lexical analysis. Supporting that
+    # transformation would exceed this deliberately narrow grammar, so any
+    # such escape makes the count unavailable instead of risking a false fact.
+    if re.search(r"\\u+[0-9a-fA-F]{4}", normalized):
+        return None
+    masked: list[str] = []
+    state = "code"
+    index = 0
+    while index < len(normalized):
+        character = normalized[index]
+        following = normalized[index + 1] if index + 1 < len(normalized) else ""
+
+        if state == "code":
+            if character == "/" and following == "/":
+                masked.extend((" ", " "))
+                state = "line_comment"
+                index += 2
+                continue
+            if character == "/" and following == "*":
+                masked.extend((" ", " "))
+                state = "block_comment"
+                index += 2
+                continue
+            if normalized.startswith('\"\"\"', index):
+                masked.extend((" ", " ", " "))
+                state = "text_block"
+                index += 3
+                continue
+            if character == '"':
+                masked.append(" ")
+                state = "string"
+                index += 1
+                continue
+            if character == "'":
+                masked.append(" ")
+                state = "character"
+                index += 1
+                continue
+            masked.append(character)
+            index += 1
+            continue
+
+        if state == "line_comment":
+            if character == "\n":
+                masked.append("\n")
+                state = "code"
+            else:
+                masked.append(" ")
+            index += 1
+            continue
+
+        if state == "block_comment":
+            if character == "*" and following == "/":
+                masked.extend((" ", " "))
+                state = "code"
+                index += 2
+            else:
+                masked.append("\n" if character == "\n" else " ")
+                index += 1
+            continue
+
+        if state == "text_block":
+            if normalized.startswith('\"\"\"', index):
+                masked.extend((" ", " ", " "))
+                state = "code"
+                index += 3
+            else:
+                masked.append("\n" if character == "\n" else " ")
+                index += 1
+            continue
+
+        if state in {"string", "character"}:
+            terminator = '"' if state == "string" else "'"
+            if character == "\n":
+                return None
+            if character == "\\":
+                if not following or following == "\n":
+                    return None
+                masked.extend((" ", " "))
+                index += 2
+                continue
+            masked.append(" ")
+            index += 1
+            if character == terminator:
+                state = "code"
+            continue
+
+        return None
+
+    if state not in {"code", "line_comment"}:
+        return None
+    return sum(
+        1
+        for line in "".join(masked).splitlines()
+        if _STANDALONE_TEST_ANNOTATION.fullmatch(line)
+    )
+
+
+def _java_test_cardinality_constraints(
+    claims: Sequence[ScientificClaim],
+    evidence: EvidenceBundle,
+) -> dict[str, dict[str, Any]]:
+    constraints: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        magnitude = claim.claimed_magnitude
+        if (
+            claim.claim_type is not ClaimType.IMPLEMENTATION_CLAIM
+            or magnitude is None
+            or magnitude.kind is not MagnitudeKind.ABSOLUTE
+            or magnitude.value is None
+            or not float(magnitude.value).is_integer()
+            or float(magnitude.value) < 0
+            or _normalized_words(magnitude.unit) not in _TEST_COUNT_UNITS
+            or not _is_test_count_metric(claim.metric)
+        ):
+            continue
+        subject = claim.subject.strip()
+        hinted_paths = {
+            path
+            for path in claim.evidence_hints
+            if PurePosixPath(path).suffix.casefold() == ".java"
+            and PurePosixPath(path).stem == subject
+        }
+        if len(hinted_paths) != 1:
+            continue
+        hinted_path = next(iter(hinted_paths))
+        references = [
+            reference
+            for reference in evidence.references
+            if reference.path == hinted_path
+            and reference.kind is EvidenceKind.TEST
+            and claim.claim_id in reference.claim_ids
+        ]
+        reference = references[0] if len(references) == 1 else None
+        claimed_count = int(magnitude.value)
+        observed_count = (
+            _java_standalone_test_count(reference.excerpt)
+            if reference is not None
+            and reference.excerpt_complete
+            and reference.excerpt_locality is EvidenceLocality.COMPLETE_FILE
+            else None
+        )
+        if observed_count is None:
+            state = "incomplete"
+            required_interpretation = (
+                "ClaimCI cannot verify the exact whole-file test count because "
+                "complete claim-owned Java test evidence was not available in the "
+                "analyzed snapshot."
+            )
+            required_citations: list[str] = []
+        elif observed_count != claimed_count:
+            state = "contradicted"
+            required_interpretation = (
+                f"The complete source contains {observed_count} standalone @Test "
+                f"annotation lines, contradicting the claimed count of "
+                f"{claimed_count} test cases."
+            )
+            required_citations = [reference.evidence_id]
+        else:
+            state = "corroborated"
+            required_interpretation = (
+                f"The complete source contains {observed_count} standalone @Test "
+                f"annotation lines, matching the claimed count of "
+                f"{claimed_count} test cases; this is source support, not evidence "
+                "that the tests were executed."
+            )
+            required_citations = [reference.evidence_id]
+        constraints[claim.claim_id] = {
+            "kind": "java_test_cardinality",
+            "state": state,
+            "claimed_count": claimed_count,
+            "observed_count": observed_count,
+            "evidence_id": (
+                reference.evidence_id if reference is not None else None
+            ),
+            "required_interpretation": required_interpretation,
+            "required_citations": required_citations,
+        }
+    return constraints
+
+
+def _interpretation_constraints(
+    claims: Sequence[ScientificClaim],
+    evidence: EvidenceBundle,
+    evidence_ids_by_claim_id: Mapping[str, Sequence[str]],
+) -> dict[str, dict[str, Any]]:
+    constraints: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        unlocalized_ids = sorted(
+            reference.evidence_id
+            for reference in evidence.references
+            if claim.claim_id in reference.claim_ids
+            and reference.excerpt_locality is EvidenceLocality.UNLOCALIZED_PREFIX
+        )
+        if unlocalized_ids and not evidence_ids_by_claim_id[claim.claim_id]:
+            constraints[claim.claim_id] = {
+                "kind": "unlocalized_evidence",
+                "state": "incomplete",
+                "evidence_ids": unlocalized_ids,
+                "required_interpretation": (
+                    "ClaimCI cannot verify this claim from the exact source/test "
+                    "evidence because the available bounded excerpts could not be "
+                    "localized to the material region."
+                ),
+                "required_citations": [],
+            }
+    # The narrower whole-file count fact takes precedence when it applies.
+    constraints.update(_java_test_cardinality_constraints(claims, evidence))
+    return constraints
+
+
 def _evidence_ids_by_claim_id(
     claims: Sequence[ScientificClaim],
     evidence: EvidenceBundle,
@@ -291,7 +568,7 @@ def _evidence_ids_by_claim_id(
         claim.claim_id: sorted(
             reference.evidence_id
             for reference in evidence.references
-            if claim.claim_id in reference.claim_ids
+            if claim.claim_id in reference.claim_ids and _citable_reference(reference)
         )
         for claim in claims
     }
@@ -300,6 +577,7 @@ def _evidence_ids_by_claim_id(
 def _synthesis_schema(
     claims: Sequence[ScientificClaim],
     evidence_ids_by_claim_id: Mapping[str, Sequence[str]],
+    interpretation_constraints_by_claim_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Constrain each row to issued IDs using the provider-supported subset."""
 
@@ -309,6 +587,7 @@ def _synthesis_schema(
     interpretations["maxItems"] = len(claims)
     alternatives: list[dict[str, Any]] = []
     row_template = _SYNTHESIS_SCHEMA["properties"]["interpretations"]["items"]
+    constraints = interpretation_constraints_by_claim_id or {}
     for claim in claims:
         row = copy.deepcopy(row_template)
         row["properties"]["claim_id"] = {
@@ -324,6 +603,23 @@ def _synthesis_schema(
         if allowed:
             citations["items"]["enum"] = allowed
         row["properties"]["citations"] = citations
+        constraint = constraints.get(claim.claim_id)
+        if constraint is not None:
+            required_interpretation = constraint["required_interpretation"]
+            required_citations = list(constraint["required_citations"])
+            row["properties"]["interpretation"] = {
+                "type": "string",
+                "enum": [required_interpretation],
+            }
+            constrained_citations: dict[str, Any] = {
+                "type": "array",
+                "minItems": len(required_citations),
+                "maxItems": len(required_citations),
+                "items": {"type": "string"},
+            }
+            if required_citations:
+                constrained_citations["items"]["enum"] = required_citations
+            row["properties"]["citations"] = constrained_citations
         alternatives.append(row)
     if alternatives:
         interpretations["items"] = {"anyOf": alternatives}
@@ -421,6 +717,7 @@ def _parse_interpretations(
     value: object,
     claims: tuple[ScientificClaim, ...],
     evidence: EvidenceBundle,
+    interpretation_constraints_by_claim_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[ClaimInterpretation, ...]:
     if not isinstance(value, Mapping) or set(value) != {"interpretations"}:
         raise ReviewError("synthesis response must contain only interpretations")
@@ -431,7 +728,9 @@ def _parse_interpretations(
     evidence_claims = {
         item.evidence_id: frozenset(item.claim_ids)
         for item in evidence.references
+        if _citable_reference(item)
     }
+    constraints = interpretation_constraints_by_claim_id or {}
     expected = {
         "claim_id",
         "interpretation",
@@ -461,6 +760,14 @@ def _parse_interpretations(
         ):
             raise ReviewError(
                 "synthesis cites unknown or claim-mismatched repository evidence"
+            )
+        constraint = constraints.get(claim_id)
+        if constraint is not None and (
+            interpretation != constraint["required_interpretation"]
+            or citations != tuple(constraint["required_citations"])
+        ):
+            raise ReviewError(
+                "synthesis violates a deterministic advisory interpretation constraint"
             )
         confidence = row["confidence"]
         if (
@@ -789,6 +1096,7 @@ def run_review(
             priority_paths=priority_paths,
             selected_paths=tuple(sorted(selected_paths)),
             changed_paths=sources.changed_paths,
+            base_root=inputs.base_root,
         )
         if config.limits.max_calls < 2:
             return _result(
@@ -801,7 +1109,16 @@ def run_review(
                 error_message="Synthesis was skipped by the configured call limit.",
             )
         evidence_ids_by_claim_id = _evidence_ids_by_claim_id(claims, evidence)
-        synthesis_schema = _synthesis_schema(claims, evidence_ids_by_claim_id)
+        interpretation_constraints_by_claim_id = _interpretation_constraints(
+            claims,
+            evidence,
+            evidence_ids_by_claim_id,
+        )
+        synthesis_schema = _synthesis_schema(
+            claims,
+            evidence_ids_by_claim_id,
+            interpretation_constraints_by_claim_id,
+        )
         synthesis_payload = {
             "policy": {
                 "mode": "advisory",
@@ -809,8 +1126,17 @@ def run_review(
             },
             "synthesis_contract": dict(_SYNTHESIS_CONTRACT),
             "claims": _plain(claims),
-            "evidence": _plain(evidence.references),
+            "evidence": _plain(
+                tuple(
+                    reference
+                    for reference in evidence.references
+                    if _citable_reference(reference)
+                )
+            ),
             "evidence_ids_by_claim_id": evidence_ids_by_claim_id,
+            "interpretation_constraints_by_claim_id": (
+                interpretation_constraints_by_claim_id
+            ),
             "missing_evidence": _plain(evidence.missing),
             "deterministic_audits": _plain(deterministic_audits),
         }
@@ -869,7 +1195,10 @@ def run_review(
             )
         try:
             interpretations = _parse_interpretations(
-                _parse_json(synthesis_response.output_text), claims, evidence
+                _parse_json(synthesis_response.output_text),
+                claims,
+                evidence,
+                interpretation_constraints_by_claim_id,
             )
         except ReviewError as exc:
             validation_message = (
