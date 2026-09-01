@@ -127,13 +127,23 @@ _SYNTHESIS_CONTRACT: dict[str, str] = {
         "unknown, omitted, or duplicate claim IDs."
     ),
     "citations": (
-        "Citations may contain only issued evidence_id values assigned to that claim "
-        "through the evidence claim_ids field. Do not cite rule IDs, paths, manifests, "
-        "or deterministic finding IDs."
+        "Citations may contain only issued evidence_id values assigned to that claim. "
+        "For each claim_id, copy only from that claim's list in "
+        "evidence_ids_by_claim_id, and use an empty list when its allowed list is "
+        "empty. Do not cite rule IDs, paths, manifests, deterministic finding IDs, "
+        "or an evidence_id assigned to another claim."
     ),
     "missing_evidence": (
         "When issued evidence does not support a statement, use an empty list for "
-        "citations and describe the gap in missing_evidence or unsupported_inferences."
+        "citations and describe the gap in missing_evidence or unsupported_inferences. "
+        "Scope every gap to the analyzed snapshot; never claim that evidence is absent "
+        "from the original repository."
+    ),
+    "evidence_provenance": (
+        "reported_measurement is summary support, not proof of execution. "
+        "executable_benchmark_definition describes a runnable method, not a completed "
+        "run. Only executed_result_artifact represents an available executed-result "
+        "artifact; never upgrade another provenance category."
     ),
     "authority": (
         "Produce advisory interpretation only. Deterministic audit snapshots are "
@@ -267,6 +277,53 @@ _SYNTHESIS_SCHEMA: dict[str, Any] = {
         }
     },
 }
+
+
+def _evidence_ids_by_claim_id(
+    claims: Sequence[ScientificClaim],
+    evidence: EvidenceBundle,
+) -> dict[str, list[str]]:
+    return {
+        claim.claim_id: sorted(
+            reference.evidence_id
+            for reference in evidence.references
+            if claim.claim_id in reference.claim_ids
+        )
+        for claim in claims
+    }
+
+
+def _synthesis_schema(
+    claims: Sequence[ScientificClaim],
+    evidence_ids_by_claim_id: Mapping[str, Sequence[str]],
+) -> dict[str, Any]:
+    """Constrain each row to issued IDs using the provider-supported subset."""
+
+    schema = copy.deepcopy(_SYNTHESIS_SCHEMA)
+    interpretations = schema["properties"]["interpretations"]
+    interpretations["minItems"] = len(claims)
+    interpretations["maxItems"] = len(claims)
+    alternatives: list[dict[str, Any]] = []
+    row_template = _SYNTHESIS_SCHEMA["properties"]["interpretations"]["items"]
+    for claim in claims:
+        row = copy.deepcopy(row_template)
+        row["properties"]["claim_id"] = {
+            "type": "string",
+            "enum": [claim.claim_id],
+        }
+        allowed = list(evidence_ids_by_claim_id[claim.claim_id])
+        citations: dict[str, Any] = {
+            "type": "array",
+            "maxItems": len(allowed),
+            "items": {"type": "string"},
+        }
+        if allowed:
+            citations["items"]["enum"] = allowed
+        row["properties"]["citations"] = citations
+        alternatives.append(row)
+    if alternatives:
+        interpretations["items"] = {"anyOf": alternatives}
+    return schema
 
 
 def _plain(value: Any) -> Any:
@@ -739,6 +796,8 @@ def run_review(
                 error_code="CALL_LIMIT",
                 error_message="Synthesis was skipped by the configured call limit.",
             )
+        evidence_ids_by_claim_id = _evidence_ids_by_claim_id(claims, evidence)
+        synthesis_schema = _synthesis_schema(claims, evidence_ids_by_claim_id)
         synthesis_payload = {
             "policy": {
                 "mode": "advisory",
@@ -747,11 +806,12 @@ def run_review(
             "synthesis_contract": dict(_SYNTHESIS_CONTRACT),
             "claims": _plain(claims),
             "evidence": _plain(evidence.references),
+            "evidence_ids_by_claim_id": evidence_ids_by_claim_id,
             "missing_evidence": _plain(evidence.missing),
             "deterministic_audits": _plain(deterministic_audits),
         }
         synthesis_chars = _request_chars(
-            "synthesize_review", synthesis_payload, _SYNTHESIS_SCHEMA
+            "synthesize_review", synthesis_payload, synthesis_schema
         )
         if extraction_chars + synthesis_chars > config.limits.max_context_chars:
             return _result(
@@ -766,7 +826,7 @@ def run_review(
         synthesis_request = StructuredRequest(
             task="synthesize_review",
             payload=synthesis_payload,
-            schema=_SYNTHESIS_SCHEMA,
+            schema=synthesis_schema,
             max_output_tokens=config.limits.synthesis_max_output_tokens,
         )
         synthesis_response = provider.synthesize_review(synthesis_request)
@@ -807,7 +867,25 @@ def run_review(
             interpretations = _parse_interpretations(
                 _parse_json(synthesis_response.output_text), claims, evidence
             )
-        except ReviewError:
+        except ReviewError as exc:
+            validation_message = (
+                "Review synthesis failed deterministic citation ownership validation; "
+                "no synthesis interpretation was accepted."
+                if "claim-mismatched repository evidence" in str(exc)
+                else (
+                    "Review synthesis failed deterministic claim coverage validation; "
+                    "no synthesis interpretation was accepted."
+                    if (
+                        "unknown or duplicate claim" in str(exc)
+                        or "interpret every accepted claim" in str(exc)
+                    )
+                    else (
+                        "Review synthesis returned complete output that failed "
+                        "deterministic claim or citation validation; no synthesis "
+                        "interpretation was accepted."
+                    )
+                )
+            )
             return _result(
                 ReviewStatus.PARTIAL,
                 claims=claims,
@@ -815,10 +893,7 @@ def run_review(
                 deterministic_audits=deterministic_audits,
                 calls=calls,
                 error_code="SYNTHESIS_INVALID",
-                error_message=(
-                    "Review synthesis returned complete output that failed deterministic "
-                    "claim or citation validation; no synthesis interpretation was accepted."
-                ),
+                error_message=validation_message,
             )
         if rejected_claim_candidates:
             return _result(

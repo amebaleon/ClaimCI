@@ -291,7 +291,10 @@ def _deterministic_lines(review: ResearchReview) -> list[str]:
     lines: list[str] = []
     audits = sorted(review.deterministic_audits, key=lambda item: item.manifest_path)
     if not audits:
-        lines.append("- No deterministic ClaimCI audit evidence was discovered.")
+        lines.append(
+            "- No deterministic ClaimCI audit snapshot was available for this "
+            "bounded review scope."
+        )
         return lines
     for audit in audits:
         lines.extend(
@@ -404,6 +407,11 @@ def render_review_markdown(review: ResearchReview) -> str:
         "",
         "### MISSING_EVIDENCE",
         "",
+        (
+            "Evidence gaps are limited to ClaimCI's bounded analyzed snapshot; "
+            "they do not establish that evidence is absent from the original repository."
+        ),
+        "",
         *_missing_lines(review),
         "",
         "### UNSUPPORTED_INFERENCE",
@@ -420,6 +428,7 @@ def render_review_markdown(review: ResearchReview) -> str:
             (
                 f"- Evidence `{_markdown_text(reference.evidence_id)}` "
                 f"({', '.join(_markdown_text(claim_id) for claim_id in reference.claim_ids)}): "
+                f"provenance **{_markdown_text(reference.provenance.value)}**; "
                 f"`{_markdown_text(reference.path)}` lines "
                 f"{reference.start_line}-{reference.end_line}; "
                 f"excerpt: {_markdown_text(reference.excerpt)}",

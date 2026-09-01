@@ -277,6 +277,12 @@ def test_synthesis_request_matches_the_trusted_interpretation_validator_contract
         assert "assigned to that claim" in contract["citations"]
         assert "Do not cite rule IDs" in contract["citations"]
         assert "empty list" in contract["missing_evidence"]
+        assert "analyzed snapshot" in contract["missing_evidence"]
+        assert "original repository" in contract["missing_evidence"]
+        assert "reported_measurement" in contract["evidence_provenance"]
+        assert "not proof of execution" in contract["evidence_provenance"]
+        assert "executable_benchmark_definition" in contract["evidence_provenance"]
+        assert "executed_result_artifact" in contract["evidence_provenance"]
         assert "advisory interpretation" in contract["authority"]
         return _synthesis_output(request)
 

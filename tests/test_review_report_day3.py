@@ -13,7 +13,12 @@ import hashlib
 import json
 from decimal import Decimal
 
-from claimci.review.evidence import EvidenceBundle, EvidenceKind, EvidenceReference
+from claimci.review.evidence import (
+    EvidenceBundle,
+    EvidenceKind,
+    EvidenceReference,
+    MissingEvidence,
+)
 from claimci.review.models import (
     ClaimDirection,
     ClaimType,
@@ -203,6 +208,9 @@ def test_review_json_is_advisory_schema_versioned_deterministic_and_complete() -
         "evidence-a",
         "evidence-z",
     ]
+    assert {
+        ref["provenance"] for ref in payload["evidence"]["references"]
+    } == {"supporting_artifact"}
     assert [call["task"] for call in payload["provider"]["calls"]] == [
         "extract_claims",
         "synthesize_review",
@@ -270,6 +278,7 @@ def test_review_markdown_is_advisory_escaped_and_parity_preserving() -> None:
     assert "FAKE&#95;DETERMINISTIC&#95;FINDING from LLM prose" in markdown
     assert "A second independent seed is missing." in markdown
     assert "Causality is not established by this comparison." in markdown
+    assert "provenance **supporting&#95;artifact**" in markdown
 
     # The model's fake authority text is not copied into the deterministic
     # evidence section; trusted snapshot text remains the only source there.
@@ -315,6 +324,32 @@ def test_review_markdown_disabled_and_unavailable_states_remain_non_blocking() -
         assert "ClaimCI Research Review (Advisory)" in markdown
         assert "Traceback" not in markdown
         assert "OPENAI_API_KEY" not in markdown
+
+
+def test_missing_evidence_section_scopes_findings_to_claimci_review_input() -> None:
+    review = ResearchReview(
+        status=ReviewStatus.PARTIAL,
+        evidence=EvidenceBundle(
+            missing=(
+                MissingEvidence(
+                    claim_id="claim-row-fold",
+                    reason="executed_result_not_available",
+                    description=(
+                        "This claim could not be independently verified from the "
+                        "available artifacts."
+                    ),
+                ),
+            )
+        ),
+    )
+
+    markdown = render_review_markdown(review)
+
+    assert "This claim could not be independently verified" in markdown
+    assert (
+        "Evidence gaps are limited to ClaimCI's bounded analyzed snapshot" in markdown
+    )
+    assert "do not establish that evidence is absent from the original repository" in markdown
 
 
 def test_deterministic_surrogate_evidence_is_visible_and_utf8_safe_in_both_views() -> None:

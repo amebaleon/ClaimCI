@@ -88,6 +88,30 @@ def test_pr_scoped_heuristics_do_not_pull_unrelated_unchanged_evidence(
     assert all("999999" not in reference.excerpt for reference in bundle.references)
 
 
+def test_pr_scoped_no_match_describes_snapshot_availability_not_repository_absence(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "README.md",
+        "| Cohort | Row fold |\n| --- | ---: |\n| local | 4.0x |\n",
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        [_resource_claim()],
+        ("README.md",),
+        changed_paths=(),
+    )
+
+    assert bundle.references == ()
+    assert [item.reason for item in bundle.missing] == ["no_matching_evidence"]
+    assert bundle.missing[0].description == (
+        "Evidence not available in the analyzed snapshot; no matching artifact "
+        "was selected within ClaimCI's bounded review scope."
+    )
+
+
 def test_explicit_valid_hint_can_reach_an_unchanged_indexed_path(tmp_path: Path) -> None:
     _write(tmp_path, "external/benchmark-cost.json", '{"rows": 100}\n')
     _write(tmp_path, "baseline/benchmark-cost.json", '{"rows": 400}\n')
