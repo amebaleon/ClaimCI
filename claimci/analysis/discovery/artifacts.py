@@ -393,6 +393,7 @@ def discover_artifacts(
             limits=ReviewLimits(),
             suggested_paths=suggested or None,
             changed_paths=tuple(str(path) for path in context.changed_paths),
+            base_root=context.base_root,
         )
     except ReviewError as error:
         raise DiscoveryError("bounded evidence routing failed") from error

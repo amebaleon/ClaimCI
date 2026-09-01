@@ -186,6 +186,7 @@ def _review_payload(review: ResearchReview) -> dict[str, Any]:
                 )
             ],
             "total_chars": evidence.total_chars,
+            "routing_incomplete": evidence.routing_incomplete,
         },
         "deterministic_audits": [
             _json_safe(item)
@@ -422,6 +423,8 @@ def render_review_markdown(review: ResearchReview) -> str:
         "",
         f"- Evidence references: {len(review.evidence.references)}; "
         f"bounded characters: {review.evidence.total_chars}.",
+        "- Routing incomplete: "
+        f"{'yes' if review.evidence.routing_incomplete else 'no'}.",
     ]
     for reference in sorted(review.evidence.references, key=lambda item: item.evidence_id):
         lines.extend(
@@ -429,6 +432,8 @@ def render_review_markdown(review: ResearchReview) -> str:
                 f"- Evidence `{_markdown_text(reference.evidence_id)}` "
                 f"({', '.join(_markdown_text(claim_id) for claim_id in reference.claim_ids)}): "
                 f"provenance **{_markdown_text(reference.provenance.value)}**; "
+                f"locality **{_markdown_text(reference.excerpt_locality.value)}**; "
+                f"excerpt complete **{'yes' if reference.excerpt_complete else 'no'}**; "
                 f"`{_markdown_text(reference.path)}` lines "
                 f"{reference.start_line}-{reference.end_line}; "
                 f"excerpt: {_markdown_text(reference.excerpt)}",

@@ -194,8 +194,16 @@ external provider when an owner enables this configuration. With a trusted
 base checkout, heuristic evidence discovery is confined to files changed by
 the pull request. Unchanged files enter review only through a relevant
 `research.yaml` whose manifest or declared artifact changed, or through an
-exact route-valid evidence path recovered from the issued sources. Structured
-research artifacts such as SQL, JSON, YAML, CSV, and TOML participate in the
+exact indexed SOURCE/TEST provider hint. Those hints remain untrusted selectors:
+ClaimCI validates path identity and confinement, assigns supporting-artifact
+provenance, and retains claim-scoped citation ownership. Complete files are
+marked `complete_file`; oversized changed files may use a bounded, contiguous
+`changed_region`. An oversized unchanged file without deterministic locality is
+marked `unlocalized_prefix`, cannot be cited, and keeps evidence routing
+incomplete unless other citable evidence covers the claim. Its bytes remain in
+the local review record but are omitted from provider synthesis evidence.
+Structured research
+artifacts such as SQL, JSON, YAML, CSV, and TOML participate in the
 bounded base/head change index. This boundary is especially important for
 `pull_request_target` and fork pull requests: the head checkout is passive
 data, while configuration and code come from the trusted base branch. Disable

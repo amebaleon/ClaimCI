@@ -41,6 +41,15 @@ class EvidenceProvenance(str, Enum):
     EXECUTED_RESULT_ARTIFACT = "executed_result_artifact"
 
 
+class EvidenceLocality(str, Enum):
+    """How much of the referenced file the issued excerpt represents."""
+
+    COMPLETE_FILE = "complete_file"
+    CHANGED_REGION = "changed_region"
+    UNLOCALIZED_PREFIX = "unlocalized_prefix"
+    SELECTED_REGION = "selected_region"
+
+
 @dataclass(frozen=True)
 class EvidenceReference:
     evidence_id: str
@@ -53,6 +62,8 @@ class EvidenceReference:
     size: int
     excerpt: str
     provenance: EvidenceProvenance = EvidenceProvenance.SUPPORTING_ARTIFACT
+    excerpt_complete: bool = False
+    excerpt_locality: EvidenceLocality = EvidenceLocality.SELECTED_REGION
 
 
 @dataclass(frozen=True)
@@ -619,6 +630,181 @@ def _validate_regular(root: Path, relative: str) -> tuple[Path | None, str]:
     return resolved, ""
 
 
+def _line_span(excerpt: str, *, start_line: int = 1) -> tuple[int, int]:
+    """Return the inclusive line span for one non-empty contiguous excerpt."""
+
+    line_count = excerpt.count("\n") + (0 if excerpt.endswith("\n") else 1)
+    return start_line, start_line + max(1, line_count) - 1
+
+
+def _changed_line_window(
+    head_text: str,
+    base_text: str | None,
+    *,
+    char_limit: int,
+) -> tuple[str, int, int] | None:
+    """Select a bounded whole-line head region intersecting a trusted change.
+
+    ``base_text=None`` means the head file is new, so every head line is a
+    changed line.  Deletion-only and normalization-only changes have no head
+    region that can honestly be described as changed and therefore return
+    ``None``.
+    """
+
+    if char_limit <= 0 or not head_text:
+        return None
+    head_lines = head_text.splitlines(keepends=True)
+    if not head_lines:
+        return None
+    if base_text is None:
+        change_start = 0
+        change_end = len(head_lines)
+    else:
+        base_lines = base_text.splitlines(keepends=True)
+        common_prefix = 0
+        while (
+            common_prefix < len(head_lines)
+            and common_prefix < len(base_lines)
+            and head_lines[common_prefix] == base_lines[common_prefix]
+        ):
+            common_prefix += 1
+        common_suffix = 0
+        while (
+            common_suffix < len(head_lines) - common_prefix
+            and common_suffix < len(base_lines) - common_prefix
+            and head_lines[len(head_lines) - common_suffix - 1]
+            == base_lines[len(base_lines) - common_suffix - 1]
+        ):
+            common_suffix += 1
+        change_start = common_prefix
+        change_end = len(head_lines) - common_suffix
+        if change_end <= change_start:
+            return None
+
+    # A partial first line would provide neither an honest whole-line span nor
+    # a stable lexical region. Fall back to explicit unlocalized-prefix state.
+    if len(head_lines[change_start]) > char_limit:
+        return None
+
+    target_chars = sum(len(line) for line in head_lines[change_start:change_end])
+    if target_chars > char_limit:
+        left = change_start
+        right = change_start
+        used = 0
+        while right < change_end and used + len(head_lines[right]) <= char_limit:
+            used += len(head_lines[right])
+            right += 1
+    else:
+        left = change_start
+        right = change_end
+        used = target_chars
+        while True:
+            expanded = False
+            if left > 0 and used + len(head_lines[left - 1]) <= char_limit:
+                left -= 1
+                used += len(head_lines[left])
+                expanded = True
+            if right < len(head_lines) and used + len(head_lines[right]) <= char_limit:
+                used += len(head_lines[right])
+                right += 1
+                expanded = True
+            if not expanded:
+                break
+
+    if right <= left:
+        return None
+    excerpt = "".join(head_lines[left:right])
+    if not excerpt or len(excerpt) > char_limit:
+        return None
+    return excerpt, left + 1, right
+
+
+def _changed_region_excerpt(
+    base_root: Path | None,
+    relative: str,
+    head_text: str,
+    *,
+    char_limit: int,
+) -> tuple[str, int, int] | None:
+    """Derive changed locality from confined base/head file identity."""
+
+    if base_root is None:
+        return None
+    base_resolved, reason = _validate_regular(base_root, relative)
+    if base_resolved is None:
+        if reason != "Evidence not available in the analyzed snapshot.":
+            return None
+        return _changed_line_window(head_text, None, char_limit=char_limit)
+    try:
+        base_capture = capture_confined_regular_file(
+            base_root,
+            relative,
+            max_bytes=MAX_EVIDENCE_FILE_BYTES,
+        )
+        base_text = base_capture.content.decode("utf-8")
+        base_text = base_text.replace("\r\n", "\n").replace("\r", "\n")
+    except (PassiveFileError, UnicodeError, ValueError, RecursionError):
+        return None
+    return _changed_line_window(head_text, base_text, char_limit=char_limit)
+
+
+def _regular_excerpt(
+    text: str,
+    *,
+    relative: str,
+    kind: EvidenceKind,
+    char_limit: int,
+    changed: set[str],
+    exact_source_test_paths: set[str],
+    base_root: Path | None,
+) -> tuple[str, int, int, bool, EvidenceLocality]:
+    """Issue one bounded excerpt with an explicit, deterministic locality."""
+
+    if len(text) <= char_limit:
+        start_line, end_line = _line_span(text)
+        return text, start_line, end_line, True, EvidenceLocality.COMPLETE_FILE
+
+    if (
+        relative in exact_source_test_paths
+        and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+    ):
+        if relative in changed:
+            region = _changed_region_excerpt(
+                base_root,
+                relative,
+                text,
+                char_limit=char_limit,
+            )
+            if region is not None:
+                excerpt, start_line, end_line = region
+                return (
+                    excerpt,
+                    start_line,
+                    end_line,
+                    False,
+                    EvidenceLocality.CHANGED_REGION,
+                )
+        excerpt = text[:char_limit]
+        start_line, end_line = _line_span(excerpt)
+        return (
+            excerpt,
+            start_line,
+            end_line,
+            False,
+            EvidenceLocality.UNLOCALIZED_PREFIX,
+        )
+
+    excerpt = text[:char_limit]
+    start_line, end_line = _line_span(excerpt)
+    return (
+        excerpt,
+        start_line,
+        end_line,
+        False,
+        EvidenceLocality.SELECTED_REGION,
+    )
+
+
 def discover_evidence(
     repository_root: Path,
     claims: Sequence[ScientificClaim],
@@ -629,6 +815,7 @@ def discover_evidence(
     priority_paths: Mapping[str, Sequence[str]] | None = None,
     selected_paths: Sequence[str] = (),
     changed_paths: Sequence[str] | None = None,
+    base_root: Path | None = None,
 ) -> EvidenceBundle:
     """Select bounded indexed paths within one audit-wide unique-file budget.
 
@@ -640,6 +827,7 @@ def discover_evidence(
     """
 
     root = _root(repository_root)
+    base = None if base_root is None else _root(base_root)
     if not isinstance(limits, ReviewLimits):
         raise ReviewError("limits must be ReviewLimits")
     if not isinstance(claims, Sequence) or not all(
@@ -679,7 +867,7 @@ def discover_evidence(
             changed.add(normalized)
     # With a trusted base checkout, heuristic discovery is confined to
     # files changed by the pull request. Unchanged files remain reachable only
-    # through trusted manifest priority or an exact, route-valid provider hint.
+    # through trusted manifest priority or an exact indexed SOURCE/TEST hint.
     # Without a base checkout, every indexed path is treated as changed.
     heuristic_index = (
         sorted_index
@@ -690,7 +878,8 @@ def discover_evidence(
     by_path: dict[str, set[str]] = defaultdict(set)
     priority_order: list[str] = []
     missing: list[MissingEvidence] = []
-    unresolved_hint_claim_ids: set[str] = set()
+    provider_hint_claim_ids: set[str] = set()
+    exact_source_test_claim_ids: dict[str, set[str]] = defaultdict(set)
 
     claims_by_id = {claim.claim_id: claim for claim in claims}
     claim_ids = set(claims_by_id)
@@ -726,9 +915,9 @@ def discover_evidence(
                 raise ReviewError("suggested evidence paths must be a sequence")
             hints += tuple(raw_hints)
         for raw_hint in hints:
+            provider_hint_claim_ids.add(claim.claim_id)
             normalized = _safe_relative(raw_hint)
             if normalized is None:
-                unresolved_hint_claim_ids.add(claim.claim_id)
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -739,7 +928,6 @@ def discover_evidence(
                 )
                 continue
             if normalized not in normalized_index:
-                unresolved_hint_claim_ids.add(claim.claim_id)
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -753,8 +941,9 @@ def discover_evidence(
                     )
                 )
                 continue
-            if not _matches(claim, normalized, changed):
-                unresolved_hint_claim_ids.add(claim.claim_id)
+            kind = _kind(normalized)
+            exact_source_test = kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+            if not exact_source_test and not _matches(claim, normalized, changed):
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -782,6 +971,8 @@ def discover_evidence(
                 )
                 continue
             by_path[normalized].add(claim.claim_id)
+            if exact_source_test:
+                exact_source_test_claim_ids[normalized].add(claim.claim_id)
 
     markdown_candidates: dict[str, set[str]] = {
         path: {
@@ -807,6 +998,7 @@ def discover_evidence(
     file_limit_counts: dict[str, int] = defaultdict(int)
     remaining = limits.max_context_chars
     priority_set = set(priority_order)
+    exact_source_test_paths = set(exact_source_test_claim_ids)
     routed_paths = set(by_path) | set(markdown_candidates)
     ordinarily_routed = set(by_path) - priority_set
     markdown_only = routed_paths - set(by_path) - priority_set
@@ -864,7 +1056,8 @@ def discover_evidence(
                 max_bytes=MAX_EVIDENCE_FILE_BYTES,
             )
             text = capture.content.decode("utf-8")
-            excerpt = text.replace("\r\n", "\n").replace("\r", "\n")[:char_limit]
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            excerpt = text[:char_limit]
             digest = capture.sha256
             size = capture.size
         except (PassiveFileError, UnicodeError, ValueError, RecursionError) as exc:
@@ -915,6 +1108,8 @@ def discover_evidence(
                         size=size,
                         excerpt=table.excerpt,
                         provenance=provenance,
+                        excerpt_complete=False,
+                        excerpt_locality=EvidenceLocality.SELECTED_REGION,
                     )
                 )
                 table_claim_ids.update(matching_ids)
@@ -926,30 +1121,69 @@ def discover_evidence(
             max(0, limits.max_file_chars - table_chars),
             remaining,
         )
-        regular_excerpt = excerpt[:regular_limit]
-        if regular_claim_ids and regular_excerpt:
-            evidence_id = "evidence-" + hashlib.sha256(
-                f"{relative}\0{digest}".encode("utf-8")
-            ).hexdigest()[:16]
+        if regular_claim_ids and regular_limit > 0:
             kind = _kind(relative)
+            (
+                regular_excerpt,
+                start_line,
+                end_line,
+                excerpt_complete,
+                excerpt_locality,
+            ) = _regular_excerpt(
+                text,
+                relative=relative,
+                kind=kind,
+                char_limit=regular_limit,
+                changed=changed,
+                exact_source_test_paths=exact_source_test_paths,
+                base_root=base,
+            )
+        else:
+            regular_excerpt = ""
+        if regular_claim_ids and regular_excerpt:
+            excerpt_digest = hashlib.sha256(
+                regular_excerpt.encode("utf-8")
+            ).hexdigest()
+            evidence_id = "evidence-" + hashlib.sha256(
+                (
+                    f"{relative}\0{digest}\0{start_line}:{end_line}"
+                    f"\0{excerpt_locality.value}\0{excerpt_digest}"
+                ).encode("utf-8")
+            ).hexdigest()[:16]
             references.append(
                 EvidenceReference(
                     evidence_id=evidence_id,
                     claim_ids=tuple(sorted(regular_claim_ids)),
                     kind=kind,
                     path=relative,
-                    start_line=1,
-                    end_line=max(
-                        1,
-                        regular_excerpt.count("\n")
-                        + (0 if regular_excerpt.endswith("\n") else 1),
-                    ),
+                    start_line=start_line,
+                    end_line=end_line,
                     sha256=digest,
                     size=size,
                     excerpt=regular_excerpt,
                     provenance=_provenance(relative, kind, regular_excerpt),
+                    excerpt_complete=excerpt_complete,
+                    excerpt_locality=excerpt_locality,
                 )
             )
+            if excerpt_locality is EvidenceLocality.UNLOCALIZED_PREFIX:
+                for claim_id in sorted(
+                    exact_source_test_claim_ids.get(relative, set())
+                    & regular_claim_ids
+                ):
+                    missing.append(
+                        MissingEvidence(
+                            claim_id=claim_id,
+                            requested_path=relative,
+                            reason="excerpt_locality_unavailable",
+                            description=(
+                                "The exact source/test path was available in the "
+                                "analyzed snapshot, but its bounded excerpt could not "
+                                "be localized to the material region and cannot "
+                                "independently verify the claim."
+                            ),
+                        )
+                    )
             remaining -= len(regular_excerpt)
 
     for claim_id, omitted_count in sorted(file_limit_counts.items()):
@@ -964,10 +1198,19 @@ def discover_evidence(
             )
         )
 
-    covered = {claim_id for reference in references for claim_id in reference.claim_ids}
+    citable_references = tuple(
+        reference
+        for reference in references
+        if reference.excerpt_locality is not EvidenceLocality.UNLOCALIZED_PREFIX
+    )
+    covered = {
+        claim_id
+        for reference in citable_references
+        for claim_id in reference.claim_ids
+    }
     verification_needed_claims = {
         claim_id
-        for reference in references
+        for reference in citable_references
         if reference.provenance
         in {
             EvidenceProvenance.REPORTED_MEASUREMENT,
@@ -977,7 +1220,7 @@ def discover_evidence(
     }
     executed_claims = {
         claim_id
-        for reference in references
+        for reference in citable_references
         if reference.provenance is EvidenceProvenance.EXECUTED_RESULT_ARTIFACT
         for claim_id in reference.claim_ids
     }
@@ -1020,5 +1263,5 @@ def discover_evidence(
             )
         ),
         total_chars=sum(len(reference.excerpt) for reference in references),
-        routing_incomplete=bool(unresolved_hint_claim_ids - covered),
+        routing_incomplete=bool(provider_hint_claim_ids - covered),
     )

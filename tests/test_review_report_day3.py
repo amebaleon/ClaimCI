@@ -211,6 +211,13 @@ def test_review_json_is_advisory_schema_versioned_deterministic_and_complete() -
     assert {
         ref["provenance"] for ref in payload["evidence"]["references"]
     } == {"supporting_artifact"}
+    assert {
+        ref["excerpt_locality"] for ref in payload["evidence"]["references"]
+    } == {"selected_region"}
+    assert {
+        ref["excerpt_complete"] for ref in payload["evidence"]["references"]
+    } == {False}
+    assert payload["evidence"]["routing_incomplete"] is False
     assert [call["task"] for call in payload["provider"]["calls"]] == [
         "extract_claims",
         "synthesize_review",
@@ -279,6 +286,9 @@ def test_review_markdown_is_advisory_escaped_and_parity_preserving() -> None:
     assert "A second independent seed is missing." in markdown
     assert "Causality is not established by this comparison." in markdown
     assert "provenance **supporting&#95;artifact**" in markdown
+    assert "locality **selected&#95;region**" in markdown
+    assert "excerpt complete **no**" in markdown
+    assert "Routing incomplete: no." in markdown
 
     # The model's fake authority text is not copied into the deterministic
     # evidence section; trusted snapshot text remains the only source there.
