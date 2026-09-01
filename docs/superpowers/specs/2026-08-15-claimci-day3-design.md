@@ -247,10 +247,11 @@ Default hard limits are:
 
 - maximum provider calls: 2;
 - maximum serialized logical context per provider request: 60,000 characters;
-- maximum provider output across the audit: 12,000 characters;
+- maximum provider output across the audit: 24,000 characters;
 - maximum selected files: 24;
 - maximum characters from one file: 16,000;
-- maximum output tokens per call: 2,000;
+- maximum extraction output tokens: 5,000;
+- maximum synthesis output tokens: 4,000;
 - timeout per call: 30 seconds;
 - retries: 0.
 
