@@ -75,7 +75,7 @@ def _audit_steps() -> list[dict[str, Any]]:
 
 
 def test_review_runs_one_free_preflight_then_one_paid_invocation_with_shared_views() -> None:
-    """Preflight and paid review each render both views without duplicate orchestration."""
+    """Preflight and paid review render distinct fresh artifacts once each."""
 
     steps = _review_steps()
     assert len(steps) == 2
@@ -89,6 +89,16 @@ def test_review_runs_one_free_preflight_then_one_paid_invocation_with_shared_vie
         assert re.search(r"[^\s'\"]+\.json(?:\s|\\|$)", run)
         assert re.search(r"[^\s'\"]+\.md(?:\s|\\|$)", run)
         assert lower.count("claimci review") == 1
+    preflight_run = _step_run(_preflight_steps()[0])
+    paid_run = _step_run(_paid_review_steps()[0])
+    assert "--json-output claimci-review-preflight.json" in preflight_run
+    assert "--markdown-output claimci-review-preflight.md" in preflight_run
+    assert "--json-output claimci-review-paid.json" in paid_run
+    assert "--markdown-output claimci-review-paid.md" in paid_run
+    assert "rm -f claimci-review-preflight.json claimci-review-preflight.md" in preflight_run
+    assert "rm -f claimci-review-paid.json claimci-review-paid.md" in paid_run
+    assert "claimci-review-paid" not in preflight_run
+    assert "claimci-review-preflight" not in paid_run
 
 
 def test_review_reads_opt_in_only_from_trusted_base_checkout() -> None:

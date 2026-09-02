@@ -23,6 +23,7 @@ from .evidence import (
 from .models import (
     ClaimType,
     ChangeInventory,
+    DeclaredReviewCoordinates,
     GateDisposition,
     MagnitudeKind,
     PreflightGateResult,
@@ -30,6 +31,7 @@ from .models import (
     ProviderUsage,
     ReviewConfig,
     ReviewError,
+    ReviewInventoryFailure,
     ReviewPreflight,
     ReviewStatus,
     ScientificClaim,
@@ -88,6 +90,8 @@ class ReviewInputs:
     comparison_base: SnapshotIdentity | None = None
     head: SnapshotIdentity | None = None
     inventory: ChangeInventory | object | None = None
+    coordinates: DeclaredReviewCoordinates | None = None
+    inventory_failure: ReviewInventoryFailure | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.repository_root, Path):
@@ -96,6 +100,16 @@ class ReviewInputs:
             object.__setattr__(self, "base_root", Path(self.base_root))
         if not isinstance(self.pr_title, str) or not isinstance(self.pr_description, str):
             raise ReviewError("pull-request title and description must be strings")
+        if self.coordinates is not None and not isinstance(
+            self.coordinates, DeclaredReviewCoordinates
+        ):
+            raise ReviewError("declared review coordinates are invalid")
+        if self.inventory_failure is not None and not isinstance(
+            self.inventory_failure, ReviewInventoryFailure
+        ):
+            raise ReviewError("review inventory failure is invalid")
+        if self.inventory is not None and self.inventory_failure is not None:
+            raise ReviewError("review inventory and failure are mutually exclusive")
 
 
 @dataclass(frozen=True)
@@ -787,6 +801,8 @@ def run_review(
             inputs.comparison_base,
             inputs.head,
             inputs.inventory,
+            inputs.coordinates,
+            inputs.inventory_failure,
         )
     )
     from .preflight import (

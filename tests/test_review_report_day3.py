@@ -178,6 +178,7 @@ def _failed_preflight_fixture() -> ReviewPreflight:
         ready_for_provider=False,
         review_status_ceiling=ReviewStatus.UNAVAILABLE,
         scope=None,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
     )
 
 
@@ -557,7 +558,7 @@ def test_review_preflight_report_preserves_failed_and_not_evaluated_gates() -> N
     markdown = render_review_markdown(review)
 
     assert first == second
-    assert payload["preflight"]["coordinates"]["comparison_basis"] is None
+    assert payload["preflight"]["coordinates"]["comparison_basis"] == "direct_base"
     assert payload["preflight"]["inventory"] is None
     assert payload["preflight"]["scope"] is None
     assert payload["preflight"]["projection"] == {}
@@ -578,6 +579,7 @@ def test_review_preflight_report_preserves_failed_and_not_evaluated_gates() -> N
             ),
         )
     assert "Gate 1: **fail**" in markdown
+    assert f"Comparison base: `{_REQUESTED_SHA}` (direct&#95;base)." in markdown
     assert "Gate 2: **not&#95;evaluated**" in markdown
     assert "PREFLIGHT&#95;NOT&#95;EVALUATED&#95;UPSTREAM&#95;FAILURE" in markdown
 

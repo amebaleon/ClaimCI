@@ -188,6 +188,40 @@ class SnapshotIdentity:
 
 
 @dataclass(frozen=True)
+class DeclaredReviewCoordinates:
+    """Raw all-or-none coordinates retained even when a root is invalid."""
+
+    requested_base_sha: str
+    comparison_base_sha: str
+    head_sha: str
+    comparison_basis: ComparisonBasis
+    invalid_root_roles: tuple[SnapshotRole, ...] = ()
+
+    def __post_init__(self) -> None:
+        for label in (
+            "requested_base_sha",
+            "comparison_base_sha",
+            "head_sha",
+        ):
+            if not isinstance(getattr(self, label), str):
+                raise ReviewError("declared review coordinates must be strings")
+        if not isinstance(self.comparison_basis, ComparisonBasis):
+            raise ReviewError("declared review comparison basis is invalid")
+        role_order = {
+            SnapshotRole.REQUESTED_BASE: 0,
+            SnapshotRole.COMPARISON_BASE: 1,
+            SnapshotRole.HEAD: 2,
+        }
+        if (
+            not isinstance(self.invalid_root_roles, tuple)
+            or any(role not in role_order for role in self.invalid_root_roles)
+            or tuple(sorted(set(self.invalid_root_roles), key=role_order.__getitem__))
+            != self.invalid_root_roles
+        ):
+            raise ReviewError("declared review invalid-root roles are invalid")
+
+
+@dataclass(frozen=True)
 class ChangeEntry:
     path: str
     status: ChangeStatus
@@ -554,6 +588,18 @@ class ScopeIssue:
 
 
 @dataclass(frozen=True)
+class ReviewInventoryFailure:
+    """Content-free typed failure carried from inventory construction."""
+
+    code: str
+
+    def __post_init__(self) -> None:
+        issue = ScopeIssue(code=self.code)
+        if not issue.code.startswith("PREFLIGHT_G1_"):
+            raise ReviewError("review inventory failure must be a Gate 1 code")
+
+
+@dataclass(frozen=True)
 class ReviewScope:
     """Complete inventory plus its bounded, deterministic materialization plan."""
 
@@ -695,6 +741,7 @@ class ReviewPreflight:
     ready_for_provider: bool
     review_status_ceiling: ReviewStatus
     scope: ReviewScope | None
+    comparison_basis: ComparisonBasis | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -763,6 +810,16 @@ class ReviewPreflight:
             raise ReviewError("review preflight status ceiling is inconsistent")
         if self.scope is not None and not isinstance(self.scope, ReviewScope):
             raise ReviewError("review preflight scope is invalid")
+        if self.comparison_basis is not None and not isinstance(
+            self.comparison_basis, ComparisonBasis
+        ):
+            raise ReviewError("review preflight comparison basis is invalid")
+        if (
+            self.scope is not None
+            and self.comparison_basis is not None
+            and self.comparison_basis is not self.scope.inventory.comparison_basis
+        ):
+            raise ReviewError("review preflight comparison basis is inconsistent")
 
 
 @dataclass(frozen=True)

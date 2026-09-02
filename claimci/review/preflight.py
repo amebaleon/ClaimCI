@@ -17,11 +17,13 @@ from .models import (
     ChangeInventorySource,
     ChangeStatus,
     ComparisonBasis,
+    DeclaredReviewCoordinates,
     GateDisposition,
     MaterialClaimSeed,
     PreflightGateResult,
     ReviewConfig,
     ReviewError,
+    ReviewInventoryFailure,
     ReviewMaterialKind,
     ReviewPreflight,
     ReviewScope,
@@ -68,6 +70,8 @@ class _ScopeInputs(Protocol):
     comparison_base: SnapshotIdentity | None
     head: SnapshotIdentity | None
     inventory: ChangeInventory | None
+    coordinates: DeclaredReviewCoordinates | None
+    inventory_failure: ReviewInventoryFailure | None
 
 
 _CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -959,8 +963,17 @@ def _inventory_shape_issues(inventory: object) -> tuple[ScopeIssue, ...]:
 
 
 def _coordinate_sha(inputs: _ScopeInputs, field: str, inventory_field: str) -> str:
+    coordinates = getattr(inputs, "coordinates", None)
+    value = (
+        getattr(coordinates, inventory_field, None)
+        if isinstance(coordinates, DeclaredReviewCoordinates)
+        else None
+    )
     snapshot = getattr(inputs, field, None)
-    value = getattr(snapshot, "sha", None)
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", value
+    ):
+        value = getattr(snapshot, "sha", None)
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
         inventory = getattr(inputs, "inventory", None)
         value = getattr(inventory, inventory_field, None)
@@ -972,21 +985,51 @@ def _coordinate_sha(inputs: _ScopeInputs, field: str, inventory_field: str) -> s
     )
 
 
+def _coordinate_basis(inputs: _ScopeInputs) -> ComparisonBasis | None:
+    coordinates = getattr(inputs, "coordinates", None)
+    if isinstance(coordinates, DeclaredReviewCoordinates):
+        return coordinates.comparison_basis
+    inventory = getattr(inputs, "inventory", None)
+    basis = getattr(inventory, "comparison_basis", None)
+    return basis if isinstance(basis, ComparisonBasis) else None
+
+
 def _gate1_precheck(inputs: _ScopeInputs) -> tuple[ScopeIssue, ...]:
     issues: list[ScopeIssue] = []
     requested = getattr(inputs, "requested_base", None)
     comparison = getattr(inputs, "comparison_base", None)
     head = getattr(inputs, "head", None)
     inventory = getattr(inputs, "inventory", None)
-    for snapshot, code in (
-        (head, "PREFLIGHT_G1_HEAD_ROOT_INVALID"),
-        (requested, "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"),
-        (comparison, "PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID"),
-    ):
-        if issue := _snapshot_root_issue(snapshot, code):
-            issues.append(issue)
-    if comparison is None:
+    coordinates = getattr(inputs, "coordinates", None)
+    inventory_failure = getattr(inputs, "inventory_failure", None)
+    root_issues: list[ScopeIssue] = []
+    if isinstance(coordinates, DeclaredReviewCoordinates):
+        root_codes = {
+            SnapshotRole.REQUESTED_BASE: "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID",
+            SnapshotRole.COMPARISON_BASE: "PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID",
+            SnapshotRole.HEAD: "PREFLIGHT_G1_HEAD_ROOT_INVALID",
+        }
+        root_issues.extend(
+            ScopeIssue(code=root_codes[role])
+            for role in coordinates.invalid_root_roles
+        )
+    else:
+        for snapshot, code in (
+            (head, "PREFLIGHT_G1_HEAD_ROOT_INVALID"),
+            (requested, "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"),
+            (comparison, "PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID"),
+        ):
+            if issue := _snapshot_root_issue(snapshot, code):
+                root_issues.append(issue)
+    if root_issues and isinstance(coordinates, DeclaredReviewCoordinates):
+        return tuple(sorted(set(root_issues), key=_issue_sort_key))
+    issues.extend(root_issues)
+    if comparison is None and not isinstance(coordinates, DeclaredReviewCoordinates):
         issues.append(ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_UNDECLARED"))
+    if isinstance(inventory_failure, ReviewInventoryFailure):
+        return (ScopeIssue(code=inventory_failure.code),)
+    if inventory_failure is not None:
+        return (ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"),)
     if inventory is None:
         issues.append(ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_UNAVAILABLE"))
         return tuple(sorted(set(issues), key=_issue_sort_key))
@@ -1014,6 +1057,16 @@ def _gate1_precheck(inputs: _ScopeInputs) -> tuple[ScopeIssue, ...]:
     if any(actual != declared for actual, declared in coordinates):
         issues.append(ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH"))
     basis = getattr(inventory, "comparison_basis", None)
+    declared_coordinates = getattr(inputs, "coordinates", None)
+    if isinstance(declared_coordinates, DeclaredReviewCoordinates):
+        if (
+            requested.sha != declared_coordinates.requested_base_sha
+            or comparison.sha != declared_coordinates.comparison_base_sha
+            or head.sha != declared_coordinates.head_sha
+        ):
+            issues.append(ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH"))
+        if basis is not declared_coordinates.comparison_basis:
+            issues.append(ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_MISMATCH"))
     if basis is ComparisonBasis.DIRECT_BASE and comparison.sha != requested.sha:
         issues.append(ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_MISMATCH"))
     if basis not in {ComparisonBasis.DIRECT_BASE, ComparisonBasis.MERGE_BASE}:
@@ -1315,6 +1368,7 @@ def _evaluate_material_gates(
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=scope,
+            comparison_basis=inventory.comparison_basis,
         )
     gate1 = _gate_result(
         1,
@@ -1337,6 +1391,7 @@ def _evaluate_material_gates(
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=scope,
+            comparison_basis=inventory.comparison_basis,
         )
     scope = _trim_scope_for_gate3(scope, config)
     gate3 = _gate3(scope, config)
@@ -1364,6 +1419,7 @@ def _evaluate_material_gates(
         ready_for_provider=ready,
         review_status_ceiling=ceiling,
         scope=scope,
+        comparison_basis=inventory.comparison_basis,
     )
 
 
@@ -1374,7 +1430,14 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
         raise ReviewError("config must be ReviewConfig")
     declared = any(
         getattr(inputs, field, None) is not None
-        for field in ("requested_base", "comparison_base", "head", "inventory")
+        for field in (
+            "requested_base",
+            "comparison_base",
+            "head",
+            "inventory",
+            "coordinates",
+            "inventory_failure",
+        )
     )
     if not declared:
         inventory, legacy_issues = _legacy_inventory(inputs)
@@ -1409,6 +1472,7 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
     requested_sha = _coordinate_sha(inputs, "requested_base", "requested_base_sha")
     comparison_sha = _coordinate_sha(inputs, "comparison_base", "comparison_base_sha")
     head_sha = _coordinate_sha(inputs, "head", "head_sha")
+    comparison_basis = _coordinate_basis(inputs)
     gate1_reasons = _gate1_precheck(inputs)
     inventory = getattr(inputs, "inventory", None)
     if gate1_reasons or not isinstance(inventory, ChangeInventory):
@@ -1422,6 +1486,7 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=None,
+            comparison_basis=comparison_basis,
         )
     requested = inputs.requested_base
     comparison = inputs.comparison_base
@@ -1447,6 +1512,7 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=None,
+            comparison_basis=comparison_basis,
         )
     except ReviewError:
         gate1 = _gate_result(
@@ -1468,6 +1534,7 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=None,
+            comparison_basis=comparison_basis,
         )
     if verified != inventory:
         reasons: list[ScopeIssue] = []
@@ -1510,6 +1577,7 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=None,
+            comparison_basis=comparison_basis,
         )
     return _evaluate_material_gates(
         build_review_scope(inputs, config, inventory),

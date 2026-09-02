@@ -246,6 +246,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          rm -f claimci-review-preflight.json claimci-review-preflight.md
           set +e
           claimci review pull-request \
             --requested-base-root claimci-trusted \
@@ -258,18 +259,18 @@ jobs:
             --config .claimci/review.yaml \
             --event-json "$GITHUB_EVENT_PATH" \
             --preflight-only \
-            --json-output claimci-review.json \
-            --markdown-output claimci-review.md
+            --json-output claimci-review-preflight.json \
+            --markdown-output claimci-review-preflight.md
           preflight_status=$?
           set -e
           ready=false
-          if [ "$preflight_status" -eq 0 ] && [ -s claimci-review.json ]; then
+          if [ "$preflight_status" -eq 0 ] && [ -s claimci-review-preflight.json ]; then
             ready="$(python - <<'PY'
           import json
           from pathlib import Path
 
           try:
-              value = json.loads(Path("claimci-review.json").read_text(encoding="utf-8"))
+              value = json.loads(Path("claimci-review-preflight.json").read_text(encoding="utf-8"))
               ready = value.get("preflight", {}).get("ready_for_provider") is True
           except Exception:
               ready = False
@@ -282,6 +283,7 @@ jobs:
           echo "preflight_status=$preflight_status" >> "$GITHUB_OUTPUT"
 
       - name: Install optional review SDK after passed preflight
+        id: review_sdk
         if: always() && steps.preflight.outputs.ready == 'true'
         continue-on-error: true
         shell: bash
@@ -289,7 +291,7 @@ jobs:
 
       - name: Run optional ClaimCI Research Review
         id: review
-        if: always() && steps.preflight.outputs.ready == 'true'
+        if: always() && steps.preflight.outputs.ready == 'true' && steps.review_sdk.outcome == 'success'
         continue-on-error: true
         shell: bash
         env:
@@ -298,6 +300,7 @@ jobs:
           # it in either report or the handoff payload.
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          rm -f claimci-review-paid.json claimci-review-paid.md
           set +e
           claimci review pull-request \
             --requested-base-root claimci-trusted \
@@ -309,8 +312,8 @@ jobs:
             --config-root claimci-trusted \
             --config .claimci/review.yaml \
             --event-json "$GITHUB_EVENT_PATH" \
-            --json-output claimci-review.json \
-            --markdown-output claimci-review.md
+            --json-output claimci-review-paid.json \
+            --markdown-output claimci-review-paid.md
           review_status=$?
           set -e
 
@@ -319,11 +322,36 @@ jobs:
       - name: Ensure advisory review artifacts
         if: always()
         shell: bash
+        env:
+          PREFLIGHT_READY: ${{ steps.preflight.outputs.ready }}
+          PREFLIGHT_STATUS: ${{ steps.preflight.outputs.preflight_status }}
+          REVIEW_SDK_OUTCOME: ${{ steps.review_sdk.outcome }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          PAID_STATUS: ${{ steps.review.outputs.review_status }}
         run: |
-          if [ ! -s claimci-review.json ]; then
-            printf '%s\n' '{"schema_version":2,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json
+          set -euo pipefail
+          rm -f claimci-review.json claimci-review.md
+          selected=false
+          if [ "${PREFLIGHT_READY:-}" = "true" ]; then
+            if [ "${PREFLIGHT_STATUS:-}" = "0" ] && \
+               [ "${REVIEW_SDK_OUTCOME:-}" = "success" ] && \
+               [ "${REVIEW_OUTCOME:-}" = "success" ] && \
+               [ "${PAID_STATUS:-}" = "0" ] && \
+               [ -s claimci-review-paid.json ] && \
+               [ -s claimci-review-paid.md ]; then
+              cp claimci-review-paid.json claimci-review.json
+              cp claimci-review-paid.md claimci-review.md
+              selected=true
+            fi
+          elif [ "${PREFLIGHT_STATUS:-}" = "0" ] && \
+               [ -s claimci-review-preflight.json ] && \
+               [ -s claimci-review-preflight.md ]; then
+            cp claimci-review-preflight.json claimci-review.json
+            cp claimci-review-preflight.md claimci-review.md
+            selected=true
           fi
-          if [ ! -s claimci-review.md ]; then
+          if [ "$selected" != "true" ]; then
+            printf '%s\n' '{"schema_version":2,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json
             {
               echo '## ClaimCI Research Review (Advisory)'
               echo

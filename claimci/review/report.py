@@ -171,6 +171,9 @@ def _preflight_payload(review: ResearchReview) -> dict[str, Any] | None:
         return None
     scope = preflight.scope
     inventory = None if scope is None else scope.inventory
+    comparison_basis = preflight.comparison_basis
+    if comparison_basis is None and inventory is not None:
+        comparison_basis = inventory.comparison_basis
     gate_rows = []
     for gate in sorted(preflight.gates, key=lambda item: item.gate):
         gate_rows.append(
@@ -226,7 +229,7 @@ def _preflight_payload(review: ResearchReview) -> dict[str, Any] | None:
             "comparison_base_sha": preflight.comparison_base_sha,
             "head_sha": preflight.head_sha,
             "comparison_basis": (
-                None if inventory is None else inventory.comparison_basis.value
+                None if comparison_basis is None else comparison_basis.value
             ),
         },
         "inventory": (
@@ -483,11 +486,10 @@ def _preflight_lines(review: ResearchReview) -> list[str]:
             "- Scope complete: unavailable.",
         ]
     scope = preflight.scope
-    basis = (
-        "unavailable"
-        if scope is None
-        else scope.inventory.comparison_basis.value
-    )
+    comparison_basis = preflight.comparison_basis
+    if comparison_basis is None and scope is not None:
+        comparison_basis = scope.inventory.comparison_basis
+    basis = "unavailable" if comparison_basis is None else comparison_basis.value
     lines = [
         f"- Requested base: `{_markdown_text(preflight.requested_base_sha)}`.",
         f"- Comparison base: `{_markdown_text(preflight.comparison_base_sha)}` "

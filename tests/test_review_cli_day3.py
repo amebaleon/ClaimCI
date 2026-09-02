@@ -442,8 +442,14 @@ def test_review_cli_preflight_inventory_failure_is_structured_and_does_not_leak_
     assert payload["review"]["status"] == "UNAVAILABLE"
     assert payload["preflight"]["ready_for_provider"] is False
     assert payload["preflight"]["gates"][0]["reasons"] == [
-        {"code": "PREFLIGHT_G1_CHANGE_INVENTORY_UNAVAILABLE"}
+        {"code": "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"}
     ]
+    assert payload["preflight"]["coordinates"] == {
+        "requested_base_sha": _REQUESTED_SHA,
+        "comparison_base_sha": _COMPARISON_SHA,
+        "head_sha": _HEAD_SHA,
+        "comparison_basis": "merge_base",
+    }
     assert payload["provider"]["calls"] == []
     assert payload["provider"]["usage"] == {
         "estimated_cost_usd": 0.0,
@@ -510,9 +516,12 @@ def test_review_cli_declared_symlink_root_is_a_structured_gate_one_failure(
     payload = json.loads(captured.out)
     reasons = payload["preflight"]["gates"][0]["reasons"]
     assert exit_code == 0
-    assert {reason["code"] for reason in reasons} >= {
-        "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID",
-        "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+    assert reasons == [{"code": "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"}]
+    assert payload["preflight"]["coordinates"] == {
+        "requested_base_sha": _REQUESTED_SHA,
+        "comparison_base_sha": _COMPARISON_SHA,
+        "head_sha": _HEAD_SHA,
+        "comparison_basis": "merge_base",
     }
     assert payload["provider"]["calls"] == []
     assert "Traceback" not in captured.out + captured.err
@@ -556,13 +565,224 @@ def test_review_cli_invalid_requested_root_without_config_root_is_structured(
     reasons = payload["preflight"]["gates"][0]["reasons"]
     assert exit_code == 0
     assert payload["review"]["status"] == "UNAVAILABLE"
-    assert {reason["code"] for reason in reasons} >= {
-        "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID",
-        "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
-    }
+    assert reasons == [{"code": "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"}]
+    assert payload["preflight"]["coordinates"]["comparison_basis"] == "merge_base"
     assert payload["provider"]["calls"] == []
     assert str(missing_requested) not in captured.out + captured.err
     assert "Traceback" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    ("root_role", "reason_code"),
+    [
+        ("requested", "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"),
+        ("comparison", "PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID"),
+        ("head", "PREFLIGHT_G1_HEAD_ROOT_INVALID"),
+    ],
+)
+@pytest.mark.parametrize("invalid_kind", ["missing", "file", "symlink"])
+def test_review_cli_declared_invalid_roots_preserve_raw_coordinates_without_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    root_role: str,
+    reason_code: str,
+    invalid_kind: str,
+) -> None:
+    """Every invalid declared-root kind is a content-free Gate 1 result."""
+
+    roots = {
+        "requested": tmp_path / "requested",
+        "comparison": tmp_path / "comparison",
+        "head": tmp_path / "head",
+    }
+    for root in roots.values():
+        root.mkdir()
+    config_root = tmp_path / "trusted-config"
+    config_root.mkdir()
+    _write_enabled_config(config_root)
+
+    invalid = tmp_path / f"invalid-{root_role}-{invalid_kind}"
+    if invalid_kind == "file":
+        invalid.write_text("not a directory", encoding="utf-8")
+    elif invalid_kind == "symlink":
+        target = tmp_path / f"target-{root_role}"
+        target.mkdir()
+        target_resolved = target.resolve()
+        path_type = type(invalid)
+        original_resolve = path_type.resolve
+        original_is_symlink = path_type.is_symlink
+
+        def pretend_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+            if path == invalid:
+                return target_resolved
+            return original_resolve(path, *args, **kwargs)
+
+        def pretend_is_symlink(path: Path) -> bool:
+            return path == invalid or original_is_symlink(path)
+
+        monkeypatch.setattr(path_type, "resolve", pretend_resolve)
+        monkeypatch.setattr(path_type, "is_symlink", pretend_is_symlink)
+    roots[root_role] = invalid
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_git_change_inventory",
+        lambda *_args: pytest.fail("invalid declared roots must not reach Git"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(roots["head"]),
+            "--config-root",
+            str(config_root),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(roots["requested"], roots["comparison"]),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["review"]["status"] == "UNAVAILABLE"
+    assert payload["preflight"]["gates"][0]["reasons"] == [
+        {"code": reason_code}
+    ]
+    assert payload["preflight"]["coordinates"] == {
+        "requested_base_sha": _REQUESTED_SHA,
+        "comparison_base_sha": _COMPARISON_SHA,
+        "head_sha": _HEAD_SHA,
+        "comparison_basis": "merge_base",
+    }
+    assert payload["provider"]["calls"] == []
+    assert str(invalid) not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_review_cli_preflight_only_short_circuits_disabled_config_before_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A disabled free path mirrors runtime and cannot become provider-ready."""
+
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = tmp_path / "comparison"
+    for root in (repository, requested, comparison):
+        root.mkdir()
+    monkeypatch.setattr(
+        cli_module,
+        "build_git_change_inventory",
+        lambda *_args: pytest.fail("disabled preflight must not invoke Git"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "preflight_review",
+        lambda *_args: pytest.fail("disabled preflight must short-circuit"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call runtime"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "OpenAIReviewerProvider",
+        lambda **_kwargs: pytest.fail("disabled preflight must not construct a provider"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(requested, comparison),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["review"] == {
+        "status": "DISABLED",
+        "policy": "advisory",
+        "blocking": False,
+    }
+    assert payload["preflight"] is None
+    assert payload["provider"]["calls"] == []
+    assert payload["provider"]["usage"] == {
+        "estimated_cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert captured.err == ""
+
+
+def test_review_cli_rejects_symlinked_explicit_config_root_without_path_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Trusted configuration roots are lexical non-symlink directories."""
+
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = tmp_path / "comparison"
+    config_target = tmp_path / "config-target"
+    for root in (repository, requested, comparison, config_target):
+        root.mkdir()
+    _write_enabled_config(config_target)
+    config_link = tmp_path / "config-link"
+    target_resolved = config_target.resolve()
+    path_type = type(config_link)
+    original_resolve = path_type.resolve
+    original_is_symlink = path_type.is_symlink
+
+    def pretend_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+        if path == config_link:
+            return target_resolved
+        return original_resolve(path, *args, **kwargs)
+
+    def pretend_is_symlink(path: Path) -> bool:
+        return path == config_link or original_is_symlink(path)
+
+    monkeypatch.setattr(path_type, "resolve", pretend_resolve)
+    monkeypatch.setattr(path_type, "is_symlink", pretend_is_symlink)
+    monkeypatch.setattr(
+        cli_module,
+        "load_review_config",
+        lambda *_args: pytest.fail("a symlinked config root must not be followed"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--config-root",
+            str(config_link),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(requested, comparison),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "config root is invalid" in captured.err
+    assert str(config_link) not in captured.err
+    assert str(config_target) not in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_review_cli_preflight_event_json_keeps_the_one_mebibyte_input_cap(

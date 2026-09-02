@@ -159,15 +159,64 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # The review runtime is the immutable source containing this reusable
+      # workflow, isolated from all consumer snapshot roots.
+      - name: Check out immutable ClaimCI review runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: claimci-runtime
+          persist-credentials: false
+
+      - name: Validate immutable ClaimCI review runtime
+        id: runtime_identity
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ job.workflow_sha }}"
+          full_sha='^([0-9a-f]{40}|[0-9a-f]{64})$'
+          if [[ ! "$expected_sha" =~ $full_sha ]]; then
+            exit 1
+          fi
+          actual_sha="$(git -C claimci-runtime rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_sha" != "$expected_sha" ]; then
+            exit 1
+          fi
+
       - name: Set up Python for trusted review
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
 
-      - name: Install trusted ClaimCI carrier
-        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
-        with:
-          install-review-dependencies: false
+      - name: Install immutable ClaimCI review carrier
+        id: review_carrier
+        if: always() && steps.runtime_identity.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: python -m pip install --disable-pip-version-check ./claimci-runtime
+
+      - name: Validate immutable ClaimCI review CLI contract
+        id: runtime_contract
+        if: always() && steps.review_carrier.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          review_help="$(claimci review --help)"
+          for option in \
+            --preflight-only \
+            --requested-base-root \
+            --comparison-base-root \
+            --requested-base-sha \
+            --comparison-base-sha \
+            --comparison-basis \
+            --head-sha
+          do
+            grep -F -- "$option" <<<"$review_help" >/dev/null
+          done
 
       - name: Probe trusted review configuration
         id: review_config
@@ -199,12 +248,13 @@ jobs:
 
       - name: Run free providerless review preflight
         id: preflight
-        if: always() && steps.review_config.outputs.enabled == 'true'
+        if: always() && steps.runtime_contract.outcome == 'success' && steps.review_config.outputs.enabled == 'true'
         continue-on-error: true
         shell: bash
         env:
           REVIEW_CONFIG_PATH: ${{ inputs.review-config-path }}
         run: |
+          rm -f claimci-review-preflight.json claimci-review-preflight.md
           set +e
           claimci review pull-request \
             --requested-base-root consumer-base \
@@ -217,18 +267,18 @@ jobs:
             --config "$REVIEW_CONFIG_PATH" \
             --event-json "$GITHUB_EVENT_PATH" \
             --preflight-only \
-            --json-output claimci-review.json \
-            --markdown-output claimci-review.md
+            --json-output claimci-review-preflight.json \
+            --markdown-output claimci-review-preflight.md
           preflight_status=$?
           set -e
           ready=false
-          if [ "$preflight_status" -eq 0 ] && [ -s claimci-review.json ]; then
+          if [ "$preflight_status" -eq 0 ] && [ -s claimci-review-preflight.json ]; then
             ready="$(python - <<'PY'
           import json
           from pathlib import Path
 
           try:
-              value = json.loads(Path("claimci-review.json").read_text(encoding="utf-8"))
+              value = json.loads(Path("claimci-review-preflight.json").read_text(encoding="utf-8"))
               ready = value.get("preflight", {}).get("ready_for_provider") is True
           except Exception:
               ready = False
@@ -241,21 +291,22 @@ jobs:
           echo "preflight_status=$preflight_status" >> "$GITHUB_OUTPUT"
 
       - name: Install optional review dependencies
+        id: review_sdk
         if: always() && steps.preflight.outputs.ready == 'true'
         continue-on-error: true
-        uses: amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__
-        with:
-          install-review-dependencies: true
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "./claimci-runtime[llm]"
 
       - name: Run optional research review
         id: review
-        if: always() && steps.preflight.outputs.ready == 'true'
+        if: always() && steps.preflight.outputs.ready == 'true' && steps.review_sdk.outcome == 'success'
         continue-on-error: true
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REVIEW_CONFIG_PATH: ${{ inputs.review-config-path }}
         run: |
+          rm -f claimci-review-paid.json claimci-review-paid.md
           set +e
           claimci review pull-request \
             --requested-base-root consumer-base \
@@ -267,8 +318,8 @@ jobs:
             --config-root consumer-base \
             --config "$REVIEW_CONFIG_PATH" \
             --event-json "$GITHUB_EVENT_PATH" \
-            --json-output claimci-review.json \
-            --markdown-output claimci-review.md
+            --json-output claimci-review-paid.json \
+            --markdown-output claimci-review-paid.md
           review_status=$?
           set -e
           echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
@@ -276,9 +327,44 @@ jobs:
       - name: Ensure advisory review artifacts
         if: always()
         shell: bash
+        env:
+          PREFLIGHT_READY: ${{ steps.preflight.outputs.ready }}
+          PREFLIGHT_STATUS: ${{ steps.preflight.outputs.preflight_status }}
+          REVIEW_SDK_OUTCOME: ${{ steps.review_sdk.outcome }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          PAID_STATUS: ${{ steps.review.outputs.review_status }}
         run: |
-          if [ ! -s claimci-review.json ]; then printf '%s\n' '{"schema_version":2,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json; fi
-          if [ ! -s claimci-review.md ]; then printf '%s\n' '## ClaimCI Research Review (Advisory)' > claimci-review.md; fi
+          set -euo pipefail
+          rm -f claimci-review.json claimci-review.md
+          selected=false
+          if [ "${PREFLIGHT_READY:-}" = "true" ]; then
+            if [ "${PREFLIGHT_STATUS:-}" = "0" ] && \
+               [ "${REVIEW_SDK_OUTCOME:-}" = "success" ] && \
+               [ "${REVIEW_OUTCOME:-}" = "success" ] && \
+               [ "${PAID_STATUS:-}" = "0" ] && \
+               [ -s claimci-review-paid.json ] && \
+               [ -s claimci-review-paid.md ]; then
+              cp claimci-review-paid.json claimci-review.json
+              cp claimci-review-paid.md claimci-review.md
+              selected=true
+            fi
+          elif [ "${PREFLIGHT_STATUS:-}" = "0" ] && \
+               [ -s claimci-review-preflight.json ] && \
+               [ -s claimci-review-preflight.md ]; then
+            cp claimci-review-preflight.json claimci-review.json
+            cp claimci-review-preflight.md claimci-review.md
+            selected=true
+          fi
+          if [ "$selected" != "true" ]; then
+            printf '%s\n' '{"schema_version":2,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json
+            {
+              echo '## ClaimCI Research Review (Advisory)'
+              echo
+              echo '**Review unavailable; no advisory Markdown was produced.**'
+              echo
+              echo 'Only the separate deterministic ClaimCI Audit can block a pull request.'
+            } > claimci-review.md
+          fi
           cat claimci-review.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build advisory Review Check payload

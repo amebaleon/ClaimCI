@@ -7,8 +7,11 @@ import sys
 import contextlib
 import io
 import importlib.util
+import json
+import os
 import runpy
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ACTION = ROOT / "action.yml"
 TEMPLATE = ROOT / "templates" / "claimci-external.yml.tmpl"
 ACTIVE_WORKFLOW = ROOT / ".github" / "workflows" / "claimci-external.yml"
+INTERNAL_WORKFLOW = ROOT / ".github" / "workflows" / "claimci.yml"
 RENDERER = ROOT / "scripts" / "render_external_workflow.py"
 INSTALLER_SHA = "1b85419c4beaf7052732339fd80fb9242e75ef06"
 MATERIALIZER = ROOT / "scripts" / "materialize_external_demo.py"
@@ -47,6 +51,84 @@ def _run_renderer(*args: str) -> subprocess.CompletedProcess[str]:
         returncode,
         stdout.getvalue(),
         stderr.getvalue(),
+    )
+
+
+def _bash_executable() -> str:
+    if os.name == "nt":
+        candidates = (
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Git"
+            / "bin"
+            / "bash.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Git"
+            / "usr"
+            / "bin"
+            / "bash.exe",
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+    found = shutil.which("bash")
+    if found is None:
+        pytest.skip("bash is required for workflow lifecycle verification")
+    return found
+
+
+def _advisory_finalizer(path: Path) -> str:
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["research_review"]["steps"]
+    matches = [
+        step
+        for step in steps
+        if step.get("name") == "Ensure advisory review artifacts"
+    ]
+    assert len(matches) == 1
+    return str(matches[0].get("run", ""))
+
+
+def _run_advisory_finalizer(
+    path: Path,
+    root: Path,
+    *,
+    ready: str,
+    preflight_status: str,
+    sdk_outcome: str,
+    review_outcome: str,
+    paid_status: str,
+) -> subprocess.CompletedProcess[str]:
+    summary = root / "summary.md"
+    stdout_path = root / "finalizer.stdout"
+    stderr_path = root / "finalizer.stderr"
+    environment = {
+        **os.environ,
+        "PREFLIGHT_READY": ready,
+        "PREFLIGHT_STATUS": preflight_status,
+        "REVIEW_SDK_OUTCOME": sdk_outcome,
+        "REVIEW_OUTCOME": review_outcome,
+        "PAID_STATUS": paid_status,
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    command = [_bash_executable(), "-eu", "-c", _advisory_finalizer(path)]
+    with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
+        "w", encoding="utf-8"
+    ) as stderr_file:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+            check=False,
+        )
+    return subprocess.CompletedProcess(
+        command,
+        completed.returncode,
+        stdout_path.read_text(encoding="utf-8"),
+        stderr_path.read_text(encoding="utf-8"),
     )
 
 
@@ -153,11 +235,11 @@ def test_renderer_requires_output_argument_and_reports_controlled_error():
 def test_template_has_exactly_one_installer_marker_in_claimci_action_reference():
     template = TEMPLATE.read_text(encoding="utf-8")
     marker = "__CLAIMCI_INSTALLER_SHA__"
-    assert template.count(marker) >= 1
+    assert template.count(marker) == 1
     marker_lines = [line for line in template.splitlines() if marker in line]
     assert all("amebaleon/ClaimCI@" in line for line in marker_lines)
     refs = re.findall(r"amebaleon/ClaimCI@([^\s\"']+)", template)
-    assert refs and refs == [marker] * len(refs)
+    assert refs == [marker]
     assert yaml.safe_load(template) is not None
 
 
@@ -315,7 +397,7 @@ def test_active_workflow_is_rendered_at_authorized_sha_and_has_exact_call_contra
     )
     assert "__CLAIMCI_INSTALLER_SHA__" not in text
     refs = re.findall(r"amebaleon/ClaimCI@([^\s\"']+)", text)
-    assert refs and refs == [INSTALLER_SHA] * len(refs)
+    assert refs == [INSTALLER_SHA]
     on = _active_on(workflow)
     call = on["workflow_call"]
     assert call["inputs"]["manifest-path"] == {
@@ -337,16 +419,20 @@ def test_active_workflow_separates_audit_review_and_neutral_publication():
     assert jobs["research_review"]["permissions"] == {"contents": "read"}
     assert jobs["publish_research_review"]["permissions"] == {"checks": "write"}
 
-    assert text.count("claimci review") == 2
-    assert text.count("--preflight-only") == 1
-    assert "--json-output claimci-review.json" in text
-    assert "--markdown-output claimci-review.md" in text
+    assert len(re.findall(r"(?m)^\s*claimci review pull-request(?:\s|\\|$)", text)) == 2
+    assert "--json-output claimci-review-preflight.json" in text
+    assert "--markdown-output claimci-review-preflight.md" in text
+    assert "--json-output claimci-review-paid.json" in text
+    assert "--markdown-output claimci-review-paid.md" in text
+    assert "rm -f claimci-review-preflight.json claimci-review-preflight.md" in text
+    assert "rm -f claimci-review-paid.json claimci-review-paid.md" in text
     assert "--config-root consumer-base" in text
     review_runs = "\n".join(
         str(step.get("run", ""))
         for step in jobs["research_review"]["steps"]
-        if "claimci review" in str(step.get("run", ""))
+        if "claimci review pull-request" in str(step.get("run", ""))
     )
+    assert review_runs.count("--preflight-only") == 1
     for option in (
         "--requested-base-root",
         "--comparison-base-root",
@@ -380,10 +466,158 @@ def test_review_dependencies_are_probed_from_trusted_base_and_installed_advisory
     assert "load_review_config" in text
     assert "consumer-base" in text
     assert "review_config" in text
-    assert "install-review-dependencies: false" in text
-    assert "install-review-dependencies: true" in text
+    assert "python -m pip install --disable-pip-version-check ./claimci-runtime" in text
+    assert 'python -m pip install --disable-pip-version-check "./claimci-runtime[llm]"' in text
     assert "steps.review_config.outputs.enabled" in text
     assert "continue-on-error: true" in text
+
+
+def test_external_review_uses_exact_colocated_runtime_and_keeps_audit_pin() -> None:
+    for path, audit_ref in (
+        (ACTIVE_WORKFLOW, f"amebaleon/ClaimCI@{INSTALLER_SHA}"),
+        (TEMPLATE, "amebaleon/ClaimCI@__CLAIMCI_INSTALLER_SHA__"),
+    ):
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+        audit = workflow["jobs"]["claimci_audit"]
+        review = workflow["jobs"]["research_review"]
+        audit_uses = [str(step.get("uses", "")) for step in audit["steps"]]
+        review_uses = [str(step.get("uses", "")) for step in review["steps"]]
+        assert audit_uses.count(audit_ref) == 1
+        assert not any("amebaleon/ClaimCI@" in value for value in review_uses)
+
+        runtime_checkouts = [
+            step
+            for step in review["steps"]
+            if step.get("with", {}).get("path") == "claimci-runtime"
+        ]
+        assert len(runtime_checkouts) == 1
+        assert runtime_checkouts[0]["with"] == {
+            "repository": "${{ job.workflow_repository }}",
+            "ref": "${{ job.workflow_sha }}",
+            "path": "claimci-runtime",
+            "persist-credentials": False,
+        }
+        identity_steps = [
+            step for step in review["steps"] if step.get("id") == "runtime_identity"
+        ]
+        assert len(identity_steps) == 1
+        identity_run = str(identity_steps[0].get("run", ""))
+        assert "job.workflow_sha" in identity_run
+        assert "[0-9a-f]{40}" in identity_run and "[0-9a-f]{64}" in identity_run
+        assert "git -C claimci-runtime rev-parse --verify 'HEAD^{commit}'" in identity_run
+
+        install_runs = "\n".join(
+            str(step.get("run", ""))
+            for step in review["steps"]
+            if "pip install" in str(step.get("run", ""))
+        )
+        assert "pip install --disable-pip-version-check ./claimci-runtime" in install_runs
+        assert 'pip install --disable-pip-version-check "./claimci-runtime[llm]"' in install_runs
+        contract_steps = [
+            step for step in review["steps"] if step.get("id") == "runtime_contract"
+        ]
+        assert len(contract_steps) == 1
+        contract_run = str(contract_steps[0].get("run", ""))
+        assert "claimci review --help" in contract_run
+        for option in (
+            "--preflight-only",
+            "--requested-base-root",
+            "--comparison-base-root",
+            "--requested-base-sha",
+            "--comparison-base-sha",
+            "--comparison-basis",
+            "--head-sha",
+        ):
+            assert option in contract_run
+
+
+@pytest.mark.parametrize(
+    "workflow_path",
+    [INTERNAL_WORKFLOW, ACTIVE_WORKFLOW, TEMPLATE],
+    ids=("internal", "external", "template"),
+)
+def test_review_finalizer_replaces_ready_preflight_when_paid_fails_before_write(
+    tmp_path: Path,
+    workflow_path: Path,
+) -> None:
+    stale = {
+        "schema_version": 2,
+        "review": {"status": "COMPLETE", "policy": "advisory", "blocking": False},
+    }
+    (tmp_path / "claimci-review.json").write_text(json.dumps(stale), encoding="utf-8")
+    (tmp_path / "claimci-review.md").write_text("STALE READY PREFLIGHT", encoding="utf-8")
+    result = _run_advisory_finalizer(
+        workflow_path,
+        tmp_path,
+        ready="true",
+        preflight_status="0",
+        sdk_outcome="success",
+        review_outcome="failure",
+        paid_status="2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    final = json.loads((tmp_path / "claimci-review.json").read_text(encoding="utf-8"))
+    assert final["schema_version"] == 2
+    assert final["review"] == {
+        "status": "UNAVAILABLE",
+        "policy": "advisory",
+        "blocking": False,
+    }
+    markdown = (tmp_path / "claimci-review.md").read_text(encoding="utf-8")
+    assert "unavailable" in markdown.casefold()
+    assert "STALE READY PREFLIGHT" not in markdown
+
+
+@pytest.mark.parametrize(
+    "workflow_path",
+    [INTERNAL_WORKFLOW, ACTIVE_WORKFLOW, TEMPLATE],
+    ids=("internal", "external", "template"),
+)
+def test_review_finalizer_publishes_not_ready_preflight_and_fresh_paid_success(
+    tmp_path: Path,
+    workflow_path: Path,
+) -> None:
+    preflight = {
+        "schema_version": 2,
+        "review": {"status": "UNAVAILABLE", "policy": "advisory", "blocking": False},
+    }
+    paid = {
+        "schema_version": 2,
+        "review": {"status": "PARTIAL", "policy": "advisory", "blocking": False},
+    }
+    preflight_json = json.dumps(preflight, sort_keys=True)
+    paid_json = json.dumps(paid, sort_keys=True)
+    (tmp_path / "claimci-review-preflight.json").write_text(preflight_json, encoding="utf-8")
+    (tmp_path / "claimci-review-preflight.md").write_text("PREFLIGHT NOT READY", encoding="utf-8")
+
+    not_ready = _run_advisory_finalizer(
+        workflow_path,
+        tmp_path,
+        ready="false",
+        preflight_status="0",
+        sdk_outcome="",
+        review_outcome="",
+        paid_status="",
+    )
+    assert not_ready.returncode == 0, not_ready.stderr
+    assert (tmp_path / "claimci-review.json").read_text(encoding="utf-8") == preflight_json
+    assert (tmp_path / "claimci-review.md").read_text(encoding="utf-8") == "PREFLIGHT NOT READY"
+
+    (tmp_path / "claimci-review-paid.json").write_text(paid_json, encoding="utf-8")
+    (tmp_path / "claimci-review-paid.md").write_text("FRESH PAID REVIEW", encoding="utf-8")
+    paid_success = _run_advisory_finalizer(
+        workflow_path,
+        tmp_path,
+        ready="true",
+        preflight_status="0",
+        sdk_outcome="success",
+        review_outcome="success",
+        paid_status="0",
+    )
+    assert paid_success.returncode == 0, paid_success.stderr
+    assert (tmp_path / "claimci-review.json").read_text(encoding="utf-8") == paid_json
+    assert (tmp_path / "claimci-review.md").read_text(encoding="utf-8") == "FRESH PAID REVIEW"
 
 
 def test_advisory_review_setup_and_publication_cannot_fail_authoritative_audit():
@@ -484,7 +718,11 @@ def test_active_workflow_is_explicit_about_provider_secret_and_checks_credential
     assert "ClaimCI Research Review" in text
 
     review_steps = review["steps"]
-    review_commands = [step for step in review_steps if "claimci review" in str(step.get("run", ""))]
+    review_commands = [
+        step
+        for step in review_steps
+        if "claimci review pull-request" in str(step.get("run", ""))
+    ]
     preflight_steps = [step for step in review_commands if "--preflight-only" in str(step.get("run", ""))]
     paid_steps = [step for step in review_commands if "--preflight-only" not in str(step.get("run", ""))]
     credential_steps = [step for step in review_steps if "OPENAI_API_KEY" in str(step.get("env", {}))]
