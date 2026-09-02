@@ -1123,6 +1123,11 @@ def run_review(
                 and inputs.comparison_base is not None
                 else inputs.base_root
             ),
+            materialized_path_chars=(
+                preflight.scope.materialized_path_chars
+                if preflight is not None and preflight.scope is not None
+                else None
+            ),
         )
         if config.limits.max_calls < 2:
             return finish(

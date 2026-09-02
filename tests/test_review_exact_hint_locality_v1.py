@@ -24,9 +24,11 @@ from claimci.review.evidence import (
 from claimci.review.models import (
     ClaimMagnitude,
     ClaimType,
+    GateDisposition,
     MagnitudeKind,
     ProviderUsage,
     ReviewConfig,
+    ReviewError,
     ReviewLimits,
     ReviewStatus,
     ScientificClaim,
@@ -734,6 +736,211 @@ def test_changed_region_alone_surfaces_sentinel_behavior_in_final_interpretation
         "extract_claims",
         "synthesize_review",
     ]
+
+
+def test_preflight_path_allocations_preserve_changed_region_after_earlier_exact_hints(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    earlier_paths = (
+        "aa/oversized.py",
+        "ab/oversized.py",
+        "ac/oversized.py",
+    )
+    target = "zz/zz_target.py"
+    for path in earlier_paths:
+        _write(head, path, "x" * 17_000)
+    unchanged_prefix = "".join(
+        f"unchanged_{index:04d} = {index}\n" for index in range(150)
+    )
+    base_line = "target = '" + ("a" * 13_900) + "'\n"
+    head_line = "target = '" + ("b" * 13_900) + "'\n"
+    _write(base, target, unchanged_prefix + base_line)
+    _write(head, target, unchanged_prefix + head_line)
+    claim_text = (
+        "Accuracy improves by 5% because the changed implementation in "
+        f"{target} preserves the bounded target region."
+    )
+
+    class FourPathProvider:
+        def __init__(self) -> None:
+            self.calls: list[StructuredRequest] = []
+
+        def _response(
+            self, request: StructuredRequest, payload: dict[str, object]
+        ) -> ProviderResponse:
+            self.calls.append(request)
+            return ProviderResponse(
+                output_text=json.dumps(payload),
+                provider="fake",
+                model="fake-model",
+            )
+
+        def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
+            source = next(
+                item
+                for item in request.payload["sources"]
+                if item["kind"] == "pull_request_description"
+            )
+            return self._response(
+                request,
+                {
+                    "claims": [
+                        {
+                            "source_text": claim_text,
+                            "claim_type": "implementation_claim",
+                            "subject": "bounded target region",
+                            "metric": "accuracy",
+                            "direction": "higher",
+                            "claimed_magnitude": {
+                                "raw": "5%",
+                                "value": 5.0,
+                                "unit": "%",
+                                "kind": "relative",
+                            },
+                            "qualifiers": [],
+                            "source": {
+                                "source_id": source["source_id"],
+                                "start_line": 1,
+                                "end_line": 1,
+                            },
+                            "confidence": 0.9,
+                            "evidence_hints": [*earlier_paths, target],
+                        }
+                    ]
+                },
+            )
+
+        def synthesize_review(self, request: StructuredRequest) -> ProviderResponse:
+            claim_id = request.payload["claims"][0]["claim_id"]
+            target_evidence = next(
+                (
+                    item
+                    for item in request.payload["evidence"]
+                    if item["path"] == target
+                ),
+                None,
+            )
+            return self._response(
+                request,
+                {
+                    "interpretations": [
+                        {
+                            "claim_id": claim_id,
+                            "interpretation": "The bounded changed region is citable.",
+                            "citations": (
+                                []
+                                if target_evidence is None
+                                else [target_evidence["evidence_id"]]
+                            ),
+                            "missing_evidence": [],
+                            "unsupported_inferences": [],
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+            )
+
+    provider = FourPathProvider()
+    result = run_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_description=claim_text,
+        ),
+        _review_config(),
+        provider=provider,
+    )
+
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.preflight.gates[2].disposition is GateDisposition.PASS_PARTIAL
+    assert dict(result.preflight.scope.materialized_path_chars)[target] == 16_000
+    target_reference = _reference_for(result.evidence.references, target)
+    assert _locality(target_reference) == "changed_region"
+    assert target_reference.excerpt
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+    synthesis = provider.calls[1]
+    assert [item["path"] for item in synthesis.payload["evidence"]] == [target]
+    assert result.interpretations[0].citations == (target_reference.evidence_id,)
+    assert result.status is ReviewStatus.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "allocation",
+    [
+        [],
+        (),
+        ((1, 1),),
+        (("other.py", 1),),
+        (("evidence.py", True),),
+        (("evidence.py", 16_001),),
+    ],
+)
+def test_evidence_rejects_non_frozen_or_out_of_bounds_path_allocations(
+    tmp_path: Path,
+    allocation: object,
+) -> None:
+    _write(tmp_path, "evidence.py", "value = 1\n")
+
+    with pytest.raises(ReviewError):
+        discover_evidence(
+            tmp_path,
+            (),
+            ("evidence.py",),
+            materialized_path_chars=allocation,  # type: ignore[arg-type]
+        )
+
+
+def test_table_and_regular_excerpts_share_one_frozen_path_allowance(
+    tmp_path: Path,
+) -> None:
+    path = "benchmarks/results.md"
+    table = (
+        "| Benchmark | Metric | Value |\n"
+        "| --- | --- | ---: |\n"
+        "| Rollup | Rows read | 4.0x |\n"
+    )
+    _write(tmp_path, path, table + ("supporting implementation detail\n" * 40))
+    table_claim = _claim(
+        "claim-table-budget",
+        ClaimType.RESOURCE_REDUCTION,
+        "The rollup reads 4.0x fewer rows.",
+        "rollup",
+        metric="rows read",
+        magnitude=ClaimMagnitude(
+            raw="4.0x",
+            value=4.0,
+            unit="x",
+            kind=MagnitudeKind.RELATIVE,
+        ),
+    )
+    regular_claim = _claim(
+        "claim-regular-budget",
+        ClaimType.RESOURCE_REDUCTION,
+        "The benchmark implementation reduces rows read.",
+        "benchmark implementation",
+        metric="rows read",
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (table_claim, regular_claim),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+        materialized_path_chars=((path, 200),),
+    )
+
+    path_references = tuple(
+        reference for reference in bundle.references if reference.path == path
+    )
+    assert len(path_references) == 2
+    assert sum(len(reference.excerpt) for reference in path_references) <= 200
 
 
 def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(

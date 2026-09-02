@@ -860,6 +860,7 @@ def discover_evidence(
     selected_paths: Sequence[str] = (),
     changed_paths: Sequence[str] | None = None,
     base_root: Path | None = None,
+    materialized_path_chars: tuple[tuple[str, int], ...] | None = None,
 ) -> EvidenceBundle:
     """Select bounded indexed paths within one audit-wide unique-file budget.
 
@@ -868,6 +869,8 @@ def discover_evidence(
     evidence path consumes one of the same ``limits.max_files`` slots.
     ``priority_paths`` is trusted deterministic routing data, never a provider
     hint; those paths are issued before broader heuristic matches.
+    ``materialized_path_chars`` freezes preflight's exact sorted path allowlist
+    and per-path character allocations.  Legacy callers may omit it.
     """
 
     root = _root(repository_root)
@@ -896,6 +899,48 @@ def discover_evidence(
     if len(selected) > limits.max_files:
         raise ReviewError("selected evidence paths exceed the global file limit")
     sorted_index = tuple(sorted(normalized_index))
+    path_char_limits: dict[str, int] | None = None
+    if materialized_path_chars is not None:
+        if not isinstance(materialized_path_chars, tuple):
+            raise ReviewError("materialized path character limits must be a tuple")
+        normalized_limits: list[tuple[str, int]] = []
+        for item in materialized_path_chars:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ReviewError("materialized path character limit is malformed")
+            raw_path, char_limit = item
+            normalized = _safe_relative(raw_path)
+            if (
+                not isinstance(raw_path, str)
+                or normalized is None
+                or normalized != raw_path
+                or normalized not in normalized_index
+            ):
+                raise ReviewError(
+                    "materialized path character limit is unsafe or not indexed"
+                )
+            if (
+                isinstance(char_limit, bool)
+                or not isinstance(char_limit, int)
+                or not 0 <= char_limit <= limits.max_file_chars
+            ):
+                raise ReviewError(
+                    "materialized path character limit is outside the file bound"
+                )
+            normalized_limits.append((normalized, char_limit))
+        if (
+            tuple(sorted(normalized_limits)) != materialized_path_chars
+            or len({path for path, _chars in normalized_limits})
+            != len(normalized_limits)
+            or {path for path, _chars in normalized_limits} != normalized_index
+        ):
+            raise ReviewError(
+                "materialized path character limits must exactly match the indexed paths"
+            )
+        if sum(chars for _path, chars in normalized_limits) > limits.max_context_chars:
+            raise ReviewError(
+                "materialized path character limits exceed the context bound"
+            )
+        path_char_limits = dict(normalized_limits)
     if changed_paths is None:
         changed: set[str] = set(sorted_index)
     else:
@@ -1121,7 +1166,14 @@ def discover_evidence(
                     )
                 )
             continue
-        char_limit = min(limits.max_file_chars, remaining)
+        path_char_limit = (
+            limits.max_file_chars
+            if path_char_limits is None
+            else path_char_limits[relative]
+        )
+        char_limit = min(path_char_limit, remaining)
+        if char_limit <= 0:
+            continue
         try:
             capture = capture_confined_regular_file(
                 root,
@@ -1148,7 +1200,7 @@ def discover_evidence(
         if not excerpt:
             continue
         table_claim_ids: set[str] = set()
-        table_chars = 0
+        path_remaining = char_limit
         if relative in markdown_candidates:
             for table in _markdown_tables(excerpt):
                 matching_ids = {
@@ -1160,7 +1212,11 @@ def discover_evidence(
                         path=relative,
                     )
                 }
-                if not matching_ids or len(table.excerpt) > remaining:
+                if (
+                    not matching_ids
+                    or len(table.excerpt) > remaining
+                    or len(table.excerpt) > path_remaining
+                ):
                     continue
                 provenance = EvidenceProvenance.REPORTED_MEASUREMENT
                 evidence_id = "evidence-" + hashlib.sha256(
@@ -1186,14 +1242,11 @@ def discover_evidence(
                     )
                 )
                 table_claim_ids.update(matching_ids)
-                table_chars += len(table.excerpt)
+                path_remaining -= len(table.excerpt)
                 remaining -= len(table.excerpt)
 
         regular_claim_ids = set(by_path.get(relative, ())) - table_claim_ids
-        regular_limit = min(
-            max(0, limits.max_file_chars - table_chars),
-            remaining,
-        )
+        regular_limit = min(path_remaining, remaining)
         if regular_claim_ids and regular_limit > 0:
             kind = _kind(relative)
             (
