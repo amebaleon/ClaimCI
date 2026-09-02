@@ -19,6 +19,7 @@ from claimci.review.models import (
 from claimci.review.openai_provider import OpenAIReviewerProvider
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
+from claimci.review.request_budget import output_budget_ready
 
 
 def _request(task: str = "extract_claims") -> StructuredRequest:
@@ -37,6 +38,19 @@ def test_review_limits_default_to_material_claim_and_task_specific_budgets() -> 
     assert limits.extraction_max_output_tokens == 5_000
     assert limits.synthesis_max_output_tokens == 4_000
     assert limits.max_output_chars == 24_000
+
+
+def test_preflight_output_reserve_requires_the_full_frozen_two_call_budget() -> None:
+    assert output_budget_ready(ReviewLimits()) is True
+    assert output_budget_ready(ReviewLimits(max_output_chars=23_999)) is False
+    assert (
+        output_budget_ready(ReviewLimits(extraction_max_output_tokens=4_999))
+        is False
+    )
+    assert (
+        output_budget_ready(ReviewLimits(synthesis_max_output_tokens=3_999))
+        is False
+    )
 
 
 def test_enabled_config_accepts_new_budgets_and_legacy_config_remains_readable(

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from decimal import Decimal, DecimalException
-from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -24,21 +22,31 @@ from .evidence import (
 )
 from .models import (
     ClaimType,
+    ChangeInventory,
     MagnitudeKind,
     ProviderCallRecord,
     ProviderUsage,
     ReviewConfig,
     ReviewError,
+    ReviewPreflight,
     ReviewStatus,
     ScientificClaim,
+    SnapshotIdentity,
     SourceBundle,
 )
-from .openai_provider import OpenAIReviewerProvider
 from .provider import (
     ProviderResponse,
-    REVIEW_SYSTEM_POLICY,
     ReviewerProvider,
     StructuredRequest,
+)
+from .request_budget import (
+    build_extraction_request_parts,
+    build_synthesis_request_parts,
+    extraction_schema as shared_extraction_schema,
+    logical_request_chars,
+    plain as shared_plain,
+    serialized_chars as shared_serialized_chars,
+    synthesis_schema as shared_synthesis_schema,
 )
 from .sources import (
     collect_review_sources,
@@ -58,12 +66,24 @@ from .tools import (
 MAX_PROVIDER_JSON_DEPTH = 64
 
 
+def OpenAIReviewerProvider(**kwargs: Any) -> ReviewerProvider:
+    """Construct the default adapter lazily, after provider-free preflight."""
+
+    from .openai_provider import OpenAIReviewerProvider as Provider
+
+    return Provider(**kwargs)
+
+
 @dataclass(frozen=True)
 class ReviewInputs:
     repository_root: Path
     base_root: Path | None = None
     pr_title: str = ""
     pr_description: str = ""
+    requested_base: SnapshotIdentity | None = None
+    comparison_base: SnapshotIdentity | None = None
+    head: SnapshotIdentity | None = None
+    inventory: ChangeInventory | object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.repository_root, Path):
@@ -87,6 +107,7 @@ class ClaimInterpretation:
 @dataclass(frozen=True)
 class ResearchReview:
     status: ReviewStatus
+    preflight: ReviewPreflight | None = None
     claims: tuple[ScientificClaim, ...] = ()
     interpretations: tuple[ClaimInterpretation, ...] = ()
     evidence: EvidenceBundle = EvidenceBundle()
@@ -259,15 +280,7 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
 
 
 def _extraction_schema(max_claims: int) -> dict[str, Any]:
-    if (
-        isinstance(max_claims, bool)
-        or not isinstance(max_claims, int)
-        or not 1 <= max_claims <= 16
-    ):
-        raise ReviewError("max_claims must be an integer from 1 through 16")
-    schema = copy.deepcopy(_EXTRACTION_SCHEMA)
-    schema["properties"]["claims"]["maxItems"] = max_claims
-    return schema
+    return shared_extraction_schema(max_claims)
 
 
 _SYNTHESIS_SCHEMA: dict[str, Any] = {
@@ -580,92 +593,25 @@ def _synthesis_schema(
     interpretation_constraints_by_claim_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Constrain each row to issued IDs using the provider-supported subset."""
-
-    schema = copy.deepcopy(_SYNTHESIS_SCHEMA)
-    interpretations = schema["properties"]["interpretations"]
-    interpretations["minItems"] = len(claims)
-    interpretations["maxItems"] = len(claims)
-    alternatives: list[dict[str, Any]] = []
-    row_template = _SYNTHESIS_SCHEMA["properties"]["interpretations"]["items"]
-    constraints = interpretation_constraints_by_claim_id or {}
-    for claim in claims:
-        row = copy.deepcopy(row_template)
-        row["properties"]["claim_id"] = {
-            "type": "string",
-            "enum": [claim.claim_id],
-        }
-        allowed = list(evidence_ids_by_claim_id[claim.claim_id])
-        citations: dict[str, Any] = {
-            "type": "array",
-            "maxItems": len(allowed),
-            "items": {"type": "string"},
-        }
-        if allowed:
-            citations["items"]["enum"] = allowed
-        row["properties"]["citations"] = citations
-        constraint = constraints.get(claim.claim_id)
-        if constraint is not None:
-            required_interpretation = constraint["required_interpretation"]
-            required_citations = list(constraint["required_citations"])
-            row["properties"]["interpretation"] = {
-                "type": "string",
-                "enum": [required_interpretation],
-            }
-            constrained_citations: dict[str, Any] = {
-                "type": "array",
-                "minItems": len(required_citations),
-                "maxItems": len(required_citations),
-                "items": {"type": "string"},
-            }
-            if required_citations:
-                constrained_citations["items"]["enum"] = required_citations
-            row["properties"]["citations"] = constrained_citations
-        alternatives.append(row)
-    if alternatives:
-        interpretations["items"] = {"anyOf": alternatives}
-    return schema
+    return shared_synthesis_schema(
+        claims,
+        evidence_ids_by_claim_id,
+        interpretation_constraints_by_claim_id,
+    )
 
 
 def _plain(value: Any) -> Any:
-    if is_dataclass(value):
-        return {
-            field.name: _plain(getattr(value, field.name))
-            for field in fields(value)
-        }
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
-    return value
+    return shared_plain(value)
 
 
 def _serialized_chars(value: object) -> int:
-    return len(
-        json.dumps(
-            _plain(value),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    )
+    return shared_serialized_chars(value)
 
 
 def _request_chars(task: str, payload: object, schema: object) -> int:
     """Count the complete logical context for this provider request."""
 
-    return _serialized_chars(
-        {
-            "system_policy": REVIEW_SYSTEM_POLICY,
-            "task": task,
-            "input": payload,
-            "strict_response_schema": schema,
-        }
-    )
+    return logical_request_chars(task, payload, schema)
 
 
 def _reject_constant(token: str) -> None:
@@ -833,6 +779,7 @@ def _aggregate_usage(calls: Sequence[ProviderCallRecord]) -> ProviderUsage:
 def _result(
     status: ReviewStatus,
     *,
+    preflight: ReviewPreflight | None = None,
     claims: tuple[ScientificClaim, ...] = (),
     interpretations: tuple[ClaimInterpretation, ...] = (),
     evidence: EvidenceBundle = EvidenceBundle(),
@@ -844,6 +791,7 @@ def _result(
     call_tuple = tuple(calls)
     return ResearchReview(
         status=status,
+        preflight=preflight,
         claims=claims,
         interpretations=interpretations,
         evidence=evidence,
@@ -949,34 +897,57 @@ def run_review(
 
     if not isinstance(config, ReviewConfig):
         raise ReviewError("config must be ReviewConfig")
+    preflight: ReviewPreflight | None = None
+
+    def finish(status: ReviewStatus, **kwargs: Any) -> ResearchReview:
+        return _result(status, preflight=preflight, **kwargs)
+
     if not config.enabled:
-        return _result(ReviewStatus.DISABLED)
+        return finish(ReviewStatus.DISABLED)
     if not isinstance(inputs, ReviewInputs):
         raise ReviewError("inputs must be ReviewInputs")
-    if provider is None:
-        if config.provider != "openai":
-            return _result(
-                ReviewStatus.UNAVAILABLE,
-                error_code="PROVIDER_UNSUPPORTED",
-                error_message="Configured review provider is not available.",
-            )
-        provider = OpenAIReviewerProvider(
-            model=config.model,
-            timeout_seconds=config.limits.timeout_seconds,
-            max_output_tokens=max(
-                config.limits.extraction_max_output_tokens,
-                config.limits.synthesis_max_output_tokens,
-            ),
+    declared = any(
+        value is not None
+        for value in (
+            inputs.requested_base,
+            inputs.comparison_base,
+            inputs.head,
+            inputs.inventory,
         )
+    )
+    if declared:
+        from .preflight import preflight_review, scope_source_bundle
+
+        preflight = preflight_review(inputs, config)
+        if not preflight.ready_for_provider:
+            failure = next(
+                gate
+                for gate in preflight.gates
+                if gate.disposition.value == "fail"
+            )
+            error_code = failure.reasons[0].code
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                error_code=error_code,
+                error_message="Research review preflight did not pass.",
+            )
+        assert preflight.scope is not None
+        preflight_sources = scope_source_bundle(preflight.scope)
+    else:
+        preflight_sources = None
 
     calls: list[ProviderCallRecord] = []
     try:
-        sources = collect_review_sources(
-            inputs.repository_root,
-            base_root=inputs.base_root,
-            pr_title=inputs.pr_title,
-            pr_description=inputs.pr_description,
-            limits=config.limits,
+        sources = (
+            preflight_sources
+            if preflight_sources is not None
+            else collect_review_sources(
+                inputs.repository_root,
+                base_root=inputs.base_root,
+                pr_title=inputs.pr_title,
+                pr_description=inputs.pr_description,
+                limits=config.limits,
+            )
         )
         manifest_candidates = discover_manifests(
             inputs.repository_root,
@@ -994,36 +965,45 @@ def run_review(
         manifest_candidates = tuple(
             plan.manifest_path for plan in audit_plans
         )
-        sources = _sources_after_manifest_reservation(
-            sources,
-            audit_plans,
-            max_files=config.limits.max_files,
+        if preflight_sources is None:
+            sources = _sources_after_manifest_reservation(
+                sources,
+                audit_plans,
+                max_files=config.limits.max_files,
+            )
+        extraction_parts = build_extraction_request_parts(
+            sources, config.limits.max_claims
         )
-        extraction_schema = _extraction_schema(config.limits.max_claims)
-        extraction_payload = {
-            "policy": {
-                "mode": "advisory",
-                "untrusted_content": True,
-                "deterministic_authority": "ClaimCI Audit only",
-            },
-            "extraction_contract": dict(_EXTRACTION_CONTRACT),
-            "max_claims": config.limits.max_claims,
-            "sources": _plain(sources.sources),
-            "repository_paths": _plain(sources.repository_paths),
-        }
         extraction_chars = _request_chars(
-            "extract_claims", extraction_payload, extraction_schema
+            extraction_parts.task,
+            extraction_parts.payload,
+            extraction_parts.schema,
         )
         if extraction_chars > config.limits.max_context_chars:
-            return _result(
+            return finish(
                 ReviewStatus.UNAVAILABLE,
                 error_code="CONTEXT_LIMIT",
                 error_message="Extraction context exceeds the configured limit.",
             )
+        if provider is None:
+            if config.provider != "openai":
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    error_code="PROVIDER_UNSUPPORTED",
+                    error_message="Configured review provider is not available.",
+                )
+            provider = OpenAIReviewerProvider(
+                model=config.model,
+                timeout_seconds=config.limits.timeout_seconds,
+                max_output_tokens=max(
+                    config.limits.extraction_max_output_tokens,
+                    config.limits.synthesis_max_output_tokens,
+                ),
+            )
         extraction_request = StructuredRequest(
-            task="extract_claims",
-            payload=extraction_payload,
-            schema=extraction_schema,
+            task=extraction_parts.task,
+            payload=extraction_parts.payload,
+            schema=extraction_parts.schema,
             max_output_tokens=config.limits.extraction_max_output_tokens,
         )
         extraction_response = provider.extract_claims(extraction_request)
@@ -1033,7 +1013,7 @@ def run_review(
         calls.append(extraction_call)
         if not extraction_response.complete:
             truncated = extraction_response.incomplete_reason == "max_output_tokens"
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 calls=calls,
                 error_code=(
@@ -1099,7 +1079,7 @@ def run_review(
             base_root=inputs.base_root,
         )
         if config.limits.max_calls < 2:
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 evidence=evidence,
@@ -1114,37 +1094,25 @@ def run_review(
             evidence,
             evidence_ids_by_claim_id,
         )
-        synthesis_schema = _synthesis_schema(
+        synthesis_parts = build_synthesis_request_parts(
             claims,
+            tuple(
+                reference
+                for reference in evidence.references
+                if _citable_reference(reference)
+            ),
             evidence_ids_by_claim_id,
             interpretation_constraints_by_claim_id,
+            evidence.missing,
+            deterministic_audits,
         )
-        synthesis_payload = {
-            "policy": {
-                "mode": "advisory",
-                "deterministic_authority": "read_only",
-            },
-            "synthesis_contract": dict(_SYNTHESIS_CONTRACT),
-            "claims": _plain(claims),
-            "evidence": _plain(
-                tuple(
-                    reference
-                    for reference in evidence.references
-                    if _citable_reference(reference)
-                )
-            ),
-            "evidence_ids_by_claim_id": evidence_ids_by_claim_id,
-            "interpretation_constraints_by_claim_id": (
-                interpretation_constraints_by_claim_id
-            ),
-            "missing_evidence": _plain(evidence.missing),
-            "deterministic_audits": _plain(deterministic_audits),
-        }
         synthesis_chars = _request_chars(
-            "synthesize_review", synthesis_payload, synthesis_schema
+            synthesis_parts.task,
+            synthesis_parts.payload,
+            synthesis_parts.schema,
         )
         if synthesis_chars > config.limits.max_context_chars:
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 evidence=evidence,
@@ -1154,9 +1122,9 @@ def run_review(
                 error_message="Synthesis context exceeds the configured limit.",
             )
         synthesis_request = StructuredRequest(
-            task="synthesize_review",
-            payload=synthesis_payload,
-            schema=synthesis_schema,
+            task=synthesis_parts.task,
+            payload=synthesis_parts.payload,
+            schema=synthesis_parts.schema,
             max_output_tokens=config.limits.synthesis_max_output_tokens,
         )
         synthesis_response = provider.synthesize_review(synthesis_request)
@@ -1166,7 +1134,7 @@ def run_review(
         calls.append(synthesis_call)
         if not synthesis_response.complete:
             truncated = synthesis_response.incomplete_reason == "max_output_tokens"
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 evidence=evidence,
@@ -1181,7 +1149,7 @@ def run_review(
                 ),
             )
         if sum(call.output_chars for call in calls) > config.limits.max_output_chars:
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 evidence=evidence,
@@ -1219,7 +1187,7 @@ def run_review(
                     )
                 )
             )
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 evidence=evidence,
@@ -1229,7 +1197,7 @@ def run_review(
                 error_message=validation_message,
             )
         if rejected_claim_candidates:
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 interpretations=interpretations,
@@ -1244,7 +1212,7 @@ def run_review(
                 ),
             )
         if evidence.routing_incomplete:
-            return _result(
+            return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
                 interpretations=interpretations,
@@ -1258,7 +1226,7 @@ def run_review(
                     "claim was interpreted, but the advisory review is incomplete."
                 ),
             )
-        return _result(
+        return finish(
             ReviewStatus.COMPLETE,
             claims=claims,
             interpretations=interpretations,
@@ -1268,7 +1236,7 @@ def run_review(
         )
     except Exception as exc:
         # Provider/model text is never included in the safe status message.
-        return _result(
+        return finish(
             ReviewStatus.UNAVAILABLE,
             calls=calls,
             error_code="REVIEW_UNAVAILABLE",

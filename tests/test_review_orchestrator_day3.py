@@ -18,7 +18,19 @@ from typing import Any, Callable
 import pytest
 import yaml
 
-from claimci.review.models import ProviderUsage, ReviewConfig, ReviewLimits, ReviewStatus
+from claimci.review.models import (
+    ChangeEntry,
+    ChangeInventory,
+    ChangeInventorySource,
+    ChangeStatus,
+    ComparisonBasis,
+    ProviderUsage,
+    ReviewConfig,
+    ReviewLimits,
+    ReviewStatus,
+    SnapshotIdentity,
+    SnapshotRole,
+)
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.evidence import EvidenceBundle, EvidenceKind, EvidenceReference
@@ -582,6 +594,46 @@ def test_context_limit_stops_before_provider_call(tmp_path: Path) -> None:
     result = _run(tmp_path, provider, config=_config(max_context_chars=10))
 
     assert result.status is ReviewStatus.UNAVAILABLE
+    assert provider.calls == []
+
+
+def test_declared_gate_3_failure_precedes_injected_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (tmp_path / "declared").resolve()
+    root.mkdir()
+    (root / "results.json").write_text('{"accuracy": 0.95}', encoding="utf-8")
+    sha = "1" * 40
+    inventory = ChangeInventory(
+        schema_version=1,
+        requested_base_sha=sha,
+        comparison_base_sha=sha,
+        head_sha=sha,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
+        declared_entry_count=1,
+        complete=True,
+        entries=(ChangeEntry("results.json", ChangeStatus.ADDED),),
+    )
+    inputs = ReviewInputs(
+        repository_root=root,
+        pr_title="Benchmark accuracy improves by 5% in results.json",
+        requested_base=SnapshotIdentity(SnapshotRole.REQUESTED_BASE, root, sha),
+        comparison_base=SnapshotIdentity(SnapshotRole.COMPARISON_BASE, root, sha),
+        head=SnapshotIdentity(SnapshotRole.HEAD, root, sha),
+        inventory=inventory,
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    provider = FakeProvider()
+
+    result = run_review(inputs, _config(max_calls=1), provider=provider)
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "PREFLIGHT_G3_CALL_LIMIT_LT_TWO"
+    assert result.provider_calls == ()
     assert provider.calls == []
 
 

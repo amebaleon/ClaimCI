@@ -10,10 +10,12 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 
 
 class ReviewError(ValueError):
@@ -68,6 +70,13 @@ class ReviewStatus(str, Enum):
     COMPLETE = "COMPLETE"
     PARTIAL = "PARTIAL"
     UNAVAILABLE = "UNAVAILABLE"
+
+
+class GateDisposition(str, Enum):
+    PASS_COMPLETE = "pass_complete"
+    PASS_PARTIAL = "pass_partial"
+    FAIL = "fail"
+    NOT_EVALUATED = "not_evaluated"
 
 
 class ComparisonBasis(str, Enum):
@@ -515,7 +524,10 @@ class ScopeIssue:
 
     def __post_init__(self) -> None:
         code = _nonempty_text(self.code, "scope issue code", max_chars=128)
-        if not re.fullmatch(r"PREFLIGHT_G[123]_[A-Z0-9_]+", code):
+        if not (
+            re.fullmatch(r"PREFLIGHT_G[123]_[A-Z0-9_]+", code)
+            or code == "PREFLIGHT_NOT_EVALUATED_UPSTREAM_FAILURE"
+        ):
             raise ReviewError("scope issue code is invalid")
         if self.path is not None:
             object.__setattr__(self, "path", _portable_inventory_path(self.path))
@@ -527,6 +539,18 @@ class ScopeIssue:
                 raise ReviewError(
                     f"scope issue {label} must be a non-negative integer or null"
                 )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the stable sparse issue representation used by reports."""
+
+        value: dict[str, object] = {"code": self.code}
+        if self.path is not None:
+            value["path"] = self.path
+        if self.observed is not None:
+            value["observed"] = self.observed
+        if self.limit is not None:
+            value["limit"] = self.limit
+        return value
 
 
 @dataclass(frozen=True)
@@ -596,6 +620,103 @@ class ReviewScope:
             or self.materialized_chars < 0
         ):
             raise ReviewError("review scope materialized_chars must be non-negative")
+
+
+@dataclass(frozen=True)
+class PreflightGateResult:
+    gate: int
+    disposition: GateDisposition
+    reasons: tuple[ScopeIssue, ...]
+    metrics: Mapping[str, int | str | bool]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.gate, bool) or self.gate not in {1, 2, 3}:
+            raise ReviewError("preflight gate must be 1, 2, or 3")
+        if not isinstance(self.disposition, GateDisposition):
+            raise ReviewError("preflight gate disposition is invalid")
+        if not isinstance(self.reasons, tuple) or not all(
+            isinstance(reason, ScopeIssue) for reason in self.reasons
+        ):
+            raise ReviewError("preflight gate reasons must be ScopeIssue values")
+        upstream = "PREFLIGHT_NOT_EVALUATED_UPSTREAM_FAILURE"
+        if self.disposition is GateDisposition.PASS_COMPLETE and self.reasons:
+            raise ReviewError("a complete preflight gate cannot contain reasons")
+        if self.disposition in {
+            GateDisposition.PASS_PARTIAL,
+            GateDisposition.FAIL,
+        } and not self.reasons:
+            raise ReviewError("a partial or failed preflight gate requires a reason")
+        if self.disposition is GateDisposition.NOT_EVALUATED:
+            if tuple(reason.code for reason in self.reasons) != (upstream,):
+                raise ReviewError("a skipped preflight gate requires the upstream reason")
+        elif any(reason.code == upstream for reason in self.reasons):
+            raise ReviewError("the upstream reason is only valid for a skipped gate")
+        if not isinstance(self.metrics, Mapping):
+            raise ReviewError("preflight gate metrics must be a mapping")
+        normalized: dict[str, int | str | bool] = {}
+        for key, value in self.metrics.items():
+            if not isinstance(key, str) or not key:
+                raise ReviewError("preflight metric names must be non-empty strings")
+            if not isinstance(value, (int, str, bool)):
+                raise ReviewError("preflight metric values must be scalar")
+            normalized[key] = value
+        object.__setattr__(
+            self,
+            "metrics",
+            MappingProxyType(dict(sorted(normalized.items()))),
+        )
+
+
+@dataclass(frozen=True)
+class ReviewPreflight:
+    schema_version: int
+    requested_base_sha: str
+    comparison_base_sha: str
+    head_sha: str
+    gates: tuple[PreflightGateResult, ...]
+    ready_for_provider: bool
+    review_status_ceiling: ReviewStatus
+    scope: ReviewScope | None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != 1
+        ):
+            raise ReviewError("review preflight schema_version must be 1")
+        _full_git_object_id(self.requested_base_sha, "preflight requested base sha")
+        _full_git_object_id(self.comparison_base_sha, "preflight comparison base sha")
+        _full_git_object_id(self.head_sha, "preflight head sha")
+        if (
+            not isinstance(self.gates, tuple)
+            or tuple(gate.gate for gate in self.gates) != (1, 2, 3)
+        ):
+            raise ReviewError("review preflight must contain gates 1, 2, and 3 in order")
+        dispositions = tuple(gate.disposition for gate in self.gates)
+        failed = GateDisposition.FAIL in dispositions
+        expected_ready = all(
+            disposition
+            in {GateDisposition.PASS_COMPLETE, GateDisposition.PASS_PARTIAL}
+            for disposition in dispositions
+        )
+        expected_ceiling = (
+            ReviewStatus.UNAVAILABLE
+            if failed
+            else (
+                ReviewStatus.PARTIAL
+                if GateDisposition.PASS_PARTIAL in dispositions
+                else ReviewStatus.COMPLETE
+            )
+        )
+        if not isinstance(self.ready_for_provider, bool) or (
+            self.ready_for_provider != expected_ready
+        ):
+            raise ReviewError("review preflight provider readiness is inconsistent")
+        if self.review_status_ceiling is not expected_ceiling:
+            raise ReviewError("review preflight status ceiling is inconsistent")
+        if self.scope is not None and not isinstance(self.scope, ReviewScope):
+            raise ReviewError("review preflight scope is invalid")
 
 
 @dataclass(frozen=True)
