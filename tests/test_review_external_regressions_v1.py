@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -45,6 +46,7 @@ from claimci.review.provider import ProviderResponse, StructuredRequest
 from scripts.replay_review_preflight import (
     CandidateInputLayout,
     FrozenCandidate,
+    _digest_metadata_tree,
     _source_identity,
     load_frozen_manifests,
     replay_candidate,
@@ -649,6 +651,35 @@ def test_source_identity_detects_unreferenced_object_store_addition(
         "git_object_store_entry_count"
     ]
     assert after["git_object_store_sha256"] != before["git_object_store_sha256"]
+
+
+def test_metadata_digest_prunes_top_level_objects_before_descent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata = (tmp_path / "git-metadata").resolve()
+    objects = metadata / "objects"
+    objects.mkdir(parents=True)
+    (objects / "must-not-be-visited").mkdir()
+    (objects / "must-not-be-visited" / "payload").write_bytes(b"object payload")
+    config = metadata / "config"
+    config.write_bytes(b"[core]\n\tbare = false\n")
+    real_scandir = os.scandir
+
+    def reject_object_descent(path):
+        scanned = Path(path).resolve(strict=True)
+        if scanned == objects:
+            raise AssertionError("metadata traversal entered the object store")
+        return real_scandir(path)
+
+    monkeypatch.setattr(
+        "scripts.replay_review_preflight.os.scandir", reject_object_descent
+    )
+    digest = hashlib.sha256()
+
+    count, size = _digest_metadata_tree(metadata, namespace="common", sink=digest)
+
+    assert count == 1
+    assert size == len(b"[core]\n\tbare = false\n")
 
 
 def test_replay_publication_never_truncates_an_outside_hardlink_to_study_content(

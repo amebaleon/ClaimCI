@@ -51,6 +51,8 @@ MAX_MANIFEST_BYTES = 1_048_576
 MAX_METADATA_BYTES = 1_048_576
 MAX_GIT_OUTPUT_BYTES = 128 * 1024 * 1024
 MAX_GIT_METADATA_BYTES = 256 * 1024 * 1024
+MAX_GIT_METADATA_ENTRIES = 250_000
+MAX_GIT_METADATA_PATH_BYTES = 64 * 1024 * 1024
 MAX_GIT_OBJECT_ENTRIES = 250_000
 MAX_GIT_OBJECT_PATH_BYTES = 64 * 1024 * 1024
 MAX_GIT_OBJECT_INFO_BYTES = 16 * 1024 * 1024
@@ -710,20 +712,72 @@ def _git_dir(root: Path, argument: str, empty_hooks: Path) -> Path:
 
 
 def _digest_metadata_tree(root: Path, *, namespace: str, sink: Any) -> tuple[int, int]:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise ValueError("Git metadata is unavailable") from exc
+    root_attributes = getattr(root_stat, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    root_is_junction = getattr(root, "is_junction", lambda: False)()
+    if (
+        root.is_symlink()
+        or root_is_junction
+        or (reparse_flag and root_attributes & reparse_flag)
+        or not stat.S_ISDIR(root_stat.st_mode)
+    ):
+        raise ValueError("Git metadata root is unsafe")
+
+    files: list[tuple[str, Path]] = []
+    directories = [root]
+    entry_count = 0
+    path_bytes = 0
+    while directories:
+        directory = directories.pop()
+        children: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    relative = path.relative_to(root).as_posix()
+                    path_bytes += len(relative.encode("utf-8", errors="strict"))
+                    entry_count += 1
+                    if entry_count > MAX_GIT_METADATA_ENTRIES:
+                        raise ValueError("Git metadata exceeds its entry bound")
+                    if path_bytes > MAX_GIT_METADATA_PATH_BYTES:
+                        raise ValueError("Git metadata exceeds its path bound")
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise ValueError("Git metadata is unavailable") from exc
+                    attributes = getattr(entry_stat, "st_file_attributes", 0)
+                    is_junction = getattr(path, "is_junction", lambda: False)()
+                    if (
+                        entry.is_symlink()
+                        or is_junction
+                        or (reparse_flag and attributes & reparse_flag)
+                    ):
+                        raise ValueError("Git metadata contains a link")
+                    if directory == root and entry.name == "objects":
+                        if not stat.S_ISDIR(entry_stat.st_mode):
+                            raise ValueError("Git object store is unsafe")
+                        continue
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        children.append(path)
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        files.append((relative, path))
+                    else:
+                        raise ValueError("Git metadata contains a special entry")
+        except OSError as exc:
+            raise ValueError("Git metadata is unavailable") from exc
+        directories.extend(
+            reversed(sorted(children, key=lambda child: child.name))
+        )
+
     count = 0
     total = 0
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        relative = path.relative_to(root).as_posix()
-        if relative == "objects" or relative.startswith("objects/"):
-            continue
-        if path.is_symlink():
-            raise ValueError("Git metadata contains a symlink")
-        if not path.is_file():
-            continue
-        raw = _read_bounded(path, limit=MAX_GIT_METADATA_BYTES)
+    for relative, path in sorted(files, key=lambda item: item[0]):
+        raw = _read_bounded(path, limit=MAX_GIT_METADATA_BYTES - total)
         total += len(raw)
-        if total > MAX_GIT_METADATA_BYTES:
-            raise ValueError("Git metadata exceeds its fixed identity bound")
         sink.update(namespace.encode("utf-8") + b"\0")
         sink.update(relative.encode("utf-8") + b"\0")
         sink.update(str(len(raw)).encode("ascii") + b"\0")
