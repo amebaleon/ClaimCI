@@ -97,9 +97,10 @@ jobs:
       - name: Check out trusted consumer base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
           path: consumer-base
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Check out pull-request artifacts as passive review data
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -107,7 +108,56 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pull-request
           persist-credentials: false
+          fetch-depth: 0
           allow-unsafe-pr-checkout: true
+
+      - name: Resolve trusted review coordinates
+        id: coordinates
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          full_sha='^([0-9a-f]{40}|[0-9a-f]{64})$'
+          if [[ ! "$requested_sha" =~ $full_sha ]] || [[ ! "$head_sha" =~ $full_sha ]]; then
+            exit 1
+          fi
+          if [ "$(git -C consumer-base rev-parse --verify 'HEAD^{commit}')" != "$requested_sha" ] || \
+             [ "$(git -C pull-request rev-parse --verify 'HEAD^{commit}')" != "$head_sha" ]; then
+            exit 1
+          fi
+          # The exact base and fork head are separate passive checkouts. Expose
+          # the head object store read-only while deriving from the trusted repo.
+          pull_request_git_dir="$(git -C pull-request rev-parse --absolute-git-dir)"
+          export GIT_ALTERNATE_OBJECT_DIRECTORIES="$pull_request_git_dir/objects"
+          mapfile -t merge_bases < <(git -C consumer-base merge-base --all "$requested_sha" "$head_sha")
+          if [ "${#merge_bases[@]}" -ne 1 ] || [[ ! "${merge_bases[0]}" =~ $full_sha ]]; then
+            exit 1
+          fi
+          comparison_sha="${merge_bases[0]}"
+          if [ "$comparison_sha" = "$requested_sha" ]; then
+            comparison_basis=direct_base
+            comparison_root=consumer-base
+          else
+            comparison_basis=merge_base
+            comparison_root=comparison-base
+          fi
+          echo "requested_sha=$requested_sha" >> "$GITHUB_OUTPUT"
+          echo "comparison_sha=$comparison_sha" >> "$GITHUB_OUTPUT"
+          echo "comparison_basis=$comparison_basis" >> "$GITHUB_OUTPUT"
+          echo "comparison_root=$comparison_root" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out explicit comparison base
+        if: steps.coordinates.outputs.comparison_basis == 'merge_base'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.coordinates.outputs.comparison_sha }}
+          path: comparison-base
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Set up Python for trusted review
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -147,8 +197,51 @@ jobs:
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
           exit 0
 
+      - name: Run free providerless review preflight
+        id: preflight
+        if: always() && steps.review_config.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          REVIEW_CONFIG_PATH: ${{ inputs.review-config-path }}
+        run: |
+          set +e
+          claimci review pull-request \
+            --requested-base-root consumer-base \
+            --comparison-base-root "${{ steps.coordinates.outputs.comparison_root || 'consumer-base' }}" \
+            --requested-base-sha "${{ steps.coordinates.outputs.requested_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-base-sha "${{ steps.coordinates.outputs.comparison_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-basis "${{ steps.coordinates.outputs.comparison_basis || 'direct_base' }}" \
+            --head-sha "${{ steps.coordinates.outputs.head_sha || '0000000000000000000000000000000000000000' }}" \
+            --config-root consumer-base \
+            --config "$REVIEW_CONFIG_PATH" \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --preflight-only \
+            --json-output claimci-review.json \
+            --markdown-output claimci-review.md
+          preflight_status=$?
+          set -e
+          ready=false
+          if [ "$preflight_status" -eq 0 ] && [ -s claimci-review.json ]; then
+            ready="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          try:
+              value = json.loads(Path("claimci-review.json").read_text(encoding="utf-8"))
+              ready = value.get("preflight", {}).get("ready_for_provider") is True
+          except Exception:
+              ready = False
+          print("true" if ready else "false")
+          PY
+          )" || ready=false
+          fi
+          case "$ready" in true|false) ;; *) ready=false ;; esac
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "preflight_status=$preflight_status" >> "$GITHUB_OUTPUT"
+
       - name: Install optional review dependencies
-        if: steps.review_config.outputs.enabled == 'true'
+        if: always() && steps.preflight.outputs.ready == 'true'
         continue-on-error: true
         uses: amebaleon/ClaimCI@1b85419c4beaf7052732339fd80fb9242e75ef06
         with:
@@ -156,7 +249,7 @@ jobs:
 
       - name: Run optional research review
         id: review
-        if: always()
+        if: always() && steps.preflight.outputs.ready == 'true'
         continue-on-error: true
         shell: bash
         env:
@@ -165,7 +258,12 @@ jobs:
         run: |
           set +e
           claimci review pull-request \
-            --base-root consumer-base \
+            --requested-base-root consumer-base \
+            --comparison-base-root "${{ steps.coordinates.outputs.comparison_root || 'consumer-base' }}" \
+            --requested-base-sha "${{ steps.coordinates.outputs.requested_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-base-sha "${{ steps.coordinates.outputs.comparison_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-basis "${{ steps.coordinates.outputs.comparison_basis || 'direct_base' }}" \
+            --head-sha "${{ steps.coordinates.outputs.head_sha || '0000000000000000000000000000000000000000' }}" \
             --config-root consumer-base \
             --config "$REVIEW_CONFIG_PATH" \
             --event-json "$GITHUB_EVENT_PATH" \
@@ -173,10 +271,15 @@ jobs:
             --markdown-output claimci-review.md
           review_status=$?
           set -e
-          if [ ! -s claimci-review.json ]; then printf '%s\n' '{"schema_version":1,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json; fi
+          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure advisory review artifacts
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s claimci-review.json ]; then printf '%s\n' '{"schema_version":2,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json; fi
           if [ ! -s claimci-review.md ]; then printf '%s\n' '## ClaimCI Research Review (Advisory)' > claimci-review.md; fi
           cat claimci-review.md >> "$GITHUB_STEP_SUMMARY"
-          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
 
       - name: Build advisory Review Check payload
         if: always()

@@ -337,11 +337,25 @@ def test_active_workflow_separates_audit_review_and_neutral_publication():
     assert jobs["research_review"]["permissions"] == {"contents": "read"}
     assert jobs["publish_research_review"]["permissions"] == {"checks": "write"}
 
-    assert text.count("claimci review") == 1
+    assert text.count("claimci review") == 2
+    assert text.count("--preflight-only") == 1
     assert "--json-output claimci-review.json" in text
     assert "--markdown-output claimci-review.md" in text
-    assert "--base-root consumer-base" in text
     assert "--config-root consumer-base" in text
+    review_runs = "\n".join(
+        str(step.get("run", ""))
+        for step in jobs["research_review"]["steps"]
+        if "claimci review" in str(step.get("run", ""))
+    )
+    for option in (
+        "--requested-base-root",
+        "--comparison-base-root",
+        "--requested-base-sha",
+        "--comparison-base-sha",
+        "--comparison-basis",
+        "--head-sha",
+    ):
+        assert review_runs.count(option) == 2
     assert '"pull-request/$CLAIMCI_MANIFEST"' in text
     assert "--artifact-root pull-request" in text
     assert "conclusion:\"neutral\"" in text or 'conclusion: "neutral"' in text
@@ -379,7 +393,7 @@ def test_advisory_review_setup_and_publication_cannot_fail_authoritative_audit()
     assert jobs["publish_research_review"].get("continue-on-error") is True
 
 
-def test_external_workflow_uses_current_trusted_base_and_keeps_head_passive():
+def test_external_workflow_binds_exact_coordinates_and_keeps_head_passive():
     for path in (ACTIVE_WORKFLOW, TEMPLATE):
         text = path.read_text(encoding="utf-8")
         workflow = yaml.safe_load(text)
@@ -398,26 +412,51 @@ def test_external_workflow_uses_current_trusted_base_and_keeps_head_passive():
             for step in audit_steps
             if step.get("name") == "Check out pull-request artifacts as passive data"
         ]
+        coordinate_steps = [step for step in steps if step.get("id") == "coordinates"]
+        comparison_steps = [
+            step
+            for step in steps
+            if step.get("name") == "Check out explicit comparison base"
+        ]
         assert len(trusted_base_steps) == 1
         assert len(passive_head_steps) == 1
         assert len(audit_head_steps) == 1
+        assert len(coordinate_steps) == 1
+        assert len(comparison_steps) == 1
         trusted_base = trusted_base_steps[0]
         passive_head = passive_head_steps[0]
         audit_head = audit_head_steps[0]
 
         assert trusted_base["with"] == {
-            "ref": "${{ github.sha }}",
+            "ref": "${{ github.event.pull_request.base.sha }}",
             "path": "consumer-base",
             "persist-credentials": False,
+            "fetch-depth": 0,
         }
-        assert "github.event.pull_request.base.sha" not in text
         assert passive_head["with"] == {
             "ref": "${{ github.event.pull_request.head.sha }}",
             "path": "pull-request",
             "persist-credentials": False,
+            "fetch-depth": 0,
             "allow-unsafe-pr-checkout": True,
         }
-        assert audit_head["with"] == passive_head["with"]
+        assert audit_head["with"]["ref"] == passive_head["with"]["ref"]
+        assert audit_head["with"]["path"] == passive_head["with"]["path"]
+        comparison = comparison_steps[0]
+        assert comparison["with"]["ref"] == "${{ steps.coordinates.outputs.comparison_sha }}"
+        assert comparison["with"]["path"] == "comparison-base"
+        assert "merge_base" in str(comparison.get("if", ""))
+
+        coordinate_run = str(coordinate_steps[0].get("run", ""))
+        assert "github.event.pull_request.base.sha" in coordinate_run
+        assert "github.event.pull_request.head.sha" in coordinate_run
+        assert "merge-base --all" in coordinate_run
+        assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" in coordinate_run
+        assert "git -C consumer-base merge-base --all" in coordinate_run
+        assert "direct_base" in coordinate_run and "merge_base" in coordinate_run
+        assert "comparison_sha" in coordinate_run
+        assert "comparison_root" in coordinate_run
+        assert "github.sha" not in text
 
     lowered = _active_text().casefold()
     for forbidden in (
@@ -443,6 +482,20 @@ def test_active_workflow_is_explicit_about_provider_secret_and_checks_credential
     assert "GH_TOKEN" in str(publisher)
     assert "ClaimCI Audit" in text
     assert "ClaimCI Research Review" in text
+
+    review_steps = review["steps"]
+    review_commands = [step for step in review_steps if "claimci review" in str(step.get("run", ""))]
+    preflight_steps = [step for step in review_commands if "--preflight-only" in str(step.get("run", ""))]
+    paid_steps = [step for step in review_commands if "--preflight-only" not in str(step.get("run", ""))]
+    credential_steps = [step for step in review_steps if "OPENAI_API_KEY" in str(step.get("env", {}))]
+    assert len(preflight_steps) == len(paid_steps) == 1
+    assert credential_steps == paid_steps
+    assert "preflight" in str(paid_steps[0].get("if", "")).casefold()
+    assert "coordinates.outputs.comparison_sha != ''" not in str(
+        preflight_steps[0].get("if", "")
+    )
+    assert "0" * 40 in str(preflight_steps[0].get("run", ""))
+    assert "OPENAI_API_KEY" not in str(preflight_steps[0])
 
 
 def test_materializer_creates_clean_consumer_fixture_and_known_audit(tmp_path: Path):

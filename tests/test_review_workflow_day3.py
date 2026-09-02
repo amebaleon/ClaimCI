@@ -62,31 +62,40 @@ def _review_steps() -> list[dict[str, Any]]:
     return [step for step in _steps() if "claimci review" in _step_run(step)]
 
 
+def _preflight_steps() -> list[dict[str, Any]]:
+    return [step for step in _review_steps() if "--preflight-only" in _step_run(step)]
+
+
+def _paid_review_steps() -> list[dict[str, Any]]:
+    return [step for step in _review_steps() if "--preflight-only" not in _step_run(step)]
+
+
 def _audit_steps() -> list[dict[str, Any]]:
     return [step for step in _job_steps("claimci") if "claimci audit" in _step_run(step)]
 
 
-def test_review_is_one_trusted_cli_invocation_that_writes_both_views() -> None:
-    """A single review command must produce JSON and Markdown (two provider calls total)."""
+def test_review_runs_one_free_preflight_then_one_paid_invocation_with_shared_views() -> None:
+    """Preflight and paid review each render both views without duplicate orchestration."""
 
     steps = _review_steps()
-    assert len(steps) == 1
-    run = _step_run(steps[0])
-    assert len(re.findall(r"(?m)^\s*claimci review(?:\s|\\|$)", run)) == 1
-    lower = run.casefold()
-    assert "json" in lower and "markdown" in lower
-    assert re.search(r"[^\s'\"]+\.json(?:\s|\\|$)", run)
-    assert re.search(r"[^\s'\"]+\.md(?:\s|\\|$)", run)
-    # A second invocation to render the other view would violate the fixed
-    # extract -> discover/tools -> synthesize budget.
-    assert lower.count("claimci review") == 1
+    assert len(steps) == 2
+    assert len(_preflight_steps()) == 1
+    assert len(_paid_review_steps()) == 1
+    for step in steps:
+        run = _step_run(step)
+        assert len(re.findall(r"(?m)^\s*claimci review(?:\s|\\|$)", run)) == 1
+        lower = run.casefold()
+        assert "json" in lower and "markdown" in lower
+        assert re.search(r"[^\s'\"]+\.json(?:\s|\\|$)", run)
+        assert re.search(r"[^\s'\"]+\.md(?:\s|\\|$)", run)
+        assert lower.count("claimci review") == 1
 
 
 def test_review_reads_opt_in_only_from_trusted_base_checkout() -> None:
     """PR content cannot enable review or choose the provider/data policy."""
 
     text = _workflow_text()
-    review = _review_steps()[0]
+    review = _paid_review_steps()[0]
     run = _step_run(review)
 
     assert "review.yaml" in text
@@ -106,15 +115,86 @@ def test_review_reads_opt_in_only_from_trusted_base_checkout() -> None:
 def test_optional_sdk_install_uses_the_same_trusted_yaml_parser_as_runtime() -> None:
     """Valid YAML boolean spellings cannot enable review without its SDK."""
 
-    install_runs = [
-        _step_run(step)
-        for step in _steps()
-        if "claimci-trusted[llm]" in _step_run(step)
-    ]
+    install_steps = [step for step in _steps() if "claimci-runtime[llm]" in _step_run(step)]
+    install_runs = [_step_run(step) for step in install_steps]
     assert len(install_runs) == 1
-    install = install_runs[0]
-    assert "load_review_config" in install
-    assert "grep -E" not in install and "grep -q" not in install
+    probes = [_step_run(step) for step in _steps() if "load_review_config" in _step_run(step)]
+    assert len(probes) == 1
+    assert "grep -E" not in probes[0] and "grep -q" not in probes[0]
+    assert "preflight" in str(install_steps[0].get("if", "")).casefold()
+
+
+def test_review_runtime_install_cannot_dirty_bound_snapshot_roots() -> None:
+    """Package build artifacts stay outside every repository identity root."""
+
+    steps = _job_steps("research_review")
+    runtime_checkouts = [
+        step
+        for step in steps
+        if str(step.get("with", {}).get("path", "")) == "claimci-runtime"
+    ]
+    assert len(runtime_checkouts) == 1
+    runtime_checkout = runtime_checkouts[0]
+    assert runtime_checkout.get("with", {}).get("ref") == "${{ github.event.pull_request.base.sha }}"
+    assert runtime_checkout.get("with", {}).get("persist-credentials") is False
+
+    install_runs = "\n".join(_step_run(step) for step in steps if "pip install" in _step_run(step))
+    assert "pip install ./claimci-runtime" in install_runs
+    assert 'pip install "./claimci-runtime[llm]"' in install_runs
+    assert "pip install ./claimci-trusted" not in install_runs
+    assert "pip install ./comparison-base" not in install_runs
+    assert "pip install ./pull-request" not in install_runs
+
+
+def test_review_coordinates_are_exact_and_merge_base_is_unique_and_materialized() -> None:
+    review_steps = _job_steps("research_review")
+    checkout_steps = [step for step in review_steps if "actions/checkout@" in str(step.get("uses", ""))]
+    checkout_text = "\n".join(str(step) for step in checkout_steps)
+    coordinate_steps = [step for step in review_steps if step.get("id") == "coordinates"]
+
+    assert len(coordinate_steps) == 1
+    coordinate_run = _step_run(coordinate_steps[0])
+    assert "github.event.pull_request.base.sha" in coordinate_run
+    assert "github.event.pull_request.head.sha" in coordinate_run
+    assert "merge-base --all" in coordinate_run
+    assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" in coordinate_run
+    assert "git -C claimci-trusted merge-base --all" in coordinate_run
+    assert "comparison_sha" in coordinate_run
+    assert "comparison_basis" in coordinate_run
+    assert "direct_base" in coordinate_run and "merge_base" in coordinate_run
+    assert "comparison_root" in coordinate_run
+    assert "github.sha" not in checkout_text
+    assert "github.event.pull_request.base.sha" in checkout_text
+    assert "github.event.pull_request.head.sha" in checkout_text
+    assert checkout_text.count("fetch-depth': 0") >= 2 or checkout_text.count("fetch-depth: 0") >= 2
+    comparison_checkouts = [
+        step
+        for step in checkout_steps
+        if str(step.get("with", {}).get("path", "")) == "comparison-base"
+    ]
+    assert len(comparison_checkouts) == 1
+    assert "merge_base" in str(comparison_checkouts[0].get("if", ""))
+    assert "steps.coordinates.outputs.comparison_sha" in str(comparison_checkouts[0])
+
+    required = (
+        "--requested-base-root",
+        "--comparison-base-root",
+        "--requested-base-sha",
+        "--comparison-base-sha",
+        "--comparison-basis",
+        "--head-sha",
+    )
+    preflight_run = _step_run(_preflight_steps()[0])
+    paid_run = _step_run(_paid_review_steps()[0])
+    preflight_if = str(_preflight_steps()[0].get("if", ""))
+    for option in required:
+        assert option in preflight_run
+        assert option in paid_run
+    assert "--preflight-only" in preflight_run
+    assert "--preflight-only" not in paid_run
+    assert "coordinates.outputs.comparison_sha != ''" not in preflight_if
+    assert "0" * 40 in preflight_run
+    assert str(_paid_review_steps()[0].get("if", "")).casefold().count("preflight") >= 1
 
 
 def test_head_checkout_is_passive_data_and_deterministic_audit_gate_is_unchanged() -> None:
@@ -161,6 +241,9 @@ def test_provider_key_isolated_from_checks_write_credential() -> None:
         if "gh api" in _step_run(step) and "check-runs" in _step_run(step)
     ]
     assert len(provider_steps) == 1
+    assert provider_steps == _paid_review_steps()
+    assert "OPENAI_API_KEY" not in _step_run(_preflight_steps()[0])
+    assert "OPENAI_API_KEY" not in str(_preflight_steps()[0].get("env", {}))
     assert publish_steps, "a trusted publish step must remain present"
     for provider in provider_steps:
         assert "GH_TOKEN" not in _step_run(provider)
@@ -207,7 +290,7 @@ def test_disabled_or_missing_key_review_is_nonblocking_and_still_documented() ->
     """Opt-in failures remain advisory; private-content egress is disclosed."""
 
     text = _workflow_text()
-    review = _review_steps()[0]
+    review = _paid_review_steps()[0]
     review_run = _step_run(review)
     # Either the step is explicitly allowed to fail or its shell command
     # converts disabled/provider/key failures to a successful advisory path.

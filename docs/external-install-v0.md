@@ -67,6 +67,27 @@ private research text may be sent to the configured provider; disable or omit
 the config when that egress is unacceptable. In particular, with
 `pull_request_target`, pull_request_target fork-authored head content may be sent to the configured provider when review is enabled.
 
+The review workflow binds the exact pull-request base and head SHAs, derives and
+validates one merge base from the local Git object graph, and materializes a
+separate comparison checkout when that merge base differs from the requested
+base. It runs `claimci review --preflight-only` without provider credentials or
+the optional provider SDK. Only a preflight whose three gates are ready can
+reach the later paid review step, and `OPENAI_API_KEY` is scoped to that step.
+Both invocations repeat the same requested-base, comparison-base, basis, and
+head coordinates; neither uses the synthetic workflow merge SHA.
+
+For trusted local integrations, the declared CLI path is additive and requires
+all six coordinate options together: `--requested-base-root`,
+`--comparison-base-root`, `--requested-base-sha`, `--comparison-base-sha`,
+`--comparison-basis` (`direct_base` or `merge_base`), and `--head-sha`.
+Omitting the whole group keeps the bounded legacy pairwise mode available for
+existing callers. Review report schema version 2 records the exact coordinates,
+inventory completeness, all three gate results, scope completeness, projection
+metrics, and the final status ceiling. `scope_complete` is independent of
+provider `routing_incomplete`. Allowlisted submission/evaluation shell runners
+are reported only as passive supporting configuration: they are never executed
+and never treated as source code or executed results.
+
 An installation failure usually means the ClaimCI repository is private without
 the same-owner Actions access setting, the caller is not private, or the caller
 uses an unavailable workflow SHA. A missing Check generally indicates Actions

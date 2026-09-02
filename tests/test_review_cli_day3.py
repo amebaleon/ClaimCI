@@ -15,10 +15,28 @@ import pytest
 import yaml
 
 import claimci.cli as cli_module
+import claimci.review as review_package
 import claimci.review.orchestrator as orchestrator
 from claimci.cli import main
-from claimci.review.models import ReviewConfig, ReviewStatus
+from claimci.review.inventory import InventoryVerificationError
+from claimci.review.models import (
+    ChangeInventory,
+    ChangeInventorySource,
+    ComparisonBasis,
+    GateDisposition,
+    PreflightGateResult,
+    ReviewConfig,
+    ReviewPreflight,
+    ReviewScope,
+    ReviewStatus,
+    SnapshotRole,
+)
 from claimci.review.orchestrator import ResearchReview
+
+
+_REQUESTED_SHA = "1" * 40
+_COMPARISON_SHA = "2" * 40
+_HEAD_SHA = "3" * 40
 
 
 def _write_enabled_config(root: Path, *, filename: str = ".claimci/review.yaml") -> Path:
@@ -55,6 +73,81 @@ def _complete_review() -> ResearchReview:
     return ResearchReview(status=ReviewStatus.COMPLETE)
 
 
+def _inventory(*, basis: ComparisonBasis) -> ChangeInventory:
+    comparison_sha = (
+        _REQUESTED_SHA if basis is ComparisonBasis.DIRECT_BASE else _COMPARISON_SHA
+    )
+    return ChangeInventory(
+        schema_version=1,
+        requested_base_sha=_REQUESTED_SHA,
+        comparison_base_sha=comparison_sha,
+        head_sha=_HEAD_SHA,
+        comparison_basis=basis,
+        source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
+        declared_entry_count=0,
+        complete=True,
+        entries=(),
+    )
+
+
+def _ready_preflight(inventory: ChangeInventory) -> ReviewPreflight:
+    scope = ReviewScope(
+        mode="declared_changed_v1",
+        inventory=inventory,
+        issued_paths=(),
+        issued_changed_paths=(),
+        selected_paths=(),
+        sources=(),
+        seeds=(),
+        complete=True,
+        issues=(),
+    )
+    gates = tuple(
+        PreflightGateResult(
+            gate=gate,
+            disposition=GateDisposition.PASS_COMPLETE,
+            reasons=(),
+            metrics={},
+        )
+        for gate in (1, 2, 3)
+    )
+    return ReviewPreflight(
+        schema_version=1,
+        requested_base_sha=inventory.requested_base_sha,
+        comparison_base_sha=inventory.comparison_base_sha,
+        head_sha=inventory.head_sha,
+        gates=gates,
+        ready_for_provider=True,
+        review_status_ceiling=ReviewStatus.COMPLETE,
+        scope=scope,
+    )
+
+
+def _coordinate_arguments(
+    requested_root: Path,
+    comparison_root: Path,
+    *,
+    basis: ComparisonBasis = ComparisonBasis.MERGE_BASE,
+) -> list[str]:
+    comparison_sha = (
+        _REQUESTED_SHA if basis is ComparisonBasis.DIRECT_BASE else _COMPARISON_SHA
+    )
+    return [
+        "--requested-base-root",
+        str(requested_root),
+        "--comparison-base-root",
+        str(comparison_root),
+        "--requested-base-sha",
+        _REQUESTED_SHA,
+        "--comparison-base-sha",
+        comparison_sha,
+        "--comparison-basis",
+        basis.value,
+        "--head-sha",
+        _HEAD_SHA,
+    ]
+
+
 def _patch_run_review(monkeypatch: pytest.MonkeyPatch, result: ResearchReview, calls: list[tuple[Any, ...]]) -> None:
     """Patch either CLI import style without touching the real provider."""
 
@@ -64,6 +157,11 @@ def _patch_run_review(monkeypatch: pytest.MonkeyPatch, result: ResearchReview, c
 
     monkeypatch.setattr(cli_module, "run_review", fake_run_review, raising=False)
     monkeypatch.setattr(orchestrator, "run_review", fake_run_review)
+
+
+def test_review_package_exposes_the_provider_free_preflight_contract() -> None:
+    assert review_package.preflight_review is cli_module.preflight_review
+    assert review_package.ReviewPreflight is ReviewPreflight
 
 
 def test_review_cli_default_is_disabled_and_never_constructs_a_provider(
@@ -90,6 +188,12 @@ def test_review_cli_default_is_disabled_and_never_constructs_a_provider(
         "blocking": False,
     }
     assert payload["provider"]["calls"] == []
+    assert payload["provider"]["usage"] == {
+        "estimated_cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
     assert "OPENAI_API_KEY" not in captured.out
 
 
@@ -152,6 +256,10 @@ def test_review_cli_reads_event_metadata_from_trusted_config_root_and_writes_bot
     inputs, config = args
     assert inputs.repository_root == repository.resolve()
     assert inputs.base_root == base.resolve()
+    assert inputs.requested_base is None
+    assert inputs.comparison_base is None
+    assert inputs.head is None
+    assert inputs.inventory is None
     assert inputs.pr_title == "Explicit title wins"
     assert inputs.pr_description == 'Event body with "quoted" data'
     assert isinstance(config, ReviewConfig)
@@ -159,6 +267,343 @@ def test_review_cli_reads_event_metadata_from_trusted_config_root_and_writes_bot
     assert json.loads(json_output.read_text(encoding="utf-8"))["review"]["status"] == "COMPLETE"
     markdown = markdown_output.read_text(encoding="utf-8")
     assert markdown.startswith("## ClaimCI Research Review (Advisory)\n")
+
+
+@pytest.mark.parametrize(
+    "missing_option",
+    [
+        "--requested-base-root",
+        "--comparison-base-root",
+        "--requested-base-sha",
+        "--comparison-base-sha",
+        "--comparison-basis",
+        "--head-sha",
+    ],
+)
+def test_review_cli_requires_the_declared_coordinate_contract_as_one_group(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    missing_option: str,
+) -> None:
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = tmp_path / "comparison"
+    for root in (repository, requested, comparison):
+        root.mkdir()
+    group = _coordinate_arguments(requested, comparison)
+    index = group.index(missing_option)
+    del group[index : index + 2]
+
+    exit_code = main(["review", str(repository), "--preflight-only", "--json", *group])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "all six coordinate options are required together" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("basis", [ComparisonBasis.DIRECT_BASE, ComparisonBasis.MERGE_BASE])
+def test_review_cli_preflight_only_builds_bound_inventory_once_and_never_runs_provider_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    basis: ComparisonBasis,
+) -> None:
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = requested if basis is ComparisonBasis.DIRECT_BASE else tmp_path / "comparison"
+    for root in {repository, requested, comparison}:
+        root.mkdir()
+    _write_enabled_config(requested)
+    inventory = _inventory(basis=basis)
+    inventory_calls: list[tuple[Any, ...]] = []
+    preflight_calls: list[tuple[Any, ...]] = []
+    json_output = tmp_path / "preflight.json"
+    markdown_output = tmp_path / "preflight.md"
+
+    def fake_inventory(*args: Any) -> ChangeInventory:
+        inventory_calls.append(args)
+        return inventory
+
+    def fake_preflight(*args: Any) -> ReviewPreflight:
+        preflight_calls.append(args)
+        return _ready_preflight(inventory)
+
+    monkeypatch.setattr(cli_module, "build_git_change_inventory", fake_inventory)
+    monkeypatch.setattr(cli_module, "preflight_review", fake_preflight)
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "OpenAIReviewerProvider",
+        lambda **_kwargs: pytest.fail("preflight-only must not construct a provider"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--config-root",
+            str(requested),
+            "--preflight-only",
+            "--json",
+            "--json-output",
+            str(json_output),
+            "--markdown-output",
+            str(markdown_output),
+            *_coordinate_arguments(requested, comparison, basis=basis),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert len(inventory_calls) == 1
+    requested_id, comparison_id, head_id, passed_basis = inventory_calls[0]
+    assert requested_id.role is SnapshotRole.REQUESTED_BASE
+    assert requested_id.root == requested.resolve()
+    assert comparison_id.role is SnapshotRole.COMPARISON_BASE
+    assert comparison_id.root == comparison.resolve()
+    assert head_id.role is SnapshotRole.HEAD
+    assert head_id.root == repository.resolve()
+    assert passed_basis is basis
+    assert len(preflight_calls) == 1
+    inputs, config = preflight_calls[0]
+    assert inputs.inventory is inventory
+    assert isinstance(config, ReviewConfig)
+    payload = json.loads(captured.out)
+    assert payload["schema_version"] == 2
+    assert payload["preflight"]["ready_for_provider"] is True
+    assert payload["provider"]["calls"] == []
+    assert payload["provider"]["usage"] == {
+        "estimated_cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert json.loads(json_output.read_text(encoding="utf-8")) == payload
+    markdown = markdown_output.read_text(encoding="utf-8")
+    assert "Provider calls: 0; input tokens: 0; output tokens: 0; total tokens: 0;" in markdown
+
+
+def test_review_cli_preflight_inventory_failure_is_structured_and_does_not_leak_git_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = tmp_path / "comparison"
+    for root in (repository, requested, comparison):
+        root.mkdir()
+    _write_enabled_config(requested)
+    original_preflight = cli_module.preflight_review
+    calls = 0
+
+    def fail_inventory(*_args: Any) -> ChangeInventory:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "fatal: hostile-git-output sk-secret",
+        )
+
+    def counted_preflight(*args: Any) -> ReviewPreflight:
+        nonlocal calls
+        calls += 1
+        return original_preflight(*args)
+
+    monkeypatch.setattr(cli_module, "build_git_change_inventory", fail_inventory)
+    monkeypatch.setattr(cli_module, "preflight_review", counted_preflight)
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--config-root",
+            str(requested),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(requested, comparison),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert calls == 1
+    assert payload["review"]["status"] == "UNAVAILABLE"
+    assert payload["preflight"]["ready_for_provider"] is False
+    assert payload["preflight"]["gates"][0]["reasons"] == [
+        {"code": "PREFLIGHT_G1_CHANGE_INVENTORY_UNAVAILABLE"}
+    ]
+    assert payload["provider"]["calls"] == []
+    assert payload["provider"]["usage"] == {
+        "estimated_cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert "hostile-git-output" not in captured.out + captured.err
+    assert "sk-secret" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_review_cli_declared_symlink_root_is_a_structured_gate_one_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = tmp_path / "comparison"
+    for root in (repository, requested, comparison):
+        root.mkdir()
+    _write_enabled_config(requested)
+    requested_link = tmp_path / "requested-link"
+    path_type = type(requested_link)
+    original_resolve = path_type.resolve
+    original_is_symlink = path_type.is_symlink
+    requested_resolved = requested.resolve()
+
+    def pretend_symlink_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+        if path == requested_link:
+            return requested_resolved
+        return original_resolve(path, *args, **kwargs)
+
+    def pretend_is_symlink(path: Path) -> bool:
+        return path == requested_link or original_is_symlink(path)
+
+    monkeypatch.setattr(path_type, "resolve", pretend_symlink_resolve)
+    monkeypatch.setattr(path_type, "is_symlink", pretend_is_symlink)
+    monkeypatch.setattr(
+        cli_module,
+        "build_git_change_inventory",
+        lambda *_args: pytest.fail("a symlinked declared root must not reach Git"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--config-root",
+            str(requested),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(requested_link, comparison),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    reasons = payload["preflight"]["gates"][0]["reasons"]
+    assert exit_code == 0
+    assert {reason["code"] for reason in reasons} >= {
+        "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID",
+        "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+    }
+    assert payload["provider"]["calls"] == []
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_review_cli_invalid_requested_root_without_config_root_is_structured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An invalid default trusted-config root cannot bypass report rendering."""
+
+    repository = tmp_path / "head"
+    comparison = tmp_path / "comparison"
+    missing_requested = tmp_path / "missing-requested"
+    repository.mkdir()
+    comparison.mkdir()
+    monkeypatch.setattr(
+        cli_module,
+        "build_git_change_inventory",
+        lambda *_args: pytest.fail("an invalid requested root must not reach Git"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(missing_requested, comparison),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    reasons = payload["preflight"]["gates"][0]["reasons"]
+    assert exit_code == 0
+    assert payload["review"]["status"] == "UNAVAILABLE"
+    assert {reason["code"] for reason in reasons} >= {
+        "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID",
+        "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+    }
+    assert payload["provider"]["calls"] == []
+    assert str(missing_requested) not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_review_cli_preflight_event_json_keeps_the_one_mebibyte_input_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "head"
+    requested = tmp_path / "requested"
+    comparison = tmp_path / "comparison"
+    for root in (repository, requested, comparison):
+        root.mkdir()
+    _write_enabled_config(requested)
+    event = tmp_path / "event.json"
+    event.write_bytes(b"{" + b"x" * (cli_module.MAX_EVENT_METADATA_BYTES + 1))
+    monkeypatch.setattr(cli_module, "build_git_change_inventory", lambda *_args: _inventory(basis=ComparisonBasis.MERGE_BASE))
+    monkeypatch.setattr(
+        cli_module,
+        "preflight_review",
+        lambda *_args: pytest.fail("oversized event metadata must fail before preflight"),
+    )
+
+    exit_code = main(
+        [
+            "review",
+            str(repository),
+            "--config-root",
+            str(requested),
+            "--event-json",
+            str(event),
+            "--preflight-only",
+            "--json",
+            *_coordinate_arguments(requested, comparison),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "could not load event metadata" in captured.err
+    assert "Traceback" not in captured.err
 
 
 @pytest.mark.parametrize(

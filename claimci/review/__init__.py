@@ -14,12 +14,18 @@ from .models import (
     ClaimMagnitude,
     ClaimType,
     ComparisonBasis,
+    GateDisposition,
+    MaterialClaimSeed,
     MagnitudeKind,
+    PreflightGateResult,
     ProviderCallRecord,
     ProviderUsage,
     ReviewConfig,
     ReviewError,
     ReviewLimits,
+    ReviewMaterialKind,
+    ReviewPreflight,
+    ReviewScope,
     ReviewStatus,
     ScientificClaim,
     SourceBundle,
@@ -28,6 +34,7 @@ from .models import (
     SourceRecord,
     SnapshotIdentity,
     SnapshotRole,
+    ScopeIssue,
 )
 from .analysis_bridge import (
     AnalysisReviewContext,
@@ -35,6 +42,7 @@ from .analysis_bridge import (
     validate_scientific_claim_for_audit,
 )
 from .inventory import build_git_change_inventory
+from .preflight import preflight_review
 
 __all__ = [
     "AnalysisReviewContext",
@@ -46,12 +54,18 @@ __all__ = [
     "ClaimMagnitude",
     "ClaimType",
     "ComparisonBasis",
+    "GateDisposition",
+    "MaterialClaimSeed",
     "MagnitudeKind",
     "ProviderCallRecord",
+    "PreflightGateResult",
     "ProviderUsage",
     "ReviewConfig",
     "ReviewError",
     "ReviewLimits",
+    "ReviewMaterialKind",
+    "ReviewPreflight",
+    "ReviewScope",
     "ReviewStatus",
     "ScientificClaim",
     "SourceBundle",
@@ -60,7 +74,9 @@ __all__ = [
     "SourceRecord",
     "SnapshotIdentity",
     "SnapshotRole",
+    "ScopeIssue",
     "build_git_change_inventory",
+    "preflight_review",
     "run_analysis_review",
     "validate_scientific_claim_for_audit",
 ]

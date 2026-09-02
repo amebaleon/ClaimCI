@@ -98,6 +98,23 @@ def _review_cli_count(job: Mapping[str, Any]) -> int:
     )
 
 
+def _preflight_cli_count(job: Mapping[str, Any]) -> int:
+    return sum(
+        _review_cli_count({"steps": [step]})
+        for step in _steps(job)
+        if "--preflight-only" in str(step.get("run", ""))
+    )
+
+
+def _paid_review_cli_count(job: Mapping[str, Any]) -> int:
+    return sum(
+        _review_cli_count({"steps": [step]})
+        for step in _steps(job)
+        if "claimci review" in str(step.get("run", ""))
+        and "--preflight-only" not in str(step.get("run", ""))
+    )
+
+
 def _provider_jobs(jobs: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     return {
         job_id: dict(job)
@@ -261,7 +278,22 @@ def test_provider_execution_is_in_a_read_only_job_without_check_credentials() ->
 
     assert len(providers) == 1, "exactly one job may invoke the review provider"
     provider_id, provider = next(iter(providers.items()))
-    assert _review_cli_count(provider) == 1
+    assert _review_cli_count(provider) == 2
+    assert _preflight_cli_count(provider) == 1
+    assert _paid_review_cli_count(provider) == 1
+
+    review_steps = [
+        step for step in _steps(provider) if "claimci review" in str(step.get("run", ""))
+    ]
+    preflight_steps = [
+        step for step in review_steps if "--preflight-only" in str(step.get("run", ""))
+    ]
+    paid_steps = [
+        step for step in review_steps if "--preflight-only" not in str(step.get("run", ""))
+    ]
+    assert len(preflight_steps) == len(paid_steps) == 1
+    assert "OPENAI_API_KEY" not in str(preflight_steps[0].get("env", {}))
+    assert "OPENAI_API_KEY" in str(paid_steps[0].get("env", {}))
 
     # A job-level map is required: a workflow-level checks:write default must
     # not accidentally become effective for the provider job.
