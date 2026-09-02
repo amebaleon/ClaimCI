@@ -255,24 +255,27 @@ def _path_references(value: str) -> _PathReferences:
     return _PathReferences(frozenset(canonical), unsafe_count)
 
 
-def _seeds(records: tuple[SourceRecord, ...], max_seeds: int) -> tuple[MaterialClaimSeed, ...]:
+def _seeds(
+    records: tuple[SourceRecord, ...], max_seeds: int
+) -> tuple[tuple[MaterialClaimSeed, ...], int]:
     seeds: list[MaterialClaimSeed] = []
+    candidate_count = 0
     for record in records:
         route_terms = tuple(sorted(_tokens(record.text)))[:24]
         if not route_terms:
             continue
         for category, pattern in _CATEGORY_PATTERNS:
             if pattern.search(record.text):
-                seeds.append(
-                    MaterialClaimSeed(
-                        origin_source_id=record.source_id,
-                        category=category,
-                        route_terms=route_terms,
+                candidate_count += 1
+                if len(seeds) < max_seeds:
+                    seeds.append(
+                        MaterialClaimSeed(
+                            origin_source_id=record.source_id,
+                            category=category,
+                            route_terms=route_terms,
+                        )
                     )
-                )
-                if len(seeds) >= max_seeds:
-                    return tuple(seeds)
-    return tuple(seeds)
+    return tuple(seeds), candidate_count
 
 
 def _source_path_references(
@@ -380,7 +383,7 @@ def build_review_scope(
             remaining_chars -= len(text)
 
     metadata_records = tuple(records)
-    initial_seeds = _seeds(metadata_records, limits.max_claims)
+    initial_seeds, _ = _seeds(metadata_records, limits.max_claims)
     initial_references = _source_path_references(metadata_records)
     classified = tuple(
         (entry, classify_review_material(entry.path)) for entry in inventory.entries
@@ -501,7 +504,7 @@ def build_review_scope(
     materialize(document_shortlist)
 
     document_seed_records = tuple(records)
-    planning_seeds = _seeds(document_seed_records, limits.max_claims)
+    planning_seeds, _ = _seeds(document_seed_records, limits.max_claims)
     planning_references = _source_path_references(document_seed_records)
     remaining_candidates = [
         item for item in candidates if item[1] is not ReviewMaterialKind.DOCUMENT
@@ -537,7 +540,15 @@ def build_review_scope(
         )
 
     all_records = tuple(records)
-    seeds = _seeds(all_records, limits.max_claims)
+    seeds, seed_candidate_count = _seeds(all_records, limits.max_claims)
+    if seed_candidate_count > len(seeds):
+        issues.append(
+            ScopeIssue(
+                code="PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED",
+                observed=seed_candidate_count,
+                limit=limits.max_claims,
+            )
+        )
     references = _source_path_references(all_records)
     citable_paths = _citable_materialized_paths(
         tuple(selected),
@@ -1158,6 +1169,14 @@ def _citable_materialized_paths(
 
 def _gate2(scope: ReviewScope) -> PreflightGateResult:
     reasons = tuple(issue for issue in scope.issues if issue.code.startswith("PREFLIGHT_G2_"))
+    seed_candidate_count = max(
+        (
+            issue.observed or len(scope.seeds)
+            for issue in reasons
+            if issue.code == "PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED"
+        ),
+        default=len(scope.seeds),
+    )
     references = _source_path_references(scope.sources)
     selected_kinds = {
         path: classify_review_material(path)
@@ -1191,6 +1210,9 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
         {
             "issue_count": len(reasons),
             "material_seed_count": len(scope.seeds),
+            "material_seed_omitted_count": max(
+                0, seed_candidate_count - len(scope.seeds)
+            ),
             "routed_seed_count": routed_seed_count,
             "selected_path_count": len(scope.selected_paths),
         },

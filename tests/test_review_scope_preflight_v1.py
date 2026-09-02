@@ -18,6 +18,7 @@ from claimci.review.models import (
     MaterialClaimSeed,
     ReviewConfig,
     ReviewLimits,
+    ReviewStatus,
     ScopeIssue,
     ScientificClaim,
     SourceKind,
@@ -140,6 +141,69 @@ def test_count_and_comparison_terms_create_normalized_material_seeds(
         description=description,
     )
     assert category in {seed.category for seed in scope.seeds}
+
+
+def test_material_seed_truncation_is_deterministic_and_forces_partial_scope(
+    tmp_path: Path,
+) -> None:
+    roots = (tmp_path / "first", tmp_path / "second")
+    material = (
+        "Benchmark model accuracy improves by 5% with reproducible seed "
+        "configuration; see docs/one.md."
+    )
+    inventory = _inventory(
+        ("docs/one.md", ChangeStatus.MODIFIED),
+        ("docs/two.md", ChangeStatus.MODIFIED),
+    )
+    scopes = []
+    for root in roots:
+        root.mkdir()
+        _write(root, "docs/one.md", material)
+        _write(root, "docs/two.md", material)
+        scopes.append(
+            _scope(
+                root,
+                inventory,
+                title=material,
+                description=material,
+            )
+        )
+
+    scope = scopes[0]
+    result = preflight_module._evaluate_material_gates(
+        scope,
+        ReviewConfig(enabled=True),
+        requested_sha=BASE,
+        comparison_sha=BASE,
+        head_sha=HEAD,
+    )
+    truncation = tuple(
+        issue
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED"
+    )
+
+    assert len(scope.sources) == 4
+    assert len(scope.seeds) == 16
+    assert scope.seeds == scopes[1].seeds
+    assert truncation == (
+        ScopeIssue(
+            code="PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED",
+            observed=20,
+            limit=16,
+        ),
+    )
+    assert truncation[0].as_dict() == {
+        "code": "PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED",
+        "observed": 20,
+        "limit": 16,
+    }
+    assert scope.complete is False
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.gates[1].metrics["material_seed_count"] == 16
+    assert result.gates[1].metrics["material_seed_omitted_count"] == 4
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
 
 
 def test_exact_path_then_category_overlap_kind_priority_and_path_order_are_deterministic(

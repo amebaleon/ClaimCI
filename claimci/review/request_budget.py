@@ -28,6 +28,15 @@ REVIEW_SYSTEM_POLICY = (
 
 MAX_SYNTHESIS_AUDIT_CHARS = 8_000
 
+# The accepted extraction-to-synthesis normalization surfaces have one shared
+# per-claim growth bound.  A finite magnitude float can grow by at most 14 JSON
+# characters when Python canonicalizes its shortest accepted wire spelling
+# (for example, 1e15); confidence normalization can add 2; and exact-quote
+# recovery can replace each one-digit source line coordinate with at most five
+# digits under the 60,000-character source envelope (4 + 4).  Source line
+# integers that are not recovered retain their canonical JSON spelling.
+_MAX_CLAIM_NORMALIZATION_GROWTH_CHARS = 14 + 2 + 4 + 4
+
 EXTRACTION_CONTRACT: dict[str, str] = {
     "claim_selection": (
         "Extract only explicit, scientifically verifiable statements present "
@@ -614,9 +623,7 @@ def _reserved_claims(
             "direction": "not_applicable",
             "claimed_magnitude": None,
             "qualifiers": [],
-            # Extraction accepts the shortest JSON number spelling, while
-            # validation normalizes confidence to float for synthesis.
-            "confidence": 1,
+            "confidence": 1.0,
             "evidence_hints": [],
         }
         for index in range(max_claims)
@@ -639,7 +646,6 @@ def _reserved_claims(
         {
             "claim_id": f"claim-{index:016x}",
             **claim,
-            "confidence": float(claim["confidence"]),
             "source": {
                 **claim["source"],
                 "kind": source_kind,
@@ -723,6 +729,9 @@ def worst_valid_synthesis_request_chars(
         mandatory.task,
         mandatory.payload,
         mandatory.schema,
+    )
+    mandatory_chars += (
+        limits.max_claims * _MAX_CLAIM_NORMALIZATION_GROWTH_CHARS
     )
     return max(mandatory_chars, limits.max_context_chars)
 
