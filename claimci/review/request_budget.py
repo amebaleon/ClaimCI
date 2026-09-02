@@ -628,7 +628,7 @@ def _reserved_claims(
         max_output_chars - base + 1,
     )
     source_path = (
-        max(repository_paths, key=lambda path: (len(path), path))
+        max(repository_paths, key=lambda path: (serialized_chars(path), path))
         if repository_paths
         else None
     )

@@ -16,6 +16,7 @@ from claimci.review.models import (
     MaterialClaimSeed,
     ReviewConfig,
     ReviewLimits,
+    ScopeIssue,
     ScientificClaim,
     SourceKind,
 )
@@ -253,6 +254,33 @@ def test_path_prefix_is_not_an_exact_inventory_path_mention(tmp_path: Path) -> N
         limits=ReviewLimits(max_files=1),
     )
     assert scope.selected_paths == ("config/aaa.yaml",)
+
+
+def test_exact_inventory_path_mention_that_is_not_issued_is_out_of_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    _write(root, "notes/claimed.bin", "not review material\n")
+
+    scope = _scope(
+        root,
+        _inventory(
+            ("benchmarks/safe.py", ChangeStatus.MODIFIED),
+            ("notes/claimed.bin", ChangeStatus.MODIFIED),
+        ),
+        description=(
+            "Benchmark accuracy improves by 5%; the exact supporting path is "
+            "notes/claimed.bin."
+        ),
+    )
+
+    assert scope.issued_paths == ("benchmarks/safe.py",)
+    assert not scope.complete
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path="notes/claimed.bin"
+    ) in scope.issues
 
 
 @pytest.mark.parametrize(

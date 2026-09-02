@@ -776,6 +776,23 @@ def _changed_region_excerpt(
     return _changed_line_window(head_text, base_text, char_limit=char_limit)
 
 
+def changed_region_excerpt(
+    base_root: Path | None,
+    relative: str,
+    head_text: str,
+    *,
+    char_limit: int,
+) -> tuple[str, int, int] | None:
+    """Expose the passive changed-region locality decision to free preflight."""
+
+    return _changed_region_excerpt(
+        base_root,
+        relative,
+        head_text,
+        char_limit=char_limit,
+    )
+
+
 def _regular_excerpt(
     text: str,
     *,

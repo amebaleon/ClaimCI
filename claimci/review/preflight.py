@@ -36,6 +36,7 @@ from .models import (
     SourceRecord,
 )
 from .path_policy import classify_review_material
+from .evidence import changed_region_excerpt
 from .inventory import (
     MAX_CHANGESET_METADATA_BYTES,
     InventoryVerificationError,
@@ -318,6 +319,29 @@ def _issue_sort_key(issue: ScopeIssue) -> tuple[str, str, int, int]:
     )
 
 
+def _locality_base_root(inputs: _ScopeInputs) -> Path | None:
+    comparison = getattr(inputs, "comparison_base", None)
+    if isinstance(comparison, SnapshotIdentity):
+        return comparison.root
+    base_root = getattr(inputs, "base_root", None)
+    return base_root if isinstance(base_root, Path) else None
+
+
+def _has_changed_region_locality(
+    inputs: _ScopeInputs,
+    path: str,
+    head_text: str,
+    *,
+    char_limit: int,
+) -> bool:
+    return changed_region_excerpt(
+        _locality_base_root(inputs),
+        path,
+        head_text,
+        char_limit=char_limit,
+    ) is not None
+
+
 def build_review_scope(
     inputs: _ScopeInputs,
     config: ReviewConfig,
@@ -431,9 +455,19 @@ def build_review_scope(
             excerpt_limit = min(limits.max_file_chars, remaining_chars)
             text = normalized[:excerpt_limit]
             if len(normalized) > len(text):
+                region_localized = _has_changed_region_locality(
+                    inputs,
+                    entry.path,
+                    normalized,
+                    char_limit=excerpt_limit,
+                )
                 issues.append(
                     ScopeIssue(
-                        code="PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+                        code=(
+                            "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+                            if region_localized
+                            else "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+                        ),
                         path=entry.path,
                         observed=len(normalized),
                         limit=excerpt_limit,
@@ -505,8 +539,13 @@ def build_review_scope(
     all_records = tuple(records)
     seeds = _seeds(all_records, limits.max_claims)
     references = _source_path_references(all_records)
+    citable_paths = _citable_materialized_paths(
+        tuple(selected),
+        tuple(materialized_path_chars.items()),
+        tuple(issues),
+    )
     selected_kinds = {
-        path: classify_review_material(path) for path in selected
+        path: classify_review_material(path) for path in citable_paths
     }
     unrouted_seed_count = 0
     for seed in seeds:
@@ -536,7 +575,7 @@ def build_review_scope(
     )
     if not seeds:
         issues.append(ScopeIssue(code="PREFLIGHT_G2_NO_MATERIAL_CLAIM_SEED"))
-    if seeds and not selected:
+    if seeds and not citable_paths:
         issues.append(ScopeIssue(code="PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH"))
     all_path_mentions = frozenset(
         path
@@ -558,9 +597,9 @@ def build_review_scope(
     if nondeleted_entries and not candidates:
         issues.append(ScopeIssue(code="PREFLIGHT_G2_UNSUPPORTED_MATERIAL_TYPE"))
 
-    inventory_paths = {entry.path for entry in inventory.entries}
+    issued_paths = set(selected)
     for mention in sorted(all_path_mentions):
-        if mention not in inventory_paths:
+        if mention not in issued_paths:
             issues.append(
                 ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=mention)
             )
@@ -627,21 +666,23 @@ def _legacy_regular_paths(root: Path) -> tuple[tuple[str, ...], tuple[ScopeIssue
             return False
         try:
             with os.scandir(directory) as iterator:
-                entries = list(iterator)
+                entries = []
+                for entry in iterator:
+                    entry_count += 1
+                    if entry_count > MAX_REPOSITORY_ENTRIES:
+                        issues.append(
+                            ScopeIssue(
+                                code="PREFLIGHT_G1_REPOSITORY_ENTRY_LIMIT",
+                                observed=entry_count,
+                                limit=MAX_REPOSITORY_ENTRIES,
+                            )
+                        )
+                        return False
+                    entries.append(entry)
         except OSError:
             issues.append(ScopeIssue(code="PREFLIGHT_G1_HEAD_ROOT_INVALID"))
             return False
         for entry in sorted(entries, key=lambda item: (item.name.casefold(), item.name)):
-            entry_count += 1
-            if entry_count > MAX_REPOSITORY_ENTRIES:
-                issues.append(
-                    ScopeIssue(
-                        code="PREFLIGHT_G1_REPOSITORY_ENTRY_LIMIT",
-                        observed=entry_count,
-                        limit=MAX_REPOSITORY_ENTRIES,
-                    )
-                )
-                return False
             candidate = Path(entry.path)
             try:
                 if entry.name.casefold() in {".git", "__pycache__"}:
@@ -869,6 +910,8 @@ def _snapshot_root_issue(snapshot: object, code: str) -> ScopeIssue | None:
 
 def _inventory_shape_issues(inventory: object) -> tuple[ScopeIssue, ...]:
     issues: list[ScopeIssue] = []
+    if not isinstance(inventory, ChangeInventory):
+        issues.append(ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"))
     required = (
         "schema_version",
         "requested_base_sha",
@@ -915,6 +958,11 @@ def _inventory_shape_issues(inventory: object) -> tuple[ScopeIssue, ...]:
         )
     if getattr(inventory, "complete") is not True:
         issues.append(ScopeIssue(code="PREFLIGHT_G1_CHANGESET_INCOMPLETE"))
+    if (
+        isinstance(inventory, ChangeInventory)
+        and inventory.source is not ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+    ):
+        issues.append(ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"))
     paths: list[str] = []
     previous: tuple[str, str] | None = None
     for entry in entries:
@@ -1088,11 +1136,36 @@ def _gate_result(
     )
 
 
+def _citable_materialized_paths(
+    selected_paths: tuple[str, ...],
+    materialized_path_chars: tuple[tuple[str, int], ...],
+    issues: tuple[ScopeIssue, ...],
+) -> tuple[str, ...]:
+    locality_unavailable = {
+        issue.path
+        for issue in issues
+        if issue.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+        and issue.path is not None
+    }
+    materialized = dict(materialized_path_chars)
+    return tuple(
+        path
+        for path in selected_paths
+        if materialized.get(path, 0) > 0
+        and path not in locality_unavailable
+    )
+
+
 def _gate2(scope: ReviewScope) -> PreflightGateResult:
     reasons = tuple(issue for issue in scope.issues if issue.code.startswith("PREFLIGHT_G2_"))
     references = _source_path_references(scope.sources)
     selected_kinds = {
-        path: classify_review_material(path) for path in scope.selected_paths
+        path: classify_review_material(path)
+        for path in _citable_materialized_paths(
+            scope.selected_paths,
+            scope.materialized_path_chars,
+            scope.issues,
+        )
     }
     routed_seed_count = sum(
         1
@@ -1103,9 +1176,12 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
         )
     )
     routable = routed_seed_count > 0
+    hard_failure = any(
+        issue.code == "PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN" for issue in reasons
+    )
     disposition = (
         GateDisposition.FAIL
-        if not routable
+        if hard_failure or not routable
         else (GateDisposition.PASS_PARTIAL if reasons else GateDisposition.PASS_COMPLETE)
     )
     return _gate_result(
@@ -1124,7 +1200,12 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
 def _routed_seeds(scope: ReviewScope) -> tuple[MaterialClaimSeed, ...]:
     references = _source_path_references(scope.sources)
     selected_kinds = {
-        path: classify_review_material(path) for path in scope.selected_paths
+        path: classify_review_material(path)
+        for path in _citable_materialized_paths(
+            scope.selected_paths,
+            scope.materialized_path_chars,
+            scope.issues,
+        )
     }
     return tuple(
         seed
@@ -1137,7 +1218,8 @@ def _routed_seeds(scope: ReviewScope) -> tuple[MaterialClaimSeed, ...]:
 
 
 def _scope_routes_required_seeds(
-    scope: ReviewScope, required: tuple[MaterialClaimSeed, ...]
+    scope: ReviewScope,
+    required: tuple[MaterialClaimSeed, ...],
 ) -> bool:
     source_ids = {source.source_id for source in scope.sources}
     routed = set(_routed_seeds(scope))
@@ -1146,7 +1228,10 @@ def _scope_routes_required_seeds(
     )
 
 
-def _trim_scope_for_gate3(scope: ReviewScope, config: ReviewConfig) -> ReviewScope:
+def _trim_scope_for_gate3(
+    scope: ReviewScope,
+    config: ReviewConfig,
+) -> ReviewScope:
     """Drop lowest-ranked issued paths until both provider envelopes can fit."""
 
     limits = config.limits
@@ -1188,7 +1273,10 @@ def _trim_scope_for_gate3(scope: ReviewScope, config: ReviewConfig) -> ReviewSco
                     item for item in current.materialized_path_chars if item[0] in retained_set
                 ),
             )
-            if _scope_routes_required_seeds(candidate, required_seeds):
+            if _scope_routes_required_seeds(
+                candidate,
+                required_seeds,
+            ):
                 removable = (path, candidate)
                 break
         if removable is None:
@@ -1235,7 +1323,11 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
     reasons.extend(
         issue
         for issue in scope.issues
-        if issue.code == "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT"
+        if issue.code
+        in {
+            "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT",
+            "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT",
+        }
     )
     if limits.max_calls < 2:
         reasons.append(
@@ -1559,6 +1651,10 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
                 )
             )
         elif verified.entries != inventory.entries:
+            reasons.append(
+                ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED")
+            )
+        if not reasons:
             reasons.append(
                 ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED")
             )

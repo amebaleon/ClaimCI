@@ -309,6 +309,139 @@ def test_gate_1_absent_inventory_fails_and_downstream_gates_are_not_evaluated(
     assert result.review_status_ceiling is ReviewStatus.UNAVAILABLE
 
 
+def test_gate_1_rejects_shape_valid_wrong_inventory_type_without_provider_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    @dataclass(frozen=True)
+    class ShapeValidInventory:
+        schema_version: int = 1
+        requested_base_sha: str = SHA
+        comparison_base_sha: str = SHA
+        head_sha: str = SHA
+        comparison_basis: ComparisonBasis = ComparisonBasis.DIRECT_BASE
+        source: ChangeInventorySource = (
+            ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+        )
+        declared_entry_count: int = 0
+        complete: bool = True
+        entries: tuple[ChangeEntry, ...] = ()
+
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    shape_valid = ShapeValidInventory()
+    constructions = 0
+
+    def provider_sentinel(**_kwargs: Any) -> Any:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("provider factory must remain untouched")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_sentinel)
+
+    result = run_review(
+        _declared_inputs(root, shape_valid), ReviewConfig(enabled=True)
+    )
+
+    assert [gate.disposition for gate in result.preflight.gates] == [
+        GateDisposition.FAIL,
+        GateDisposition.NOT_EVALUATED,
+        GateDisposition.NOT_EVALUATED,
+    ]
+    assert _issue_codes(result.preflight, 1) == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"
+    }
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.provider_calls == ()
+    assert constructions == 0
+
+
+def test_gate_1_rejects_declared_legacy_inventory_source_before_verification_or_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    inventory = ChangeInventory(
+        schema_version=1,
+        requested_base_sha=SHA,
+        comparison_base_sha=SHA,
+        head_sha=SHA,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.LEGACY_PAIRWISE,
+        declared_entry_count=0,
+        complete=True,
+        entries=(),
+    )
+    constructions = 0
+
+    def provider_sentinel(**_kwargs: Any) -> Any:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("provider factory must remain untouched")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_sentinel)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy declared inventory must fail before verification"
+        ),
+    )
+
+    result = run_review(
+        _declared_inputs(root, inventory), ReviewConfig(enabled=True)
+    )
+
+    assert [gate.disposition for gate in result.preflight.gates] == [
+        GateDisposition.FAIL,
+        GateDisposition.NOT_EVALUATED,
+        GateDisposition.NOT_EVALUATED,
+    ]
+    assert _issue_codes(result.preflight, 1) == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"
+    }
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.provider_calls == ()
+    assert constructions == 0
+
+
+def test_gate_1_inventory_verification_mismatch_has_defensive_reason_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    declared = _inventory(())
+    verified_with_wrong_source = ChangeInventory(
+        schema_version=declared.schema_version,
+        requested_base_sha=declared.requested_base_sha,
+        comparison_base_sha=declared.comparison_base_sha,
+        head_sha=declared.head_sha,
+        comparison_basis=declared.comparison_basis,
+        source=ChangeInventorySource.LEGACY_PAIRWISE,
+        declared_entry_count=declared.declared_entry_count,
+        complete=declared.complete,
+        entries=declared.entries,
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: verified_with_wrong_source,
+    )
+
+    result = preflight_review(
+        _declared_inputs(root, declared), ReviewConfig(enabled=True)
+    )
+
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert _issue_codes(result, 1) == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.ready_for_provider is False
+
+
 @pytest.mark.parametrize(
     ("field", "expected"),
     [
@@ -791,6 +924,49 @@ def test_legacy_comparison_limits_fail_with_exact_reasons(
     assert expected in _issue_codes(result, 1)
 
 
+def test_legacy_scandir_stops_consuming_at_the_entry_limit_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.preflight as module
+
+    class Entry:
+        name = ".git"
+
+    class GuardedScandir:
+        def __init__(self) -> None:
+            self.next_count = 0
+
+        def __enter__(self) -> "GuardedScandir":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def __iter__(self) -> "GuardedScandir":
+            return self
+
+        def __next__(self) -> Entry:
+            self.next_count += 1
+            if self.next_count > module.MAX_REPOSITORY_ENTRIES + 1:
+                raise AssertionError("scandir consumed beyond the required sentinel")
+            return Entry()
+
+    guarded = GuardedScandir()
+    monkeypatch.setattr(module.os, "scandir", lambda _path: guarded)
+
+    paths, issues = module._legacy_regular_paths(tmp_path.resolve())
+
+    assert paths == ()
+    assert guarded.next_count == module.MAX_REPOSITORY_ENTRIES + 1
+    assert issues == (
+        ScopeIssue(
+            code="PREFLIGHT_G1_REPOSITORY_ENTRY_LIMIT",
+            observed=module.MAX_REPOSITORY_ENTRIES + 1,
+            limit=module.MAX_REPOSITORY_ENTRIES,
+        ),
+    )
+
+
 def test_legacy_unknown_change_status_fails_gate_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -820,6 +996,53 @@ def test_legacy_unknown_change_status_fails_gate_2(
     assert "PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN" in _issue_codes(result, 2)
 
 
+def test_legacy_unknown_change_status_is_hard_failure_with_another_safe_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.preflight as module
+
+    head = (tmp_path / "head").resolve()
+    base = (tmp_path / "base").resolve()
+    head.mkdir()
+    base.mkdir()
+    (head / "results.json").write_text('{"accuracy": 0.95}', encoding="utf-8")
+    (head / "results-unknown.json").write_text("x", encoding="utf-8")
+    (base / "results-unknown.json").write_text("x", encoding="utf-8")
+    real_capture = module.capture_confined_regular_file
+
+    def guarded_capture(root: Path, path: str, *, max_bytes: int):
+        if path == "results-unknown.json":
+            raise PassiveFileError("sentinel", code="changed")
+        return real_capture(root, path, max_bytes=max_bytes)
+
+    constructions = 0
+
+    def provider_sentinel(**_kwargs: Any) -> Any:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("provider factory must remain untouched")
+
+    monkeypatch.setattr(module, "capture_confined_regular_file", guarded_capture)
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_sentinel)
+
+    result = run_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Benchmark accuracy improves in results.json",
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.preflight.gates[1].disposition is GateDisposition.FAIL
+    assert "PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN" in _issue_codes(result.preflight, 2)
+    assert result.preflight.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.provider_calls == ()
+    assert constructions == 0
+
+
 def test_gate_2_unreadable_candidate_fails_when_no_other_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -841,9 +1064,11 @@ def test_gate_2_unreadable_candidate_fails_when_no_other_route(
     assert "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH" in _issue_codes(result, 2)
 
 
-def test_gate_2_locality_external_and_out_of_scope_omissions_are_partial(
+def test_gate_2_locality_unavailable_sole_route_is_unavailable_before_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import claimci.review.orchestrator as orchestrator
+
     root = (tmp_path / "repo").resolve()
     root.mkdir()
     (root / "results.json").write_text("x" * 101, encoding="utf-8")
@@ -863,17 +1088,138 @@ def test_gate_2_locality_external_and_out_of_scope_omissions_are_partial(
     )
     limits = ReviewLimits(max_file_chars=100)
 
-    result = preflight_review(
-        inputs, ReviewConfig(enabled=True, limits=limits)
-    )
+    constructions = 0
 
-    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    def provider_sentinel(**_kwargs: Any) -> Any:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("provider factory must remain untouched")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_sentinel)
+    result = run_review(inputs, ReviewConfig(enabled=True, limits=limits))
+
+    assert result.preflight.gates[1].disposition is GateDisposition.FAIL
     assert {
         "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
         "PREFLIGHT_G2_EXTERNAL_EVIDENCE_ONLY",
         "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
-    }.issubset(_issue_codes(result, 2))
+        "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH",
+    }.issubset(_issue_codes(result.preflight, 2))
+    assert result.preflight.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.provider_calls == ()
+    assert constructions == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "limits"),
+    [
+        ("", ReviewLimits()),
+        ("x" * 101, ReviewLimits(max_file_chars=100)),
+    ],
+)
+def test_gate_2_empty_or_locality_unavailable_sole_route_never_constructs_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    limits: ReviewLimits,
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    (root / "results.json").write_text(text, encoding="utf-8")
+    inventory = _inventory((ChangeEntry("results.json", ChangeStatus.ADDED),))
+    inputs = _declared_inputs(root, inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    constructions = 0
+
+    def provider_sentinel(**_kwargs: Any) -> Any:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("provider factory must remain untouched")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_sentinel)
+
+    result = run_review(inputs, ReviewConfig(enabled=True, limits=limits))
+
+    assert result.preflight.gates[1].disposition is GateDisposition.FAIL
+    assert "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH" in _issue_codes(
+        result.preflight, 2
+    )
+    assert result.preflight.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.provider_calls == ()
+    assert constructions == 0
+
+
+def test_gate_2_locality_omission_is_partial_when_another_citable_route_remains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    (root / "results.json").write_text("x" * 101, encoding="utf-8")
+    (root / "benchmarks").mkdir()
+    (root / "benchmarks" / "safe.py").write_text(
+        "accuracy = 95\n", encoding="utf-8"
+    )
+    inventory = _inventory(
+        (
+            ChangeEntry("benchmarks/safe.py", ChangeStatus.ADDED),
+            ChangeEntry("results.json", ChangeStatus.ADDED),
+        )
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    result = preflight_review(
+        _declared_inputs(root, inventory),
+        ReviewConfig(enabled=True, limits=ReviewLimits(max_file_chars=100)),
+    )
+
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE" in _issue_codes(result, 2)
+    assert result.gates[1].metrics["routed_seed_count"] > 0
+    assert result.ready_for_provider is True
+
+
+def test_gate_2_changed_region_locality_keeps_a_truncated_modified_route_citable(
+    tmp_path: Path,
+) -> None:
+    head = (tmp_path / "head").resolve()
+    base = (tmp_path / "base").resolve()
+    head.mkdir()
+    base.mkdir()
+    path = Path("src/service.py")
+    (head / path).parent.mkdir(parents=True)
+    (base / path).parent.mkdir(parents=True)
+    prefix = "".join(f"unchanged_{index} = {index}\n" for index in range(40))
+    (base / path).write_text(prefix + "sentinel = -1\n", encoding="utf-8")
+    (head / path).write_text(prefix + "sentinel = 0\n", encoding="utf-8")
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title=(
+                "Accuracy improves by 5% because implementation behavior changes "
+                "in src/service.py"
+            ),
+        ),
+        ReviewConfig(enabled=True, limits=ReviewLimits(max_file_chars=100)),
+    )
+
+    assert result.gates[1].disposition is GateDisposition.PASS_COMPLETE
+    assert result.gates[1].metrics["routed_seed_count"] > 0
+    assert result.gates[2].disposition is GateDisposition.PASS_PARTIAL
     assert "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT" in _issue_codes(result, 3)
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
 
 
 def test_selection_truncation_is_partial_and_provider_ready(
@@ -1299,6 +1645,113 @@ def test_synthesis_reserve_covers_mandatory_claim_identity_and_source_augmentati
     reserved = worst_valid_synthesis_request_chars(scope, ReviewLimits())
 
     assert actual_chars > 60_000
+    assert reserved >= actual_chars
+
+
+def test_synthesis_reserve_uses_worst_exact_serialized_source_path() -> None:
+    escaped_path = "sourcé/" + ('"' * 817) + ".py"
+    more_escaped_path = "sourcé/" + ('"' * 828) + ".py"
+    longer_plain_path = "source/" + ("x" * 829) + ".py"
+    source_id = "source-escaped-path"
+    raw_claims = [
+        {
+            "source_text": "",
+            "claim_type": "other_scientific",
+            "subject": f"subject-{index}",
+            "metric": None,
+            "direction": "not_applicable",
+            "claimed_magnitude": None,
+            "qualifiers": [],
+            "source": {
+                "source_id": source_id,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            "confidence": 0.5,
+            "evidence_hints": [],
+        }
+        for index in range(16)
+    ]
+    fixed = len(
+        json.dumps(
+            {"claims": raw_claims},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    raw_claims[0]["source_text"] = "x" * (24_000 - fixed)
+    claims = [
+        {
+            "claim_id": f"claim-{index:016x}",
+            **claim,
+            "source": {
+                **claim["source"],
+                "kind": "repository_file",
+                "path": more_escaped_path if index == 0 else escaped_path,
+            },
+        }
+        for index, claim in enumerate(raw_claims)
+    ]
+    actual = build_synthesis_request_parts(
+        claims,
+        (),
+        {claim["claim_id"]: [] for claim in claims},
+        {},
+        (),
+        (),
+    )
+    actual_chars = logical_request_chars(actual.task, actual.payload, actual.schema)
+    inventory = _inventory(
+        tuple(
+            sorted(
+                (
+                    ChangeEntry(more_escaped_path, ChangeStatus.ADDED),
+                    ChangeEntry(escaped_path, ChangeStatus.ADDED),
+                    ChangeEntry(longer_plain_path, ChangeStatus.ADDED),
+                ),
+                key=lambda entry: (entry.path, entry.status.value),
+            )
+        )
+    )
+    sources = tuple(
+        SourceRecord(
+            source_id=(
+                source_id if path != longer_plain_path else "source-plain-path"
+            ),
+            kind=SourceKind.REPOSITORY_FILE,
+            path=path,
+            text="x",
+            sha256="0" * 64,
+        )
+        for path in (escaped_path, more_escaped_path, longer_plain_path)
+    )
+    scope = ReviewScope(
+        mode="declared_changed_v1",
+        inventory=inventory,
+        issued_paths=(escaped_path, more_escaped_path, longer_plain_path),
+        issued_changed_paths=(escaped_path, more_escaped_path, longer_plain_path),
+        selected_paths=(escaped_path, more_escaped_path, longer_plain_path),
+        sources=sources,
+        seeds=(),
+        complete=True,
+        issues=(),
+        materialized_chars=3,
+        materialized_path_chars=tuple(
+            sorted(
+                (
+                    (escaped_path, 1),
+                    (more_escaped_path, 1),
+                    (longer_plain_path, 1),
+                )
+            )
+        ),
+    )
+
+    reserved = worst_valid_synthesis_request_chars(scope, ReviewLimits())
+
+    assert len(longer_plain_path) > len(more_escaped_path)
+    assert actual_chars == 62_855
     assert reserved >= actual_chars
 
 
