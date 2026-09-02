@@ -23,7 +23,9 @@ from .evidence import (
 from .models import (
     ClaimType,
     ChangeInventory,
+    GateDisposition,
     MagnitudeKind,
+    PreflightGateResult,
     ProviderCallRecord,
     ProviderUsage,
     ReviewConfig,
@@ -31,6 +33,7 @@ from .models import (
     ReviewPreflight,
     ReviewStatus,
     ScientificClaim,
+    ScopeIssue,
     SnapshotIdentity,
     SourceBundle,
 )
@@ -40,10 +43,9 @@ from .provider import (
     StructuredRequest,
 )
 from .request_budget import (
-    bound_synthesis_audits,
+    allocate_synthesis_inputs,
     build_extraction_request_parts,
     build_synthesis_request_parts,
-    deduplicate_missing_evidence,
     extraction_schema as shared_extraction_schema,
     logical_request_chars,
     plain as shared_plain,
@@ -126,25 +128,6 @@ def _extraction_schema(max_claims: int) -> dict[str, Any]:
 
 def _citable_reference(reference: EvidenceReference) -> bool:
     return reference.excerpt_locality is not EvidenceLocality.UNLOCALIZED_PREFIX
-
-
-def _bounded_synthesis_evidence(evidence: EvidenceBundle) -> EvidenceBundle:
-    """Issue at most one deterministic reference per already bounded path."""
-
-    by_path: dict[str, EvidenceReference] = {}
-    for reference in evidence.references:
-        current = by_path.get(reference.path)
-        if current is None or (
-            not _citable_reference(current) and _citable_reference(reference)
-        ):
-            by_path[reference.path] = reference
-    references = tuple(by_path[path] for path in sorted(by_path))
-    return EvidenceBundle(
-        references=references,
-        missing=tuple(deduplicate_missing_evidence(evidence.missing)),
-        total_chars=sum(len(reference.excerpt) for reference in references),
-        routing_incomplete=evidence.routing_incomplete,
-    )
 
 
 _STANDALONE_TEST_ANNOTATION = re.compile(r"[ \t]*@Test[ \t]*\Z")
@@ -649,6 +632,69 @@ def _record_call(
     )
 
 
+def _record_runtime_gate3_omissions(
+    preflight: ReviewPreflight | None,
+    omissions: Sequence[tuple[str, str, int]],
+) -> ReviewPreflight | None:
+    """Attach exact post-extraction allocation losses to the returned scope."""
+
+    material = tuple(item for item in omissions if item[2] > 0)
+    if preflight is None or not material:
+        return preflight
+    gate3 = preflight.gates[2]
+    if gate3.disposition not in {
+        GateDisposition.PASS_COMPLETE,
+        GateDisposition.PASS_PARTIAL,
+    }:
+        raise ReviewError("runtime omissions require a provider-ready Gate 3")
+    new_issues = tuple(
+        ScopeIssue(code=code, observed=count, limit=0)
+        for code, _metric, count in material
+    )
+    reasons = tuple(
+        sorted(
+            set((*gate3.reasons, *new_issues)),
+            key=lambda issue: (
+                issue.code,
+                issue.path or "",
+                -1 if issue.observed is None else issue.observed,
+                -1 if issue.limit is None else issue.limit,
+            ),
+        )
+    )
+    metrics = dict(gate3.metrics)
+    metrics.update({metric: count for _code, metric, count in material})
+    revised_gate3 = PreflightGateResult(
+        gate=3,
+        disposition=GateDisposition.PASS_PARTIAL,
+        reasons=reasons,
+        metrics=metrics,
+    )
+    scope = preflight.scope
+    if scope is not None:
+        scope = replace(
+            scope,
+            complete=False,
+            issues=tuple(
+                sorted(
+                    set((*scope.issues, *new_issues)),
+                    key=lambda issue: (
+                        issue.code,
+                        issue.path or "",
+                        -1 if issue.observed is None else issue.observed,
+                        -1 if issue.limit is None else issue.limit,
+                    ),
+                )
+            ),
+        )
+    return replace(
+        preflight,
+        gates=(*preflight.gates[:2], revised_gate3),
+        review_status_ceiling=ReviewStatus.PARTIAL,
+        scope=scope,
+    )
+
+
 def _sources_after_manifest_reservation(
     sources: SourceBundle,
     audit_plans: Sequence[ManifestAuditPlan],
@@ -806,12 +852,37 @@ def run_review(
             ),
             changed_paths=sources.changed_paths,
         )
+        omitted_audit_plan_count = 0
+        omitted_audit_dependency_count = 0
         if preflight_sources is not None:
             issued_paths = set(preflight_sources.repository_paths)
-            audit_plans = tuple(
+            retained_audit_plans = tuple(
                 plan
                 for plan in audit_plans
                 if set(plan.paths).issubset(issued_paths)
+            )
+            omitted_audit_plans = tuple(
+                plan for plan in audit_plans if plan not in retained_audit_plans
+            )
+            omitted_audit_plan_count = len(omitted_audit_plans)
+            omitted_audit_dependency_count = sum(
+                len(set(plan.paths) - issued_paths) for plan in omitted_audit_plans
+            )
+            audit_plans = retained_audit_plans
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_AUDIT_PLAN_OMITTED",
+                        "omitted_audit_plan_count",
+                        omitted_audit_plan_count,
+                    ),
+                    (
+                        "PREFLIGHT_G3_AUDIT_DEPENDENCY_OMITTED",
+                        "omitted_audit_dependency_count",
+                        omitted_audit_dependency_count,
+                    ),
+                ),
             )
         manifest_candidates = tuple(
             plan.manifest_path for plan in audit_plans
@@ -939,29 +1010,51 @@ def run_review(
                 error_code="CALL_LIMIT",
                 error_message="Synthesis was skipped by the configured call limit.",
             )
-        synthesis_evidence = _bounded_synthesis_evidence(evidence)
-        evidence_ids_by_claim_id = _evidence_ids_by_claim_id(
-            claims, synthesis_evidence
-        )
+        evidence_ids_by_claim_id = _evidence_ids_by_claim_id(claims, evidence)
         interpretation_constraints_by_claim_id = _interpretation_constraints(
             claims,
-            synthesis_evidence,
+            evidence,
             evidence_ids_by_claim_id,
         )
-        synthesis_audits, omitted_synthesis_audits = bound_synthesis_audits(
-            deterministic_audits
-        )
-        synthesis_parts = build_synthesis_request_parts(
+        synthesis_allocation = allocate_synthesis_inputs(
             claims,
             tuple(
                 reference
-                for reference in synthesis_evidence.references
+                for reference in evidence.references
                 if _citable_reference(reference)
             ),
             evidence_ids_by_claim_id,
             interpretation_constraints_by_claim_id,
-            synthesis_evidence.missing,
-            synthesis_audits,
+            evidence.missing,
+            deterministic_audits,
+            max_chars=config.limits.max_context_chars,
+        )
+        synthesis_parts = synthesis_allocation.parts
+        omission_counts = synthesis_allocation.omitted_counts
+        preflight = _record_runtime_gate3_omissions(
+            preflight,
+            (
+                (
+                    "PREFLIGHT_G3_SYNTHESIS_EVIDENCE_OMITTED",
+                    "synthesis_evidence_omitted_count",
+                    omission_counts["evidence"],
+                ),
+                (
+                    "PREFLIGHT_G3_SYNTHESIS_CONSTRAINT_OMITTED",
+                    "synthesis_constraint_omitted_count",
+                    omission_counts["interpretation_constraints"],
+                ),
+                (
+                    "PREFLIGHT_G3_SYNTHESIS_AUDIT_OMITTED",
+                    "synthesis_audit_omitted_count",
+                    omission_counts["deterministic_audits"],
+                ),
+                (
+                    "PREFLIGHT_G3_SYNTHESIS_MISSING_EVIDENCE_OMITTED",
+                    "synthesis_missing_evidence_omitted_count",
+                    omission_counts["missing_evidence"],
+                ),
+            ),
         )
         synthesis_chars = _request_chars(
             synthesis_parts.task,
@@ -1023,7 +1116,9 @@ def run_review(
                 _parse_json(synthesis_response.output_text),
                 claims,
                 evidence,
-                interpretation_constraints_by_claim_id,
+                synthesis_parts.payload[
+                    "interpretation_constraints_by_claim_id"
+                ],
             )
         except ReviewError as exc:
             validation_message = (
@@ -1068,6 +1163,26 @@ def run_review(
                     "claim was reviewed."
                 ),
             )
+        if any(omission_counts.values()):
+            return finish(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                interpretations=interpretations,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="SYNTHESIS_INPUTS_OMITTED",
+                error_message=(
+                    "Bounded advisory synthesis omitted exact input counts: "
+                    f"evidence={omission_counts['evidence']}, "
+                    "interpretation_constraints="
+                    f"{omission_counts['interpretation_constraints']}, "
+                    f"missing_evidence={omission_counts['missing_evidence']}, "
+                    "deterministic_audits="
+                    f"{omission_counts['deterministic_audits']}. Full evidence and "
+                    "deterministic Audit results remain in the review record."
+                ),
+            )
         if evidence.routing_incomplete:
             return finish(
                 ReviewStatus.PARTIAL,
@@ -1083,7 +1198,7 @@ def run_review(
                     "claim was interpreted, but the advisory review is incomplete."
                 ),
             )
-        if omitted_synthesis_audits:
+        if omitted_audit_plan_count:
             return finish(
                 ReviewStatus.PARTIAL,
                 claims=claims,
@@ -1091,11 +1206,11 @@ def run_review(
                 evidence=evidence,
                 deterministic_audits=deterministic_audits,
                 calls=calls,
-                error_code="SYNTHESIS_AUDITS_OMITTED",
+                error_code="AUDIT_PLANS_OMITTED",
                 error_message=(
-                    f"{omitted_synthesis_audits} deterministic audit snapshot(s) "
-                    "were omitted from advisory synthesis by the bounded input "
-                    "allocation; the complete Audit results remain authoritative."
+                    f"{omitted_audit_plan_count} deterministic audit plan(s) with "
+                    f"{omitted_audit_dependency_count} unissued dependency path(s) "
+                    "were omitted from this bounded advisory scope."
                 ),
             )
         return finish(

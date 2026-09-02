@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 from .models import ReviewError, ReviewLimits, ReviewScope, ScopeIssue, SourceBundle
@@ -237,6 +238,34 @@ class RequestParts:
     schema: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class SynthesisInputAllocation:
+    """One exact bounded synthesis request plus explicit omission accounting."""
+
+    parts: RequestParts
+    omitted_counts: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parts, RequestParts):
+            raise ReviewError("synthesis allocation request parts are invalid")
+        expected = {
+            "deterministic_audits",
+            "evidence",
+            "interpretation_constraints",
+            "missing_evidence",
+        }
+        if set(self.omitted_counts) != expected or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in self.omitted_counts.values()
+        ):
+            raise ReviewError("synthesis allocation omission counts are invalid")
+        object.__setattr__(
+            self,
+            "omitted_counts",
+            MappingProxyType(dict(sorted(self.omitted_counts.items()))),
+        )
+
+
 def plain(value: Any) -> Any:
     if isinstance(value, ScopeIssue):
         return value.as_dict()
@@ -395,6 +424,165 @@ def build_synthesis_request_parts(
     )
 
 
+def _field(value: object, name: str) -> object | None:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def allocate_synthesis_inputs(
+    claims: Sequence[object],
+    evidence: Sequence[object],
+    evidence_ids_by_claim_id: Mapping[str, Sequence[str]],
+    interpretation_constraints_by_claim_id: Mapping[str, Mapping[str, Any]],
+    missing_evidence: Sequence[object],
+    deterministic_audits: Sequence[object],
+    *,
+    max_chars: int,
+) -> SynthesisInputAllocation:
+    """Pack actual synthesis inputs without ever exceeding the logical cap.
+
+    Claims are mandatory because synthesis must cover each accepted claim. Distinct
+    citable references retain their producer order. Constraints, complete audit
+    snapshots, and missing-evidence rows are then admitted only when the shared
+    serializer proves that the resulting request remains bounded.
+    """
+
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 1:
+        raise ReviewError("synthesis allocation limit must be a positive integer")
+    claim_ids: list[str] = []
+    for claim in claims:
+        claim_id = _field(claim, "claim_id")
+        if not isinstance(claim_id, str) or not claim_id or claim_id in claim_ids:
+            raise ReviewError("synthesis allocation claims are invalid")
+        claim_ids.append(claim_id)
+    if set(evidence_ids_by_claim_id) != set(claim_ids):
+        raise ReviewError("synthesis allocation ownership is incomplete")
+
+    retained_evidence: list[object] = []
+    retained_ids: set[str] = set()
+    retained_constraints: dict[str, Mapping[str, Any]] = {}
+    retained_missing: list[object] = []
+    retained_audits: list[object] = []
+
+    def owners() -> dict[str, list[str]]:
+        return {
+            claim_id: [
+                evidence_id
+                for evidence_id in evidence_ids_by_claim_id[claim_id]
+                if evidence_id in retained_ids
+            ]
+            for claim_id in claim_ids
+        }
+
+    def parts(
+        *,
+        candidate_evidence: Sequence[object] | None = None,
+        candidate_constraints: Mapping[str, Mapping[str, Any]] | None = None,
+        candidate_missing: Sequence[object] | None = None,
+        candidate_audits: Sequence[object] | None = None,
+    ) -> RequestParts:
+        return build_synthesis_request_parts(
+            claims,
+            retained_evidence if candidate_evidence is None else candidate_evidence,
+            owners(),
+            (
+                retained_constraints
+                if candidate_constraints is None
+                else candidate_constraints
+            ),
+            retained_missing if candidate_missing is None else candidate_missing,
+            retained_audits if candidate_audits is None else candidate_audits,
+        )
+
+    def fits(candidate: RequestParts) -> bool:
+        return (
+            logical_request_chars(
+                candidate.task,
+                candidate.payload,
+                candidate.schema,
+            )
+            <= max_chars
+        )
+
+    base = parts()
+    if not fits(base):
+        raise ReviewError("mandatory synthesis input exceeds the configured limit")
+
+    omitted_evidence = 0
+    for reference in evidence:
+        evidence_id = _field(reference, "evidence_id")
+        if (
+            not isinstance(evidence_id, str)
+            or not evidence_id
+            or evidence_id in retained_ids
+        ):
+            raise ReviewError("synthesis allocation evidence IDs are invalid")
+        candidate_ids = {*retained_ids, evidence_id}
+        prior_ids = retained_ids
+        retained_ids = candidate_ids
+        candidate_evidence = (*retained_evidence, reference)
+        candidate = parts(candidate_evidence=candidate_evidence)
+        if fits(candidate):
+            retained_evidence.append(reference)
+        else:
+            retained_ids = prior_ids
+            omitted_evidence += 1
+
+    omitted_constraints = 0
+    for claim_id in sorted(interpretation_constraints_by_claim_id):
+        constraint = interpretation_constraints_by_claim_id[claim_id]
+        required = constraint.get("required_citations", ())
+        if (
+            claim_id not in claim_ids
+            or not isinstance(required, Sequence)
+            or isinstance(required, (str, bytes))
+            or any(item not in retained_ids for item in required)
+        ):
+            omitted_constraints += 1
+            continue
+        candidate_constraints = {**retained_constraints, claim_id: constraint}
+        candidate = parts(candidate_constraints=candidate_constraints)
+        if fits(candidate):
+            retained_constraints[claim_id] = constraint
+        else:
+            omitted_constraints += 1
+
+    omitted_audits = 0
+    for audit in deterministic_audits:
+        candidate_audits = (*retained_audits, audit)
+        candidate = parts(candidate_audits=candidate_audits)
+        if (
+            serialized_chars(candidate_audits) <= MAX_SYNTHESIS_AUDIT_CHARS
+            and fits(candidate)
+        ):
+            retained_audits.append(audit)
+        else:
+            omitted_audits += 1
+
+    omitted_missing = 0
+    for missing in missing_evidence:
+        candidate_missing = (*retained_missing, missing)
+        candidate = parts(candidate_missing=candidate_missing)
+        if fits(candidate):
+            retained_missing.append(missing)
+        else:
+            omitted_missing += 1
+
+    allocated = parts()
+    if not fits(allocated):  # pragma: no cover - defense against future refactors
+        raise ReviewError("synthesis allocator exceeded the configured limit")
+    return SynthesisInputAllocation(
+        parts=allocated,
+        omitted_counts={
+            "deterministic_audits": omitted_audits,
+            "evidence": omitted_evidence,
+            "interpretation_constraints": omitted_constraints,
+            "missing_evidence": omitted_missing,
+        },
+    )
+
+
 def output_budget_ready(limits: ReviewLimits) -> bool:
     if not isinstance(limits, ReviewLimits):
         raise ReviewError("output budget requires ReviewLimits")
@@ -410,18 +598,15 @@ def _reserved_claims(
     max_output_chars: int,
     repository_paths: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
-    """Model the largest accepted extraction serialization using producer caps."""
+    """Model provider-bounded claim JSON plus deterministic validation fields."""
 
-    claims = [
+    raw_claims = [
         {
-            "claim_id": f"claim-{index:016x}",
             "source_text": "x",
             "claim_type": "other_scientific",
             "subject": "x",
             "source": {
                 "source_id": "source-0000000000000000",
-                "kind": "pull_request_title",
-                "path": None,
                 "start_line": 1,
                 "end_line": 1,
             },
@@ -434,21 +619,32 @@ def _reserved_claims(
         }
         for index in range(max_claims)
     ]
-    # Evidence hints are copied into routing records and can amplify the later
-    # request.  Reserve every issued exact path for every claim before spending
-    # the remaining accepted extraction budget on ordinary claim text.
-    for claim in claims:
-        for path in repository_paths:
-            claim["evidence_hints"].append(path)
-            if serialized_chars({"claims": claims}) > max_output_chars:
-                claim["evidence_hints"].pop()
-                break
-    # The raw extraction response is capped before validation. Validation adds
-    # fixed deterministic IDs/kind/path fields; fill one valid quote field with
-    # the remaining producer-owned response characters.
-    base = serialized_chars({"claims": claims})
-    claims[0]["source_text"] = "x" * max(1, max_output_chars - base + 1)
-    return claims
+    # The provider response cap applies before deterministic claim IDs and
+    # source kind/path are attached. Spend its remaining characters on a valid
+    # quoted source field, then add those trusted fields separately.
+    base = serialized_chars({"claims": raw_claims})
+    raw_claims[0]["source_text"] = "x" * max(
+        1,
+        max_output_chars - base + 1,
+    )
+    source_path = (
+        max(repository_paths, key=lambda path: (len(path), path))
+        if repository_paths
+        else None
+    )
+    source_kind = "repository_file" if source_path is not None else "pull_request_title"
+    return [
+        {
+            "claim_id": f"claim-{index:016x}",
+            **claim,
+            "source": {
+                **claim["source"],
+                "kind": source_kind,
+                "path": source_path,
+            },
+        }
+        for index, claim in enumerate(raw_claims)
+    ]
 
 
 def deduplicate_missing_evidence(values: Sequence[object]) -> tuple[object, ...]:
@@ -493,160 +689,39 @@ def bound_synthesis_audits(
 def worst_valid_synthesis_request_chars(
     scope: ReviewScope, limits: ReviewLimits
 ) -> int:
-    """Conservatively reserve the finite output of existing bounded producers."""
+    """Reserve the runtime allocator envelope or its mandatory producer base.
+
+    Optional evidence, gaps, constraints, and Audit snapshots are admitted by
+    :func:`allocate_synthesis_inputs` only while the exact logical request stays
+    within ``max_context_chars``. The only possible larger input is therefore
+    the mandatory all-claim payload/schema, which cannot be omitted.
+    """
 
     if not isinstance(scope, ReviewScope) or not isinstance(limits, ReviewLimits):
         raise ReviewError("synthesis reservation requires scope and ReviewLimits")
-    paths = tuple(scope.selected_paths[: limits.max_files])
+    repository_paths = tuple(
+        source.path for source in scope.sources if source.path is not None
+    )
     claims = _reserved_claims(
         limits.max_claims,
         limits.max_output_chars,
-        paths,
+        repository_paths,
     )
-    claim_ids = [claim["claim_id"] for claim in claims]
-    evidence_count = len(paths)
-    evidence: list[dict[str, Any]] = []
-    evidence_ids_by_claim_id: dict[str, list[str]] = {
-        claim_id: [] for claim_id in claim_ids
-    }
-    remaining_excerpt = (
-        sum(chars for _path, chars in scope.materialized_path_chars)
-        if scope.materialized_path_chars
-        else scope.materialized_chars
-    )
-    for index in range(evidence_count):
-        evidence_id = f"evidence-{index:016x}"
-        share = remaining_excerpt // (evidence_count - index)
-        remaining_excerpt -= share
-        path = paths[index]
-        evidence.append(
-            {
-                "evidence_id": evidence_id,
-                "claim_ids": list(claim_ids),
-                "kind": "document",
-                "path": path,
-                "start_line": 1,
-                "end_line": 1,
-                "sha256": "0" * 64,
-                "size": share,
-                "excerpt": "x" * share,
-                "provenance": "supporting_artifact",
-                "excerpt_complete": True,
-                "excerpt_locality": "complete_file",
-            }
-        )
-        for claim_id in claim_ids:
-            evidence_ids_by_claim_id[claim_id].append(evidence_id)
-    missing = []
-    for claim_id in claim_ids:
-        for path in paths:
-            missing.append(
-                {
-                    "claim_id": claim_id,
-                    "reason": "unresolved_provider_hint",
-                    "requested_path": path,
-                    "description": (
-                        "Provider-suggested evidence hint was unresolved because it "
-                        "did not exactly match a safely routed artifact in the "
-                        "analyzed snapshot."
-                    ),
-                }
-            )
-        for reason, description in (
-            (
-                "executed_result_not_available",
-                "No executed result artifact was available in the analyzed snapshot.",
-            ),
-        ):
-            missing.append(
-                {
-                    "claim_id": claim_id,
-                    "reason": reason,
-                    "requested_path": None,
-                    "description": description,
-                }
-            )
-    has_java_path = any(path.casefold().endswith(".java") for path in paths)
-    has_locality_path = any(
-        path.casefold().endswith(
-            (
-                ".c",
-                ".cc",
-                ".cpp",
-                ".cs",
-                ".go",
-                ".h",
-                ".hpp",
-                ".java",
-                ".js",
-                ".jsx",
-                ".kt",
-                ".py",
-                ".rs",
-                ".scala",
-                ".swift",
-                ".ts",
-                ".tsx",
-            )
-        )
-        for path in paths
-    )
-    constraints = {
-        claim_id: {
-            "kind": "java_test_cardinality",
-            "state": "contradicted",
-            "claimed_count": 999999999999999,
-            "observed_count": 999999999999998,
-            "evidence_id": (
-                evidence_ids_by_claim_id[claim_id][0]
-                if evidence_ids_by_claim_id[claim_id]
-                else None
-            ),
-            "evidence_ids": list(evidence_ids_by_claim_id[claim_id]),
-            "required_interpretation": (
-                "The complete source contains a bounded deterministic cardinality "
-                "that contradicts the claimed count; this is source support and not "
-                "evidence that any tests were executed."
-            ),
-            "required_citations": list(evidence_ids_by_claim_id[claim_id]),
-        }
-        for claim_id in claim_ids
-        if has_java_path
-    }
-    if has_locality_path and not has_java_path:
-        constraints = {
-            claim_id: {
-                "kind": "unlocalized_evidence",
-                "state": "incomplete",
-                "evidence_ids": list(evidence_ids_by_claim_id[claim_id]),
-                "required_interpretation": (
-                    "ClaimCI cannot verify this claim from the exact source/test "
-                    "evidence because the available bounded excerpts could not be "
-                    "localized to the material region."
-                ),
-                "required_citations": [],
-            }
-            for claim_id in claim_ids
-        }
-    manifest_count = sum(
-        path.casefold().endswith(("research.yaml", "research.yml"))
-        for path in paths
-    )
-    audits: list[dict[str, str]] = []
-    if manifest_count:
-        placeholder = [{"reserved": ""}]
-        fixed = serialized_chars(placeholder)
-        placeholder[0]["reserved"] = "x" * (MAX_SYNTHESIS_AUDIT_CHARS - fixed)
-        audits = placeholder
-    parts = build_synthesis_request_parts(
+    owners = {claim["claim_id"]: [] for claim in claims}
+    mandatory = build_synthesis_request_parts(
         claims,
-        evidence,
-        evidence_ids_by_claim_id,
-        constraints,
-        missing,
-        audits,
+        (),
+        owners,
+        {},
+        (),
+        (),
     )
-    return logical_request_chars(parts.task, parts.payload, parts.schema)
+    mandatory_chars = logical_request_chars(
+        mandatory.task,
+        mandatory.payload,
+        mandatory.schema,
+    )
+    return max(mandatory_chars, limits.max_context_chars)
 
 
 __all__ = [
@@ -655,6 +730,8 @@ __all__ = [
     "REVIEW_SYSTEM_POLICY",
     "RequestParts",
     "SYNTHESIS_CONTRACT",
+    "SynthesisInputAllocation",
+    "allocate_synthesis_inputs",
     "build_extraction_request_parts",
     "build_synthesis_request_parts",
     "bound_synthesis_audits",

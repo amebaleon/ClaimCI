@@ -24,6 +24,7 @@ from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.request_budget import (
     MAX_SYNTHESIS_AUDIT_CHARS,
+    allocate_synthesis_inputs,
     bound_synthesis_audits,
     build_extraction_request_parts,
     logical_request_chars,
@@ -73,6 +74,92 @@ def test_synthesis_audit_allocation_keeps_only_complete_bounded_snapshots() -> N
 
     assert retained == (small,)
     assert omitted == 1
+
+
+def test_exact_synthesis_allocator_packs_all_input_classes_and_counts_omissions() -> None:
+    claim_ids = tuple(f"claim-{index:016x}" for index in range(16))
+    claims = tuple(
+        {
+            "claim_id": claim_id,
+            "source_text": "The benchmark improves accuracy.",
+            "subject": f"candidate-{index}",
+            "evidence_hints": [
+                f"outside/{index:02}-{hint:02}.json" for hint in range(32)
+            ],
+        }
+        for index, claim_id in enumerate(claim_ids)
+    )
+    evidence = (
+        {
+            "evidence_id": "evidence-table-one",
+            "claim_ids": [claim_ids[0]],
+            "path": "results.md",
+            "excerpt": "first table",
+        },
+        {
+            "evidence_id": "evidence-table-two",
+            "claim_ids": [claim_ids[0]],
+            "path": "results.md",
+            "excerpt": "second table",
+        },
+    )
+    owners = {
+        claim_id: (
+            ["evidence-table-one", "evidence-table-two"]
+            if claim_id == claim_ids[0]
+            else []
+        )
+        for claim_id in claim_ids
+    }
+    constraints = {
+        claim_ids[0]: {
+            "required_interpretation": "Use both distinct tables.",
+            "required_citations": ["evidence-table-one", "evidence-table-two"],
+        }
+    }
+    missing = tuple(
+        {
+            "claim_id": claim_id,
+            "reason": "unresolved_provider_hint",
+            "requested_path": f"outside/{claim_index:02}-{hint:02}.json",
+            "description": "The exact provider hint was outside the issued scope.",
+        }
+        for claim_index, claim_id in enumerate(claim_ids)
+        for hint in range(32)
+    )
+    audits = (
+        {"manifest_path": "one/research.yaml", "findings": []},
+        {
+            "manifest_path": "two/research.yaml",
+            "findings": [{"explanation": "x" * MAX_SYNTHESIS_AUDIT_CHARS}],
+        },
+    )
+
+    allocation = allocate_synthesis_inputs(
+        claims,
+        evidence,
+        owners,
+        constraints,
+        missing,
+        audits,
+        max_chars=60_000,
+    )
+
+    assert logical_request_chars(
+        allocation.parts.task,
+        allocation.parts.payload,
+        allocation.parts.schema,
+    ) <= 60_000
+    assert [row["evidence_id"] for row in allocation.parts.payload["evidence"]] == [
+        "evidence-table-one",
+        "evidence-table-two",
+    ]
+    assert allocation.parts.payload["claims"] == list(claims)
+    assert allocation.omitted_counts["missing_evidence"] == (
+        len(missing) - len(allocation.parts.payload["missing_evidence"])
+    )
+    assert allocation.omitted_counts["missing_evidence"] > 0
+    assert allocation.omitted_counts["deterministic_audits"] == 1
 
 
 def test_preflight_output_reserve_requires_the_full_frozen_two_call_budget() -> None:

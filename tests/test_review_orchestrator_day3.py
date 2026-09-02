@@ -35,6 +35,11 @@ from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.evidence import EvidenceBundle, EvidenceKind, EvidenceReference
 from claimci.review.report import render_review_markdown
+from claimci.review.tools import (
+    DeterministicAuditSnapshot,
+    DeterministicFindingSnapshot,
+    ManifestAuditPlan,
+)
 
 
 TITLE = "Candidate improves accuracy by five percentage points"
@@ -683,7 +688,7 @@ def test_context_limit_rejects_oversized_extraction_request_without_provider_cal
     assert provider.calls == []
 
 
-def test_context_limit_rejects_oversized_synthesis_request_without_second_call(
+def test_context_limit_allocates_oversized_synthesis_inputs_before_second_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import claimci.review.orchestrator as orchestrator
@@ -709,12 +714,21 @@ def test_context_limit_rejects_oversized_synthesis_request_without_second_call(
     result = run_review(base_inputs, _config(), provider=provider)
 
     assert observed["extract_claims"] <= 60_000
-    assert observed["synthesize_review"] > 60_000
+    assert observed["synthesize_review"] <= 60_000
     assert result.status is ReviewStatus.PARTIAL
-    assert result.error_code == "CONTEXT_LIMIT"
-    assert len(provider.calls) == 1
-    assert [request.task for request in provider.calls] == ["extract_claims"]
-    assert len(result.provider_calls) == 1
+    assert result.error_code == "SYNTHESIS_INPUTS_OMITTED"
+    assert len(provider.calls) == 2
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+    assert len(result.provider_calls) == 2
+    emitted_evidence = len(provider.calls[1].payload["evidence"])
+    assert emitted_evidence < len(result.evidence.references)
+    assert (
+        f"evidence={len(result.evidence.references) - emitted_evidence}"
+        in (result.error_message or "")
+    )
     assert [reference.path for reference in result.evidence.references] == [
         "result-0.json",
         "result-1.json",
@@ -778,6 +792,101 @@ def test_file_limit_is_global_across_sources_evidence_and_manifests(
         item["manifest_path"] for item in synthesis["deterministic_audits"]
     }
     assert len(extraction_paths | evidence_paths | manifest_paths) <= 24
+
+
+def test_synthesis_retains_distinct_same_path_references(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def distinct_tables(
+        _root: Path,
+        claims: tuple[Any, ...],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> EvidenceBundle:
+        claim_id = claims[0].claim_id
+        common = {
+            "claim_ids": (claim_id,),
+            "kind": EvidenceKind.BENCHMARK,
+            "path": "README.md",
+            "sha256": "0" * 64,
+            "size": 100,
+        }
+        return EvidenceBundle(
+            references=(
+                EvidenceReference(
+                    evidence_id="evidence-table-one",
+                    start_line=3,
+                    end_line=5,
+                    excerpt="| metric | value |\n|---|---|\n|accuracy|0.8|",
+                    **common,
+                ),
+                EvidenceReference(
+                    evidence_id="evidence-table-two",
+                    start_line=8,
+                    end_line=10,
+                    excerpt="| metric | value |\n|---|---|\n|accuracy|0.9|",
+                    **common,
+                ),
+            ),
+            total_chars=92,
+        )
+
+    monkeypatch.setattr("claimci.review.orchestrator.discover_evidence", distinct_tables)
+    provider = FakeProvider()
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert [
+        row["evidence_id"] for row in provider.calls[1].payload["evidence"]
+    ] == ["evidence-table-one", "evidence-table-two"]
+    assert len(result.evidence.references) == 2
+
+
+def test_synthesis_audit_omission_preserves_full_authoritative_review_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = DeterministicFindingSnapshot(
+        rule_id="RESULT.LARGE",
+        severity="WARNING",
+        impact="INSUFFICIENT",
+        title="Large deterministic finding",
+        explanation="x" * 8_000,
+        evidence={"path": "README.md"},
+    )
+    snapshot = DeterministicAuditSnapshot(
+        manifest_path="research.yaml",
+        verdict="INSUFFICIENT_EVIDENCE",
+        metric="accuracy",
+        minimum_improvement=0.0,
+        direction="higher",
+        findings=(finding,),
+    )
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.discover_manifests",
+        lambda *_args, **_kwargs: ("research.yaml",),
+    )
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.plan_manifest_audits",
+        lambda *_args, **_kwargs: (
+            ManifestAuditPlan("research.yaml", ("README.md",)),
+        ),
+    )
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.run_manifest_audits",
+        lambda *_args, **_kwargs: (snapshot,),
+    )
+    provider = FakeProvider()
+
+    result = _run(tmp_path, provider)
+
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "SYNTHESIS_INPUTS_OMITTED"
+    assert result.deterministic_audits == (snapshot,)
+    assert provider.calls[1].payload["deterministic_audits"] == []
+    assert "deterministic_audits=1" in (result.error_message or "")
 
 
 @pytest.mark.parametrize("normalized_metric", ["accuracy", None])

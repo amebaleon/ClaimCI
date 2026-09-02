@@ -724,9 +724,19 @@ class ReviewPreflight:
         )
         if failure_indexes:
             first_failure = failure_indexes[0]
-            if failure_indexes != (first_failure,) or dispositions[first_failure + 1 :] != (
-                GateDisposition.NOT_EVALUATED,
-            ) * (2 - first_failure):
+            pass_dispositions = {
+                GateDisposition.PASS_COMPLETE,
+                GateDisposition.PASS_PARTIAL,
+            }
+            if (
+                failure_indexes != (first_failure,)
+                or any(
+                    disposition not in pass_dispositions
+                    for disposition in dispositions[:first_failure]
+                )
+                or dispositions[first_failure + 1 :]
+                != (GateDisposition.NOT_EVALUATED,) * (2 - first_failure)
+            ):
                 raise ReviewError("review preflight gate sequence is impossible")
         elif not_evaluated_indexes:
             raise ReviewError("review preflight gate sequence is impossible")

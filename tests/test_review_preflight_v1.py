@@ -23,17 +23,25 @@ from claimci.review.models import (
     ReviewConfig,
     ReviewLimits,
     ReviewPreflight,
+    ReviewScope,
     ReviewStatus,
     ScopeIssue,
     SnapshotIdentity,
     SnapshotRole,
+    SourceKind,
+    SourceRecord,
 )
-from claimci.review.inventory import InventoryVerificationError
+from claimci.review.inventory import (
+    InventoryVerificationError,
+    build_git_change_inventory,
+)
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.preflight import build_review_scope, preflight_review, scope_source_bundle
 from claimci.review.provider import ProviderResponse, StructuredRequest
+from claimci.review.tools import ManifestAuditPlan
 from claimci.review.request_budget import (
     RequestParts,
+    allocate_synthesis_inputs,
     build_extraction_request_parts,
     build_synthesis_request_parts,
     logical_request_chars,
@@ -232,6 +240,16 @@ def test_review_preflight_enforces_the_exact_status_ceiling(
             GateDisposition.FAIL,
             GateDisposition.PASS_PARTIAL,
         ),
+        (
+            GateDisposition.NOT_EVALUATED,
+            GateDisposition.FAIL,
+            GateDisposition.NOT_EVALUATED,
+        ),
+        (
+            GateDisposition.NOT_EVALUATED,
+            GateDisposition.PASS_COMPLETE,
+            GateDisposition.FAIL,
+        ),
     ],
 )
 def test_review_preflight_rejects_impossible_gate_sequences(
@@ -375,6 +393,69 @@ def test_gate_1_maps_typed_inventory_verification_failures_without_message_parsi
     result = preflight_review(inputs, ReviewConfig(enabled=True))
 
     assert _issue_codes(result, 1) == {code}
+
+
+def test_git_inventory_maps_casefold_duplicate_paths_to_typed_duplicate_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path.resolve()
+    requested = SnapshotIdentity(SnapshotRole.REQUESTED_BASE, root, SHA)
+    comparison = SnapshotIdentity(SnapshotRole.COMPARISON_BASE, root, SHA)
+    head = SnapshotIdentity(SnapshotRole.HEAD, root, SHA)
+    monkeypatch.setattr(
+        "claimci.review.inventory._verify_coordinates",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "claimci.review.inventory._run_git",
+        lambda *_args, **_kwargs: b"A\0Bench/Result.json\0A\0bench/result.json\0",
+    )
+
+    with pytest.raises(InventoryVerificationError) as raised:
+        build_git_change_inventory(
+            requested,
+            comparison,
+            head,
+            ComparisonBasis.DIRECT_BASE,
+        )
+
+    assert raised.value.code == "PREFLIGHT_G1_CHANGE_INVENTORY_DUPLICATE_PATH"
+
+
+def test_git_inventory_wraps_unexpected_constructed_shape_as_typed_malformed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path.resolve()
+    requested = SnapshotIdentity(SnapshotRole.REQUESTED_BASE, root, SHA)
+    comparison = SnapshotIdentity(SnapshotRole.COMPARISON_BASE, root, SHA)
+    head = SnapshotIdentity(SnapshotRole.HEAD, root, SHA)
+    monkeypatch.setattr(
+        "claimci.review.inventory._verify_coordinates",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "claimci.review.inventory._run_git",
+        lambda *_args, **_kwargs: b"",
+    )
+    monkeypatch.setattr(
+        "claimci.review.inventory._parse_change_entries",
+        lambda _encoded: (
+            ChangeEntry("z.py", ChangeStatus.ADDED),
+            ChangeEntry("a.py", ChangeStatus.ADDED),
+        ),
+    )
+
+    with pytest.raises(InventoryVerificationError) as raised:
+        build_git_change_inventory(
+            requested,
+            comparison,
+            head,
+            ComparisonBasis.DIRECT_BASE,
+        )
+
+    assert raised.value.code == "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"
 
 
 def test_gate_1_classifies_verified_inventory_content_disagreement(
@@ -820,9 +901,8 @@ def test_selection_truncation_is_partial_and_provider_ready(
     assert "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED" in _issue_codes(result, 2)
     assert result.gates[2].disposition is GateDisposition.PASS_PARTIAL
     assert "PREFLIGHT_G3_SELECTED_FILE_LIMIT" in _issue_codes(result, 3)
-    assert "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT" in _issue_codes(result, 3)
     assert result.scope is not None
-    assert len(result.scope.selected_paths) < 24
+    assert len(result.scope.selected_paths) == 24
     assert result.gates[2].metrics["synthesis_reserved_context_chars"] <= 60_000
     assert result.ready_for_provider is True
     assert result.review_status_ceiling is ReviewStatus.PARTIAL
@@ -848,7 +928,6 @@ def test_selected_file_limit_boundary_is_exact(
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
     )
-
     result = preflight_review(
         _declared_inputs(root, inventory), ReviewConfig(enabled=True)
     )
@@ -1020,6 +1099,10 @@ def test_gate_3_blocks_call_one_when_extraction_fits_but_synthesis_reserve_does_
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
     )
+    monkeypatch.setattr(
+        "claimci.review.preflight.worst_valid_synthesis_request_chars",
+        lambda *_args, **_kwargs: 60_001,
+    )
 
     result = preflight_review(inputs, ReviewConfig(enabled=True))
 
@@ -1029,7 +1112,7 @@ def test_gate_3_blocks_call_one_when_extraction_fits_but_synthesis_reserve_does_
     assert result.ready_for_provider is False
 
 
-def test_synthesis_reserve_covers_all_owner_references_missing_rows_and_audits(
+def test_synthesis_reserve_covers_the_enforced_all_input_allocator_envelope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "repo"
@@ -1115,10 +1198,108 @@ def test_synthesis_reserve_covers_all_owner_references_missing_rows_and_audits(
         }
         for index in range(4)
     ]
-    actual = build_synthesis_request_parts(claims, evidence, owners, {}, missing, audits)
-    actual_chars = logical_request_chars(actual.task, actual.payload, actual.schema)
+    allocation = allocate_synthesis_inputs(
+        claims,
+        evidence,
+        owners,
+        {},
+        missing,
+        audits,
+        max_chars=config.limits.max_context_chars,
+    )
+    actual_chars = logical_request_chars(
+        allocation.parts.task,
+        allocation.parts.payload,
+        allocation.parts.schema,
+    )
 
     assert worst_valid_synthesis_request_chars(scope, config.limits) >= actual_chars
+    assert any(allocation.omitted_counts.values())
+
+
+def test_synthesis_reserve_covers_mandatory_claim_identity_and_source_augmentation() -> None:
+    long_path = f"source/{'x' * 1_490}.py"
+    source_id = "source-long-path"
+    raw_claims = [
+        {
+            "source_text": "",
+            "claim_type": "other_scientific",
+            "subject": f"subject-{index}",
+            "metric": None,
+            "direction": "not_applicable",
+            "claimed_magnitude": None,
+            "qualifiers": [],
+            "source": {
+                "source_id": source_id,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            "confidence": 0.5,
+            "evidence_hints": [],
+        }
+        for index in range(16)
+    ]
+    fixed = len(
+        json.dumps(
+            {"claims": raw_claims},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    quote = "x" * ((24_000 - fixed) // len(raw_claims))
+    for claim in raw_claims:
+        claim["source_text"] = quote
+    assert len(
+        json.dumps(
+            {"claims": raw_claims},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    ) <= 24_000
+    claims = [
+        {
+            "claim_id": f"claim-{index:016x}",
+            **claim,
+            "source": {
+                **claim["source"],
+                "kind": "repository_file",
+                "path": long_path,
+            },
+        }
+        for index, claim in enumerate(raw_claims)
+    ]
+    owners = {claim["claim_id"]: [] for claim in claims}
+    actual = build_synthesis_request_parts(claims, (), owners, {}, (), ())
+    actual_chars = logical_request_chars(actual.task, actual.payload, actual.schema)
+    inventory = _inventory((ChangeEntry(long_path, ChangeStatus.ADDED),))
+    scope = ReviewScope(
+        mode="declared_changed_v1",
+        inventory=inventory,
+        issued_paths=(long_path,),
+        issued_changed_paths=(long_path,),
+        selected_paths=(long_path,),
+        sources=(
+            SourceRecord(
+                source_id=source_id,
+                kind=SourceKind.REPOSITORY_FILE,
+                path=long_path,
+                text=quote,
+                sha256="0" * 64,
+            ),
+        ),
+        seeds=(),
+        complete=True,
+        issues=(),
+        materialized_chars=len(quote),
+        materialized_path_chars=((long_path, len(quote)),),
+    )
+
+    reserved = worst_valid_synthesis_request_chars(scope, ReviewLimits())
+
+    assert actual_chars > 60_000
+    assert reserved >= actual_chars
 
 
 def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
@@ -1194,7 +1375,6 @@ def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
     result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
 
     assert result.preflight is not None and result.preflight.scope is not None
-    assert "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT" in _issue_codes(result.preflight, 3)
     assert len(provider.calls) == 2
     synthesis = provider.calls[1]
     actual_chars = logical_request_chars(
@@ -1203,6 +1383,212 @@ def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
     reserved = result.preflight.gates[2].metrics["synthesis_reserved_context_chars"]
     assert isinstance(reserved, int)
     assert actual_chars <= reserved <= 60_000
+    assert result.status is ReviewStatus.PARTIAL
+    assert "PREFLIGHT_G3_SYNTHESIS_MISSING_EVIDENCE_OMITTED" in _issue_codes(
+        result.preflight, 3
+    )
+
+
+def test_runtime_allocates_all_provider_valid_missing_rows_with_explicit_omissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    (root / "results.json").write_text('{"accuracy": 0.95}', encoding="utf-8")
+    inventory = _inventory((ChangeEntry("results.json", ChangeStatus.ADDED),))
+    inputs = _declared_inputs(root, inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls: list[StructuredRequest] = []
+
+        def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
+            self.calls.append(request)
+            title = next(
+                source
+                for source in request.payload["sources"]
+                if source["kind"] == "pull_request_title"
+            )
+            claims = [
+                {
+                    "source_text": inputs.pr_title,
+                    "claim_type": "other_scientific",
+                    "subject": f"subject-{claim_index}",
+                    "metric": None,
+                    "direction": "not_applicable",
+                    "claimed_magnitude": None,
+                    "qualifiers": [],
+                    "source": {
+                        "source_id": title["source_id"],
+                        "start_line": 1,
+                        "end_line": 1,
+                    },
+                    "confidence": 0.5,
+                    "evidence_hints": [
+                        f"unissued/{claim_index:02}-{hint_index:02}.json"
+                        for hint_index in range(32)
+                    ],
+                }
+                for claim_index in range(16)
+            ]
+            return ProviderResponse(
+                output_text=json.dumps({"claims": claims}),
+                provider="fake",
+                model="fake",
+            )
+
+        def synthesize_review(self, request: StructuredRequest) -> ProviderResponse:
+            self.calls.append(request)
+            rows = [
+                {
+                    "claim_id": claim["claim_id"],
+                    "interpretation": "Advisory interpretation.",
+                    "citations": [],
+                    "missing_evidence": ["The hinted artifact was not issued."],
+                    "unsupported_inferences": [],
+                    "confidence": 0.5,
+                }
+                for claim in request.payload["claims"]
+            ]
+            return ProviderResponse(
+                output_text=json.dumps({"interpretations": rows}),
+                provider="fake",
+                model="fake",
+            )
+
+    provider = Provider()
+    result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
+
+    assert len(result.evidence.missing) == 512
+    assert len(provider.calls) == 2
+    synthesis = provider.calls[1]
+    emitted_missing = len(synthesis.payload["missing_evidence"])
+    assert emitted_missing < len(result.evidence.missing)
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "SYNTHESIS_INPUTS_OMITTED"
+    assert result.preflight is not None
+    gate3 = result.preflight.gates[2]
+    omitted = len(result.evidence.missing) - emitted_missing
+    assert gate3.metrics["synthesis_missing_evidence_omitted_count"] == omitted
+    assert any(
+        issue.code == "PREFLIGHT_G3_SYNTHESIS_MISSING_EVIDENCE_OMITTED"
+        and issue.observed == omitted
+        for issue in gate3.reasons
+    )
+    actual = logical_request_chars(synthesis.task, synthesis.payload, synthesis.schema)
+    reserved = gate3.metrics["synthesis_reserved_context_chars"]
+    assert isinstance(reserved, int)
+    assert actual <= reserved <= 60_000
+
+
+def test_declared_audit_plan_trim_is_counted_and_forces_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    (root / "research.yaml").write_text("metric: accuracy\n", encoding="utf-8")
+    (root / "unissued-results.json").write_text("{}", encoding="utf-8")
+    inventory = _inventory((ChangeEntry("research.yaml", ChangeStatus.ADDED),))
+    inputs = _declared_inputs(
+        root,
+        inventory,
+        title="Benchmark accuracy improves by 5% in research.yaml",
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.plan_manifest_audits",
+        lambda *_args, **_kwargs: (
+            ManifestAuditPlan(
+                manifest_path="research.yaml",
+                paths=("research.yaml", "unissued-results.json"),
+            ),
+        ),
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls: list[StructuredRequest] = []
+
+        def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
+            self.calls.append(request)
+            title = next(
+                source
+                for source in request.payload["sources"]
+                if source["kind"] == "pull_request_title"
+            )
+            return ProviderResponse(
+                output_text=json.dumps(
+                    {
+                        "claims": [
+                            {
+                                "source_text": inputs.pr_title,
+                                "claim_type": "metric_improvement",
+                                "subject": "candidate",
+                                "metric": "accuracy",
+                                "direction": "higher",
+                                "claimed_magnitude": None,
+                                "qualifiers": [],
+                                "source": {
+                                    "source_id": title["source_id"],
+                                    "start_line": 1,
+                                    "end_line": 1,
+                                },
+                                "confidence": 0.5,
+                                "evidence_hints": [],
+                            }
+                        ]
+                    }
+                ),
+                provider="fake",
+                model="fake",
+            )
+
+        def synthesize_review(self, request: StructuredRequest) -> ProviderResponse:
+            self.calls.append(request)
+            claim_id = request.payload["claims"][0]["claim_id"]
+            return ProviderResponse(
+                output_text=json.dumps(
+                    {
+                        "interpretations": [
+                            {
+                                "claim_id": claim_id,
+                                "interpretation": "Advisory interpretation.",
+                                "citations": [],
+                                "missing_evidence": ["Audit dependency was not issued."],
+                                "unsupported_inferences": [],
+                                "confidence": 0.5,
+                            }
+                        ]
+                    }
+                ),
+                provider="fake",
+                model="fake",
+            )
+
+    provider = Provider()
+    result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
+
+    assert len(provider.calls) == 2
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "AUDIT_PLANS_OMITTED"
+    assert result.preflight is not None and result.preflight.scope is not None
+    gate3 = result.preflight.gates[2]
+    assert gate3.metrics["omitted_audit_plan_count"] == 1
+    assert gate3.metrics["omitted_audit_dependency_count"] == 1
+    assert {
+        "PREFLIGHT_G3_AUDIT_PLAN_OMITTED",
+        "PREFLIGHT_G3_AUDIT_DEPENDENCY_OMITTED",
+    }.issubset(_issue_codes(result.preflight, 3))
+    assert result.preflight.scope.complete is False
 
 
 @pytest.mark.parametrize(

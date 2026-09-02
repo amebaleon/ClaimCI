@@ -407,14 +407,26 @@ def build_git_change_inventory(
             "Git change metadata is unavailable",
         ) from exc
     entries = _parse_change_entries(encoded)
-    return ChangeInventory(
-        schema_version=1,
-        requested_base_sha=requested_base.sha,
-        comparison_base_sha=comparison_base.sha,
-        head_sha=head.sha,
-        comparison_basis=comparison_basis,
-        source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
-        declared_entry_count=len(entries),
-        complete=True,
-        entries=entries,
-    )
+    folded_paths = tuple(entry.path.casefold() for entry in entries)
+    if len(set(folded_paths)) != len(folded_paths):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_DUPLICATE_PATH",
+            "Git change metadata contains duplicate paths",
+        )
+    try:
+        return ChangeInventory(
+            schema_version=1,
+            requested_base_sha=requested_base.sha,
+            comparison_base_sha=comparison_base.sha,
+            head_sha=head.sha,
+            comparison_basis=comparison_basis,
+            source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
+            declared_entry_count=len(entries),
+            complete=True,
+            entries=entries,
+        )
+    except ReviewError as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "Git change metadata could not form a valid inventory",
+        ) from exc
