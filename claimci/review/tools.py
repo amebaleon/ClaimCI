@@ -294,6 +294,7 @@ def plan_manifest_audits(
     *,
     limits: ReviewLimits = ReviewLimits(),
     selected_paths: Sequence[str] = (),
+    issued_paths: Sequence[str] | None = None,
 ) -> tuple[ManifestAuditPlan, ...]:
     """Reserve safe manifest bundles before broad repository retrieval."""
 
@@ -312,11 +313,23 @@ def plan_manifest_audits(
         selected.add(relative)
     if len(selected) > limits.max_files:
         raise ReviewError("selected paths exceed the global review file limit")
+    issued: set[str] | None = None
+    if issued_paths is not None:
+        if not isinstance(issued_paths, Sequence) or isinstance(
+            issued_paths, (str, bytes)
+        ):
+            raise ReviewError("issued manifest paths must be a sequence")
+        issued = set()
+        for raw in issued_paths:
+            relative = _relative(raw)
+            if relative is None:
+                raise ReviewError("issued manifest path is unsafe")
+            issued.add(relative)
 
     plans: list[ManifestAuditPlan] = []
     for raw in manifest_paths:
         relative = _relative(raw)
-        if relative is None:
+        if relative is None or (issued is not None and relative not in issued):
             continue
         try:
             lexical_manifest = root / Path(relative)
@@ -325,19 +338,32 @@ def plan_manifest_audits(
             ):
                 continue
             lexical_artifacts = _declared_artifact_paths(root, relative)
-            if lexical_artifacts is None or any(
+            if lexical_artifacts is None:
+                continue
+            # Preserve the submitted lexical names. Admitted plans reject
+            # links before resolution; omitted plans never touch dependencies.
+            ordered_audit_paths = tuple(
+                dict.fromkeys((relative, *lexical_artifacts))
+            )
+            audit_paths = set(ordered_audit_paths)
+            if issued is not None and not audit_paths.issubset(issued):
+                # Retain lexical dependency names for the caller's structured
+                # omission accounting, but do not stat, open, parse, or audit
+                # any dependency outside the issued scope.
+                plans.append(
+                    ManifestAuditPlan(
+                        manifest_path=relative,
+                        paths=ordered_audit_paths,
+                    )
+                )
+                continue
+            if any(
                 _has_symlink_component(root, path) for path in lexical_artifacts
             ):
                 continue
             manifest = lexical_manifest.resolve()
             manifest.relative_to(root)
             load_research_spec(manifest, artifact_root=root)
-            # Count the declared lexical files.  Links were rejected before
-            # resolution, so these names preserve the submitted provenance.
-            ordered_audit_paths = tuple(
-                dict.fromkeys((relative, *lexical_artifacts))
-            )
-            audit_paths = set(ordered_audit_paths)
             if len(selected | audit_paths) > limits.max_files:
                 continue
             if any(

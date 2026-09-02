@@ -711,7 +711,14 @@ def test_changed_region_alone_surfaces_sentinel_behavior_in_final_interpretation
         provider=provider,
     )
 
-    assert result.status is ReviewStatus.COMPLETE
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.mode == "legacy_pairwise_v1"
+    assert result.preflight.scope.complete is False
+    assert any(
+        issue.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+        for issue in result.preflight.scope.issues
+    )
     assert result.error_code is None
     assert len(result.interpretations) == 1
     interpretation = result.interpretations[0]

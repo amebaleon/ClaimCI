@@ -385,6 +385,35 @@ def test_ready_legacy_scope_remains_compatible_and_is_explicitly_identified(
     assert len(provider.calls) == 2
 
 
+def test_provider_ready_partial_legacy_scope_is_retained_and_caps_status(
+    tmp_path: Path,
+) -> None:
+    """Known legacy scope loss must not disappear behind the compatibility path."""
+
+    title = (
+        "Benchmark accuracy improves by 5% in results.json while "
+        "private/missing.json is outside the bounded snapshot."
+    )
+    inputs = _inputs(tmp_path, title=title)
+    (inputs.repository_root / "results.json").write_text(
+        '{"accuracy": 0.95}\n', encoding="utf-8"
+    )
+    provider = FakeProvider(
+        extraction=lambda request: _extraction_output(request, title=title)
+    )
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.preflight is not None
+    assert result.preflight.scope is not None
+    assert result.preflight.scope.mode == "legacy_pairwise_v1"
+    assert result.preflight.ready_for_provider is True
+    assert result.preflight.review_status_ceiling is ReviewStatus.PARTIAL
+    assert result.preflight.scope.complete is False
+    assert result.status is ReviewStatus.PARTIAL
+    assert len(provider.calls) == 2
+
+
 def test_disabled_review_skips_preflight_and_default_provider_factory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1074,11 +1103,11 @@ def test_synthesis_audit_omission_preserves_full_authoritative_review_record(
 
 
 @pytest.mark.parametrize("normalized_metric", ["accuracy", None])
-def test_pr1_manifest_evidence_preempts_unrelated_heuristic_matches(
+def test_bounded_legacy_scope_does_not_materialize_unissued_manifest_dependencies(
     tmp_path: Path,
     normalized_metric: str | None,
 ) -> None:
-    """The PR's declared experiment must not be starved by broad retrieval."""
+    """A legacy shortlist stays authoritative when broad retrieval is truncated."""
 
     repository = tmp_path / "pull-request"
     demo = repository / "examples" / "day2_demo"
@@ -1144,8 +1173,8 @@ def test_pr1_manifest_evidence_preempts_unrelated_heuristic_matches(
                     {
                         "claim_id": claim_id,
                         "interpretation": (
-                            "The submitted score improves, but deterministic "
-                            "ClaimCI findings invalidate the stronger claim."
+                            "The issued result files support a bounded comparison; "
+                            "the unissued manifest bundle was not audited."
                         ),
                         "citations": citations,
                         "missing_evidence": [],
@@ -1163,10 +1192,140 @@ def test_pr1_manifest_evidence_preempts_unrelated_heuristic_matches(
         provider=provider,
     )
 
+    assert result.status is ReviewStatus.PARTIAL
+    assert len(provider.calls) == 2
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.mode == "legacy_pairwise_v1"
+    assert result.preflight.scope.complete is False
+    assert result.preflight.review_status_ceiling is ReviewStatus.PARTIAL
+    reason_codes = {
+        reason.code
+        for gate in result.preflight.gates
+        for reason in gate.reasons
+    }
+    assert {
+        "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
+        "PREFLIGHT_G3_SELECTED_FILE_LIMIT",
+    }.issubset(reason_codes)
+    assert result.deterministic_audits == ()
+
+    issued_paths = set(result.preflight.scope.issued_paths)
+    evidence_paths = {reference.path for reference in result.evidence.references}
+    extraction_paths = {
+        source["path"]
+        for source in provider.calls[0].payload["sources"]
+        if source["path"]
+    }
+    synthesis_paths = {
+        item["path"] for item in provider.calls[1].payload["evidence"]
+    }
+    assert "research.yaml" not in issued_paths
+    assert "research.yaml" not in extraction_paths | evidence_paths | synthesis_paths
+    assert extraction_paths <= issued_paths
+    assert evidence_paths <= issued_paths
+    assert synthesis_paths <= issued_paths
+    assert len(extraction_paths | evidence_paths) <= 24
+
+    issued_ids = {reference.evidence_id for reference in result.evidence.references}
+    assert set(result.interpretations[0].citations).issubset(issued_ids)
+    markdown = render_review_markdown(result)
+    assert (
+        "No deterministic ClaimCI audit snapshot was available for this bounded "
+        "review scope."
+    ) in markdown
+    assert "CONFIG.COMPUTE&#95;MISMATCH" not in markdown
+    assert "DATASET.EXACT&#95;LEAKAGE" not in markdown
+
+
+def test_fully_issued_manifest_bundle_retains_end_to_end_audit_coverage(
+    tmp_path: Path,
+) -> None:
+    """A small in-scope manifest bundle still reaches deterministic Audit."""
+
+    repository = tmp_path / "pull-request"
+    fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+    repository.mkdir()
+    renamed_datasets = {
+        "baseline-train.jsonl": "baseline-train-results.jsonl",
+        "baseline-eval.jsonl": "baseline-eval-results.jsonl",
+        "candidate-train.jsonl": "candidate-train-results.jsonl",
+        "candidate-eval.jsonl": "candidate-eval-results.jsonl",
+    }
+    for original in (
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "candidate-config.yaml",
+        "candidate-results.json",
+    ):
+        shutil.copyfile(fixture / original, repository / original)
+    for original, renamed in renamed_datasets.items():
+        shutil.copyfile(fixture / original, repository / renamed)
+    manifest_payload = yaml.safe_load(
+        (fixture / "research.yaml").read_text(encoding="utf-8")
+    )
+    for experiment_name in ("baseline", "candidate"):
+        for field in ("train_dataset", "eval_dataset"):
+            manifest_payload[experiment_name][field] = renamed_datasets[
+                manifest_payload[experiment_name][field]
+            ]
+    (repository / "research.yaml").write_text(
+        yaml.safe_dump(manifest_payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    title = "Candidate improves accuracy from 0.60 to 0.90"
+
+    def grounded_synthesis(request: StructuredRequest) -> str:
+        claim = _mapping(request.payload["claims"][0])
+        claim_id = claim["claim_id"]
+        citations = [
+            item["evidence_id"]
+            for item in request.payload["evidence"]
+            if claim_id in item["claim_ids"]
+        ]
+        return json.dumps(
+            {
+                "interpretations": [
+                    {
+                        "claim_id": claim_id,
+                        "interpretation": (
+                            "The submitted score improves, but deterministic "
+                            "ClaimCI findings invalidate the stronger claim."
+                        ),
+                        "citations": citations,
+                        "missing_evidence": [],
+                        "unsupported_inferences": [],
+                        "confidence": 0.95,
+                    }
+                ]
+            }
+        )
+
+    provider = FakeProvider(
+        extraction=lambda request: _extraction_output(request, title=title),
+        synthesis=grounded_synthesis,
+    )
+    result = run_review(
+        ReviewInputs(repository_root=repository, pr_title=title),
+        _config(max_files=24),
+        provider=provider,
+    )
+
     assert result.status is ReviewStatus.COMPLETE
     assert len(provider.calls) == 2
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.complete is True
+    assert {
+        "research.yaml",
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "candidate-config.yaml",
+        "candidate-results.json",
+        *renamed_datasets.values(),
+    }.issubset(result.preflight.scope.issued_paths)
     root_audit = next(
-        audit for audit in result.deterministic_audits if audit.manifest_path == "research.yaml"
+        audit
+        for audit in result.deterministic_audits
+        if audit.manifest_path == "research.yaml"
     )
     assert root_audit.verdict == "NOT_SUPPORTED"
     assert {
@@ -1174,27 +1333,8 @@ def test_pr1_manifest_evidence_preempts_unrelated_heuristic_matches(
         "RESULT.CLAIM_SUPPORTED",
         "DATASET.EXACT_LEAKAGE",
     }.issubset({finding.rule_id for finding in root_audit.findings})
-
-    declared_paths = (
-        "research.yaml",
-        *(f"examples/day2_demo/{name}" for name in artifact_names),
-    )
-    evidence_paths = tuple(reference.path for reference in result.evidence.references)
-    assert evidence_paths[: len(declared_paths)] == declared_paths
-    assert set(declared_paths).issubset(evidence_paths)
-    extraction_paths = {
-        source["path"]
-        for source in provider.calls[0].payload["sources"]
-        if source["path"]
-    }
-    assert len(extraction_paths | set(evidence_paths)) <= 24
-
     issued_ids = {reference.evidence_id for reference in result.evidence.references}
     assert set(result.interpretations[0].citations).issubset(issued_ids)
-    markdown = render_review_markdown(result)
-    assert "No deterministic ClaimCI audit evidence was discovered." not in markdown
-    assert "CONFIG.COMPUTE&#95;MISMATCH" in markdown
-    assert "DATASET.EXACT&#95;LEAKAGE" in markdown
 
 
 def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: Path) -> None:

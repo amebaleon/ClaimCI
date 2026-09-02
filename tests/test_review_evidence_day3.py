@@ -295,6 +295,46 @@ def test_arbitrary_shell_hint_is_not_promoted_to_review_evidence(tmp_path: Path)
     assert bundle.routing_incomplete is True
 
 
+def test_test_path_submission_runner_is_config_and_requires_changed_identity(
+    tmp_path: Path,
+) -> None:
+    """A test-like directory must not grant shell runners SOURCE/TEST bypass."""
+
+    path = "tests/eval.sh"
+    _write(tmp_path, path, "python run_eval.py --model candidate\n")
+    claim = _claim("held_out_evaluation")
+    claim = replace(claim, evidence_hints=(path,))
+
+    unchanged = discover_evidence(
+        tmp_path,
+        [claim],
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(),
+    )
+
+    assert unchanged.references == ()
+    assert any(
+        item.requested_path == path and item.reason == "route_mismatch"
+        for item in unchanged.missing
+    )
+    assert unchanged.routing_incomplete is True
+
+    changed = discover_evidence(
+        tmp_path,
+        [claim],
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    reference = next(item for item in changed.references if item.path == path)
+    assert reference.kind is EvidenceKind.CONFIG
+    assert reference.provenance is EvidenceProvenance.SUPPORTING_ARTIFACT
+    assert reference.claim_ids == (claim.claim_id,)
+    assert changed.routing_incomplete is False
+
+
 def test_provider_normalization_terms_cannot_expand_beyond_the_exact_quote(
     tmp_path: Path,
 ) -> None:

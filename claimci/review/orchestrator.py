@@ -805,7 +805,7 @@ def run_review(
         planned_legacy = preflight_review(inputs, config)
         preflight = (
             planned_legacy
-            if planned_legacy.review_status_ceiling is ReviewStatus.COMPLETE
+            if planned_legacy.ready_for_provider
             else legacy_preflight_failure(inputs, config)
         )
     if preflight is not None and not preflight.ready_for_provider:
@@ -857,6 +857,11 @@ def run_review(
                 inputs.repository_root,
                 manifest_candidates,
                 limits=config.limits,
+                issued_paths=(
+                    sources.repository_paths
+                    if preflight_sources is not None
+                    else None
+                ),
             ),
             changed_paths=sources.changed_paths,
         )

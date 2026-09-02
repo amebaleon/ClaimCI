@@ -1504,14 +1504,19 @@ def test_declared_audit_plan_trim_is_counted_and_forces_partial(
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
     )
-    monkeypatch.setattr(
-        "claimci.review.orchestrator.plan_manifest_audits",
-        lambda *_args, **_kwargs: (
+    planning: dict[str, object] = {}
+
+    def planned_audits(*_args: object, **kwargs: object) -> tuple[ManifestAuditPlan, ...]:
+        planning["issued_paths"] = kwargs.get("issued_paths")
+        return (
             ManifestAuditPlan(
                 manifest_path="research.yaml",
                 paths=("research.yaml", "unissued-results.json"),
             ),
-        ),
+        )
+
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.plan_manifest_audits", planned_audits
     )
 
     class Provider:
@@ -1589,6 +1594,7 @@ def test_declared_audit_plan_trim_is_counted_and_forces_partial(
         "PREFLIGHT_G3_AUDIT_DEPENDENCY_OMITTED",
     }.issubset(_issue_codes(result.preflight, 3))
     assert result.preflight.scope.complete is False
+    assert planning["issued_paths"] == result.preflight.scope.issued_paths
 
 
 @pytest.mark.parametrize(

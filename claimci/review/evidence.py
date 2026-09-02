@@ -245,8 +245,11 @@ def _kind(path: str) -> EvidenceKind:
     name = PurePosixPath(path).name.casefold()
     tokens = _tokens(lowered)
     segments = set(PurePosixPath(lowered).parts)
+    material_kind = classify_review_material(path)
     if name in {"research.yaml", "research.yml"}:
         return EvidenceKind.MANIFEST
+    if material_kind is ReviewMaterialKind.SUBMISSION_CONFIG:
+        return EvidenceKind.CONFIG
     # File format is authoritative for implementation evidence.  A source
     # filename such as ``config.py`` must not bypass the changed-file policy
     # merely because its stem also names another evidence category.
@@ -258,9 +261,6 @@ def _kind(path: str) -> EvidenceKind:
         return EvidenceKind.TEST
     if is_source_file(path):
         return EvidenceKind.SOURCE
-    material_kind = classify_review_material(path)
-    if material_kind is ReviewMaterialKind.SUBMISSION_CONFIG:
-        return EvidenceKind.CONFIG
     if tokens & {"result", "results", "metric", "metrics", "score", "scores"}:
         return EvidenceKind.RESULTS
     if tokens & {"config", "configs", "configuration", "configurations"} or name.endswith((".yaml", ".yml", ".toml")):
@@ -574,12 +574,12 @@ def _matches(
     tokens = _tokens(lowered)
     kind = _kind(path)
 
-    if (
-        PurePosixPath(path).suffix.casefold() in {".sh", ".bash"}
-        and classify_review_material(path)
-        is not ReviewMaterialKind.SUBMISSION_CONFIG
-    ):
-        return False
+    material_kind = classify_review_material(path)
+    if PurePosixPath(path).suffix.casefold() in {".sh", ".bash"}:
+        if material_kind is not ReviewMaterialKind.SUBMISSION_CONFIG:
+            return False
+        if path not in changed_paths:
+            return False
 
     if (
         claim.claim_type in _CHANGED_SOURCE_CLAIMS
@@ -969,9 +969,9 @@ def discover_evidence(
                 )
                 continue
             material_kind = classify_review_material(normalized)
-            if (
-                PurePosixPath(normalized).suffix.casefold() in {".sh", ".bash"}
-                and material_kind is not ReviewMaterialKind.SUBMISSION_CONFIG
+            if PurePosixPath(normalized).suffix.casefold() in {".sh", ".bash"} and (
+                material_kind is not ReviewMaterialKind.SUBMISSION_CONFIG
+                or normalized not in changed
             ):
                 missing.append(
                     MissingEvidence(
