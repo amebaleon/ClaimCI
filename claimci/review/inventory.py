@@ -54,6 +54,8 @@ def _git_environment() -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
             "GCM_INTERACTIVE": "Never",
@@ -155,6 +157,8 @@ def _run_git(root: Path, arguments: tuple[str, ...], *, stdout_limit: int) -> by
     for reader in readers:
         reader.join(timeout=1.0)
 
+    if any(reader.is_alive() for reader in readers):
+        raise _GitCommandError("git output reader did not terminate")
     if stdout_overflow.is_set() or stderr_overflow.is_set():
         raise _GitOutputLimitError("git output exceeded bound")
     if timed_out or return_code != 0:
@@ -179,20 +183,31 @@ def _verify_snapshot(identity: SnapshotIdentity) -> None:
         raise ReviewError("snapshot SHA identity mismatch")
 
     try:
-        status = _run_git(
+        _run_git(
+            identity.root,
+            ("diff-index", "--cached", "--quiet", "HEAD", "--"),
+            stdout_limit=0,
+        )
+    except (_GitCommandError, _GitOutputLimitError) as exc:
+        raise ReviewError("snapshot index is dirty or unavailable") from exc
+
+    try:
+        worktree_changes = _run_git(
             identity.root,
             (
-                "status",
-                "--porcelain=v1",
+                "ls-files",
+                "--modified",
+                "--deleted",
+                "--others",
+                "--directory",
+                "--no-empty-directory",
                 "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
             ),
             stdout_limit=1,
         )
     except (_GitCommandError, _GitOutputLimitError) as exc:
-        raise ReviewError("snapshot worktree is dirty or status is unavailable") from exc
-    if status:
+        raise ReviewError("snapshot worktree is dirty or unavailable") from exc
+    if worktree_changes:
         raise ReviewError("snapshot worktree is dirty")
 
 

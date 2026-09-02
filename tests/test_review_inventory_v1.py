@@ -7,7 +7,9 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -328,6 +330,15 @@ def _direct_inventory(graph: dict[str, object]) -> ChangeInventory:
         _identity(SnapshotRole.REQUESTED_BASE, direct_root, direct_sha),
         _identity(SnapshotRole.COMPARISON_BASE, direct_root, direct_sha),
         _identity(SnapshotRole.HEAD, head_root, head_sha),
+        ComparisonBasis.DIRECT_BASE,
+    )
+
+
+def _same_snapshot_inventory(root: Path, sha: str) -> ChangeInventory:
+    return build_git_change_inventory(
+        _identity(SnapshotRole.REQUESTED_BASE, root, sha),
+        _identity(SnapshotRole.COMPARISON_BASE, root, sha),
+        _identity(SnapshotRole.HEAD, root, sha),
         ComparisonBasis.DIRECT_BASE,
     )
 
@@ -672,3 +683,211 @@ def test_git_inventory_is_byte_for_byte_deterministic(
 
     assert first == second
     assert serialized(first) == serialized(second)
+
+
+def _filter_sentinel_repository(tmp_path: Path) -> tuple[Path, str]:
+    root = (tmp_path / "filtered-repository").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    _write(root, ".gitattributes", "filtered.txt filter=danger\n")
+    _write(root, "filtered.txt", "clean\n")
+    sha = _commit(root, "filtered base")
+    return root, sha
+
+
+def _command_argv(*values: str) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(values)
+    return shlex.join(values)
+
+
+@pytest.mark.parametrize("filter_mode", ["clean", "process"])
+def test_git_cleanliness_never_invokes_configured_clean_or_process_filter(
+    tmp_path: Path, filter_mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    root, sha = _filter_sentinel_repository(tmp_path)
+    marker = tmp_path / f"{filter_mode}-filter-ran.txt"
+    helper = tmp_path / f"{filter_mode}-filter.py"
+    helper.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('invoked', encoding='utf-8')\n"
+        "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    command = _command_argv(sys.executable, str(helper), str(marker))
+    _git(root, "config", f"filter.danger.{filter_mode}", command)
+    _write(root, "filtered.txt", "dirty\n")
+    calls: list[tuple[str, ...]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object):
+        argv = args[0]
+        assert isinstance(argv, tuple)
+        calls.append(argv)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(inventory_module.subprocess, "Popen", recording_popen)
+
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+    assert not marker.exists()
+    assert not any("status" in argv for argv in calls)
+
+
+def test_git_cleanliness_does_not_traverse_dirty_submodule_worktree(
+    tmp_path: Path,
+) -> None:
+    submodule_source = (tmp_path / "submodule-source").resolve()
+    submodule_source.mkdir()
+    _git(submodule_source, "init", "-q")
+    _git(submodule_source, "config", "user.email", "tests@claimci.invalid")
+    _git(submodule_source, "config", "user.name", "ClaimCI Tests")
+    _write(submodule_source, ".gitattributes", "filtered.txt filter=danger\n")
+    _write(submodule_source, "filtered.txt", "clean\n")
+    _commit(submodule_source, "submodule base")
+
+    root = (tmp_path / "superproject").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    _git(
+        root,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(submodule_source),
+        "deps/submodule",
+    )
+    sha = _commit(root, "superproject base")
+
+    marker = tmp_path / "submodule-filter-ran.txt"
+    helper = tmp_path / "submodule-filter.py"
+    helper.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('invoked', encoding='utf-8')\n"
+        "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    command = _command_argv(sys.executable, str(helper), str(marker))
+    submodule_root = root / "deps" / "submodule"
+    _git(submodule_root, "config", "filter.danger.clean", command)
+    _write(submodule_root, "filtered.txt", "dirty\n")
+
+    inventory = _same_snapshot_inventory(root, sha)
+    assert inventory.entries == ()
+    assert not marker.exists()
+
+
+def test_git_inventory_ignores_malicious_replace_refs(
+    divergent_git_graph: dict[str, object],
+) -> None:
+    repository = divergent_git_graph["repository"]
+    direct = divergent_git_graph["direct"]
+    requested = divergent_git_graph["requested"]
+    assert isinstance(repository, Path)
+    assert isinstance(direct, str) and isinstance(requested, str)
+    expected = _direct_inventory(divergent_git_graph)
+
+    _git(repository, "replace", direct, requested)
+    try:
+        assert _direct_inventory(divergent_git_graph) == expected
+    finally:
+        _git(repository, "replace", "-d", direct)
+
+
+def test_git_inventory_never_lazy_fetches_a_promised_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    root = (tmp_path / "promisor-repository").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    _write(root, "tracked.txt", "tracked\n")
+    sha = _commit(root, "promised commit")
+
+    marker = tmp_path / "remote-helper-ran.txt"
+    helper_directory = tmp_path / "helpers"
+    helper_directory.mkdir()
+    helper = helper_directory / (
+        "git-remote-sentinel.cmd" if os.name == "nt" else "git-remote-sentinel"
+    )
+    if os.name == "nt":
+        helper.write_text(f"@echo invoked>{marker}\n@exit /b 1\n", encoding="utf-8")
+    else:
+        helper.write_text(f"#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\nexit 1\n", encoding="utf-8")
+        os.chmod(helper, 0o700)
+    monkeypatch.setenv("PATH", str(helper_directory) + os.pathsep + os.environ["PATH"])
+    _git(root, "config", "core.repositoryformatversion", "1")
+    _git(root, "config", "extensions.partialclone", "origin")
+    _git(root, "config", "remote.origin.url", "sentinel::missing")
+    _git(root, "config", "remote.origin.promisor", "true")
+    _git(root, "config", "remote.origin.partialclonefilter", "blob:none")
+
+    object_path = root / ".git" / "objects" / sha[:2] / sha[2:]
+    backup = tmp_path / "promised-object-backup"
+    object_path.replace(backup)
+    environments: list[dict[str, str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object):
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        environments.append(environment)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(inventory_module.subprocess, "Popen", recording_popen)
+    try:
+        with pytest.raises((TypeError, ValueError)):
+            _same_snapshot_inventory(root, sha)
+        assert not marker.exists()
+        assert environments
+        assert all(env.get("GIT_NO_REPLACE_OBJECTS") == "1" for env in environments)
+        assert all(env.get("GIT_NO_LAZY_FETCH") == "1" for env in environments)
+    finally:
+        backup.replace(object_path)
+
+
+def test_git_runner_rejects_reader_that_remains_alive_after_join(
+    divergent_git_graph: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    roots = divergent_git_graph["roots"]
+    direct = divergent_git_graph["direct"]
+    assert isinstance(roots, dict) and isinstance(direct, str)
+    root = roots["direct"]
+    assert isinstance(root, Path)
+    release = inventory_module.threading.Event()
+    original_drain = inventory_module._drain_bounded
+
+    def delayed_drain(
+        stream: object,
+        limit: int,
+        sink: bytearray,
+        overflow: object,
+    ) -> None:
+        release.wait(timeout=5.0)
+        original_drain(stream, limit, sink, overflow)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(inventory_module, "_drain_bounded", delayed_drain)
+    try:
+        with pytest.raises(inventory_module._GitCommandError, match="reader"):
+            inventory_module._run_git(
+                root,
+                ("cat-file", "-e", f"{direct}^{{commit}}"),
+                stdout_limit=0,
+            )
+    finally:
+        release.set()
