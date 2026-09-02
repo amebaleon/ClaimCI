@@ -933,6 +933,22 @@ def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal
             relative,
         )
         _git(root / relative, "checkout", "-q", gitlink_v1)
+    _write(
+        root,
+        ".gitmodules",
+        "[submodule \"deps/added\"]\n"
+        "\tpath = deps/added\n"
+        f"\turl = {submodule_source.as_posix()}\n"
+        "\tignore = all\n"
+        "[submodule \"deps/deleted\"]\n"
+        "\tpath = deps/deleted\n"
+        f"\turl = {submodule_source.as_posix()}\n"
+        "\tignore = all\n"
+        "[submodule \"deps/modified\"]\n"
+        "\tpath = deps/modified\n"
+        f"\turl = {submodule_source.as_posix()}\n"
+        "\tignore = all\n",
+    )
     base = _commit(root, "base gitlinks")
     base_root = (tmp_path / "base-snapshot").resolve()
     _git(root, "worktree", "add", "-q", "--detach", str(base_root), base)

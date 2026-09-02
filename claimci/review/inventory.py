@@ -390,6 +390,7 @@ def build_git_change_inventory(
                 "-z",
                 "--no-renames",
                 "--no-ext-diff",
+                "--ignore-submodules=none",
                 comparison_base.sha,
                 head.sha,
             ),
