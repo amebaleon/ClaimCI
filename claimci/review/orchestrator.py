@@ -64,6 +64,7 @@ from .tools import (
     ManifestAuditPlan,
     discover_manifests,
     plan_manifest_audits,
+    revalidate_manifest_audit_input_identities,
     run_manifest_audits,
     select_relevant_manifest_audit_plans,
 )
@@ -868,21 +869,27 @@ def run_review(
             sources.repository_paths,
             max_manifests=min(4, config.limits.max_files),
         )
+        audit_issued_paths = (
+            sources.repository_paths if preflight_sources is not None else None
+        )
+        audit_selected_paths = (
+            preflight.scope.selected_paths
+            if preflight is not None and preflight.scope is not None
+            else ()
+        )
         audit_plans = select_relevant_manifest_audit_plans(
             plan_manifest_audits(
                 inputs.repository_root,
                 manifest_candidates,
                 limits=config.limits,
-                issued_paths=(
-                    sources.repository_paths
-                    if preflight_sources is not None
-                    else None
-                ),
+                selected_paths=audit_selected_paths,
+                issued_paths=audit_issued_paths,
             ),
             changed_paths=sources.changed_paths,
         )
         omitted_audit_plan_count = 0
         omitted_audit_dependency_count = 0
+        invalidated_audit_plan_count = 0
         if preflight_sources is not None:
             issued_paths = set(preflight_sources.repository_paths)
             retained_audit_plans = tuple(
@@ -922,6 +929,53 @@ def run_review(
                 audit_plans,
                 max_files=config.limits.max_files,
             )
+        # Deterministic authority consumes the exact reserved inputs before an
+        # untrusted provider can mutate the checkout.  Later provider-time
+        # validation is identity-only and never re-plans or re-runs Audit.
+        deterministic_audits = run_manifest_audits(
+            inputs.repository_root,
+            manifest_candidates,
+            limits=config.limits,
+            selected_paths=audit_selected_paths,
+            reserved_plans=audit_plans,
+            issued_paths=audit_issued_paths,
+        )
+        completed_audit_manifests = {
+            snapshot.manifest_path for snapshot in deterministic_audits
+        }
+        invalidated_audit_plan_count = sum(
+            plan.manifest_path not in completed_audit_manifests
+            for plan in audit_plans
+        )
+        preflight = _record_runtime_gate3_omissions(
+            preflight,
+            (
+                (
+                    "PREFLIGHT_G3_AUDIT_PLAN_INVALIDATED",
+                    "invalidated_audit_plan_count",
+                    invalidated_audit_plan_count,
+                ),
+            ),
+        )
+        if invalidated_audit_plan_count:
+            return finish(
+                ReviewStatus.PARTIAL,
+                deterministic_audits=deterministic_audits,
+                error_code="AUDIT_PLANS_INVALIDATED",
+                error_message=(
+                    f"{invalidated_audit_plan_count} pre-provider deterministic "
+                    "audit plan(s) failed exact revalidation or execution and "
+                    "were omitted from this bounded advisory review."
+                ),
+            )
+        plans_by_manifest = {
+            plan.manifest_path: plan for plan in audit_plans
+        }
+        audit_bundles = tuple(
+            ManifestAuditBundle(snapshot=snapshot, paths=plan.paths)
+            for snapshot in deterministic_audits
+            if (plan := plans_by_manifest.get(snapshot.manifest_path)) is not None
+        )
         extraction_parts = build_extraction_request_parts(
             sources, config.limits.max_claims
         )
@@ -981,6 +1035,49 @@ def run_review(
             )
         if extraction_call.output_chars > config.limits.max_output_chars:
             raise ReviewError("provider extraction output exceeds configured limit")
+        retained_audit_plans = revalidate_manifest_audit_input_identities(
+            inputs.repository_root,
+            audit_plans,
+            limits=config.limits,
+            issued_paths=audit_issued_paths,
+        )
+        retained_audit_keys = {
+            (plan.manifest_path, plan.paths) for plan in retained_audit_plans
+        }
+        invalidated_audit_plan_count = sum(
+            (plan.manifest_path, plan.paths) not in retained_audit_keys
+            for plan in audit_plans
+        )
+        if invalidated_audit_plan_count:
+            retained_manifests = {
+                plan.manifest_path for plan in retained_audit_plans
+            }
+            deterministic_audits = tuple(
+                snapshot
+                for snapshot in deterministic_audits
+                if snapshot.manifest_path in retained_manifests
+            )
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_AUDIT_PLAN_INVALIDATED",
+                        "invalidated_audit_plan_count",
+                        invalidated_audit_plan_count,
+                    ),
+                ),
+            )
+            return finish(
+                ReviewStatus.PARTIAL,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="AUDIT_PLANS_INVALIDATED",
+                error_message=(
+                    f"{invalidated_audit_plan_count} exact deterministic Audit "
+                    "input bundle(s) changed or became unavailable after the "
+                    "pre-provider snapshot; synthesis was skipped."
+                ),
+            )
         claim_validation = validate_claim_candidates_best_effort(
             _parse_json(extraction_response.output_text),
             sources,
@@ -992,19 +1089,6 @@ def run_review(
             raise ReviewError(
                 "all extracted claim candidates failed deterministic source validation"
             )
-        deterministic_audits = run_manifest_audits(
-            inputs.repository_root,
-            manifest_candidates,
-            limits=config.limits,
-        )
-        plans_by_manifest = {
-            plan.manifest_path: plan for plan in audit_plans
-        }
-        audit_bundles = tuple(
-            ManifestAuditBundle(snapshot=snapshot, paths=plan.paths)
-            for snapshot in deterministic_audits
-            if (plan := plans_by_manifest.get(snapshot.manifest_path)) is not None
-        )
         selected_paths = (
             set(preflight.scope.selected_paths)
             if preflight is not None and preflight.scope is not None

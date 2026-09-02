@@ -244,6 +244,87 @@ def _declared_run_inputs(
     )
 
 
+def _declared_manifest_run_inputs(
+    tmp_path: Path,
+) -> tuple[ReviewInputs, ChangeInventory, Path, tuple[str, ...]]:
+    """Build a complete declared scope whose Audit bundle is fully issued."""
+
+    repository = (tmp_path / "manifest-head").resolve()
+    base = (tmp_path / "manifest-base").resolve()
+    repository.mkdir()
+    base.mkdir()
+    fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+    renamed_datasets = {
+        "baseline-train.jsonl": "baseline-train-results.jsonl",
+        "baseline-eval.jsonl": "baseline-eval-results.jsonl",
+        "candidate-train.jsonl": "candidate-train-results.jsonl",
+        "candidate-eval.jsonl": "candidate-eval-results.jsonl",
+    }
+    for original in (
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "candidate-config.yaml",
+        "candidate-results.json",
+    ):
+        shutil.copyfile(fixture / original, repository / original)
+    for original, renamed in renamed_datasets.items():
+        shutil.copyfile(fixture / original, repository / renamed)
+    manifest_payload = yaml.safe_load(
+        (fixture / "research.yaml").read_text(encoding="utf-8")
+    )
+    for experiment_name in ("baseline", "candidate"):
+        for field in ("train_dataset", "eval_dataset"):
+            manifest_payload[experiment_name][field] = renamed_datasets[
+                manifest_payload[experiment_name][field]
+            ]
+    manifest = repository / "research.yaml"
+    manifest.write_text(
+        yaml.safe_dump(manifest_payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    issued_paths = tuple(
+        sorted(
+            (
+                "research.yaml",
+                "baseline-config.yaml",
+                "baseline-results.json",
+                "candidate-config.yaml",
+                "candidate-results.json",
+                *renamed_datasets.values(),
+            )
+        )
+    )
+    requested_sha = "3" * 40
+    head_sha = "4" * 40
+    inventory = ChangeInventory(
+        schema_version=1,
+        requested_base_sha=requested_sha,
+        comparison_base_sha=requested_sha,
+        head_sha=head_sha,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
+        declared_entry_count=len(issued_paths),
+        complete=True,
+        entries=tuple(
+            ChangeEntry(path, ChangeStatus.ADDED) for path in issued_paths
+        ),
+    )
+    inputs = ReviewInputs(
+        repository_root=repository,
+        pr_title="Candidate improves accuracy from 0.60 to 0.90",
+        pr_description="The complete manifest bundle is declared and bounded.",
+        requested_base=SnapshotIdentity(
+            SnapshotRole.REQUESTED_BASE, base, requested_sha
+        ),
+        comparison_base=SnapshotIdentity(
+            SnapshotRole.COMPARISON_BASE, base, requested_sha
+        ),
+        head=SnapshotIdentity(SnapshotRole.HEAD, repository, head_sha),
+        inventory=inventory,
+    )
+    return inputs, inventory, manifest, issued_paths
+
+
 def _wrap_pipeline(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
     """Trace every trusted stage while retaining its implementation."""
 
@@ -451,12 +532,14 @@ def test_run_review_uses_exact_extract_discover_tools_synthesize_sequence(
         "sources",
         "manifests",
         "plans",
+        "audits",
         "extract_claims",
         "validate",
-        "audits",
         "evidence",
         "synthesize_review",
     ]
+    assert events.count("plans") == 1
+    assert events.count("audits") == 1
     assert len(provider.calls) == 2
     assert provider.calls[0].task == "extract_claims"
     assert provider.calls[1].task == "synthesize_review"
@@ -1335,6 +1418,255 @@ def test_fully_issued_manifest_bundle_retains_end_to_end_audit_coverage(
     }.issubset({finding.rule_id for finding in root_audit.findings})
     issued_ids = {reference.evidence_id for reference in result.evidence.references}
     assert set(result.interpretations[0].citations).issubset(issued_ids)
+
+
+def test_extraction_time_manifest_drift_never_broadens_reserved_audit_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider-time manifest edit must not authorize a new Audit input."""
+
+    inputs, inventory, manifest, issued_paths = _declared_manifest_run_inputs(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    unissued = inputs.repository_root / "private" / "unissued-results.json"
+    unissued.parent.mkdir()
+    unissued.write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {"seed": 1, "accuracy": 0.99},
+                    {"seed": 2, "accuracy": 0.99},
+                    {"seed": 3, "accuracy": 0.99},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    unissued_accesses: list[str] = []
+    original_stat = Path.stat
+    original_open = Path.open
+
+    def traced_stat(path: Path, *args: Any, **kwargs: Any):
+        if path == unissued:
+            unissued_accesses.append("stat")
+        return original_stat(path, *args, **kwargs)
+
+    def traced_open(path: Path, *args: Any, **kwargs: Any):
+        if path == unissued:
+            unissued_accesses.append("open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", traced_stat)
+    monkeypatch.setattr(Path, "open", traced_open)
+
+    def extraction(request: StructuredRequest) -> str:
+        payload = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        payload["candidate"]["results"] = "private/unissued-results.json"
+        manifest.write_text(
+            yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+        )
+        return _extraction_output(request, title=inputs.pr_title)
+
+    def grounded_synthesis(request: StructuredRequest) -> str:
+        claim = _mapping(request.payload["claims"][0])
+        claim_id = claim["claim_id"]
+        citations = [
+            item["evidence_id"]
+            for item in request.payload["evidence"]
+            if claim_id in item["claim_ids"]
+        ]
+        return json.dumps(
+            {
+                "interpretations": [
+                    {
+                        "claim_id": claim_id,
+                        "interpretation": (
+                            "Only the originally issued evidence bundle was "
+                            "eligible for this bounded review."
+                        ),
+                        "citations": citations,
+                        "missing_evidence": [],
+                        "unsupported_inferences": [],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+    provider = FakeProvider(
+        extraction=extraction,
+        synthesis=grounded_synthesis,
+    )
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert unissued_accesses == []
+    assert result.deterministic_audits == ()
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "AUDIT_PLANS_INVALIDATED"
+    assert len(provider.calls) == 1
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert set(result.preflight.scope.issued_paths) == set(issued_paths)
+    gate3 = result.preflight.gates[2]
+    assert gate3.metrics["invalidated_audit_plan_count"] == 1
+    assert any(
+        reason.code == "PREFLIGHT_G3_AUDIT_PLAN_INVALIDATED"
+        for reason in gate3.reasons
+    )
+
+
+def test_reserved_manifest_audit_failure_is_typed_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silently missing reserved Audit result must not preserve COMPLETE."""
+
+    inputs, inventory, _manifest, _issued_paths = _declared_manifest_run_inputs(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    def unavailable_audit(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("local deterministic audit unavailable")
+
+    monkeypatch.setattr(
+        "claimci.review.tools.audit_research", unavailable_audit
+    )
+    provider = FakeProvider(
+        extraction=lambda request: _extraction_output(
+            request, title=inputs.pr_title
+        )
+    )
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "AUDIT_PLANS_INVALIDATED"
+    assert result.deterministic_audits == ()
+    assert len(provider.calls) == 0
+    assert result.preflight is not None
+    assert result.preflight.gates[2].metrics[
+        "invalidated_audit_plan_count"
+    ] == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "manifest_metric",
+        "manifest_minimum_improvement",
+        "manifest_direction",
+        "issued_result",
+    ),
+)
+def test_extraction_time_same_path_drift_discards_pre_provider_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Exact Audit inputs are immutable even when lexical paths do not change."""
+
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.tools as review_tools
+
+    inputs, inventory, manifest, _issued_paths = _declared_manifest_run_inputs(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    planning_calls: list[tuple[ManifestAuditPlan, ...]] = []
+    audit_calls: list[str] = []
+    parse_calls: list[str] = []
+    pre_provider_snapshots: list[tuple[DeterministicAuditSnapshot, ...]] = []
+    original_plan = orchestrator.plan_manifest_audits
+    original_run = orchestrator.run_manifest_audits
+    original_audit = review_tools.audit_research
+    original_declared_paths = review_tools._declared_artifact_paths
+
+    def traced_plan(*args: Any, **kwargs: Any) -> tuple[ManifestAuditPlan, ...]:
+        plans = original_plan(*args, **kwargs)
+        planning_calls.append(plans)
+        return plans
+
+    def traced_run(
+        *args: Any, **kwargs: Any
+    ) -> tuple[DeterministicAuditSnapshot, ...]:
+        snapshots = original_run(*args, **kwargs)
+        pre_provider_snapshots.append(snapshots)
+        return snapshots
+
+    def traced_audit(path: Path, *args: Any, **kwargs: Any) -> Any:
+        audit_calls.append(path.name)
+        return original_audit(path, *args, **kwargs)
+
+    def traced_declared_paths(*args: Any, **kwargs: Any) -> Any:
+        parse_calls.append(str(args[1]))
+        return original_declared_paths(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "plan_manifest_audits", traced_plan)
+    monkeypatch.setattr(orchestrator, "run_manifest_audits", traced_run)
+    monkeypatch.setattr(review_tools, "audit_research", traced_audit)
+    monkeypatch.setattr(
+        review_tools, "_declared_artifact_paths", traced_declared_paths
+    )
+
+    counts_at_extraction: dict[str, int] = {}
+
+    def extraction(request: StructuredRequest) -> str:
+        counts_at_extraction.update(
+            plans=len(planning_calls),
+            audits=len(audit_calls),
+            parses=len(parse_calls),
+        )
+        if mutation.startswith("manifest_"):
+            payload = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+            if mutation == "manifest_metric":
+                payload["claim"]["metric"] = "loss"
+            elif mutation == "manifest_minimum_improvement":
+                payload["claim"]["minimum_improvement"] = 0.25
+            else:
+                payload["claim"]["direction"] = "lower"
+            manifest.write_text(
+                yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+            )
+        else:
+            result_path = inputs.repository_root / "candidate-results.json"
+            result_path.write_text(
+                result_path.read_text(encoding="utf-8").replace("0.90", "0.10"),
+                encoding="utf-8",
+            )
+        return _extraction_output(request, title=inputs.pr_title)
+
+    provider = FakeProvider(extraction=extraction)
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert counts_at_extraction == {
+        "plans": 1,
+        "audits": 1,
+        "parses": len(parse_calls),
+    }
+    assert len(planning_calls) == 1
+    assert planning_calls[0] and all(
+        plan.input_sha256 for plan in planning_calls[0]
+    )
+    assert len(pre_provider_snapshots) == 1
+    assert len(audit_calls) == 1
+    assert pre_provider_snapshots[0][0].metric == "accuracy"
+    assert pre_provider_snapshots[0][0].minimum_improvement == 0.05
+    assert pre_provider_snapshots[0][0].direction == "higher"
+    assert result.deterministic_audits == ()
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "AUDIT_PLANS_INVALIDATED"
+    assert len(provider.calls) == 1
 
 
 def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: Path) -> None:

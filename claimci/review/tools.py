@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any
@@ -13,6 +13,7 @@ import yaml
 
 from claimci.audit import audit_research, load_research_spec
 from claimci.models import AuditResult, ClaimCIError
+from claimci.passive_files import PassiveFileError, inspect_confined_regular_file
 from claimci.parsing import load_unique_yaml
 
 from .models import ReviewError, ReviewLimits
@@ -66,6 +67,9 @@ class ManifestAuditPlan:
 
     manifest_path: str
     paths: tuple[str, ...]
+    input_sha256: tuple[tuple[str, str | None], ...] = field(
+        default=(), compare=False, repr=False
+    )
 
 
 def select_relevant_manifest_audit_plans(
@@ -288,6 +292,65 @@ def _bounded_text(root: Path, path: Path, limits: ReviewLimits) -> bool:
         return False
 
 
+def _capture_manifest_input_sha256(
+    root: Path,
+    paths: Sequence[str],
+    limits: ReviewLimits,
+) -> tuple[tuple[str, str | None], ...] | None:
+    """Capture exact bounded identities without discovering any new path."""
+
+    identities: list[tuple[str, str | None]] = []
+    for raw in paths:
+        relative = _relative(raw)
+        if relative is None or relative != raw:
+            return None
+        try:
+            inspection = inspect_confined_regular_file(
+                root,
+                relative,
+                max_bytes=limits.max_file_chars * 4,
+            )
+        except PassiveFileError as exc:
+            if exc.code != "unavailable":
+                return None
+            # Missing evidence is a meaningful deterministic Audit input.  It
+            # receives a stable null identity, while every other inspection
+            # failure invalidates the reservation.
+            try:
+                (root / Path(relative)).lstat()
+            except FileNotFoundError:
+                identities.append((relative, None))
+                continue
+            except OSError:
+                return None
+            return None
+        identities.append((relative, inspection.sha256))
+    return tuple(identities)
+
+
+def _valid_manifest_input_sha256(plan: ManifestAuditPlan) -> bool:
+    """Validate the private identity payload carried by a reserved plan."""
+
+    identities = plan.input_sha256
+    if not isinstance(identities, tuple) or len(identities) != len(plan.paths):
+        return False
+    hexadecimal = frozenset("0123456789abcdef")
+    return all(
+        isinstance(item, tuple)
+        and len(item) == 2
+        and item[0] == path
+        and (
+            item[1] is None
+            or (
+                isinstance(item[1], str)
+                and len(item[1]) == 64
+                and set(item[1]).issubset(hexadecimal)
+            )
+        )
+        for path, item in zip(plan.paths, identities)
+    )
+
+
 def plan_manifest_audits(
     repository_root: Path,
     manifest_paths: Sequence[str],
@@ -371,11 +434,17 @@ def plan_manifest_audits(
                 for artifact_path in lexical_artifacts
             ):
                 continue
+            input_sha256 = _capture_manifest_input_sha256(
+                root, ordered_audit_paths, limits
+            )
+            if input_sha256 is None:
+                continue
             selected.update(audit_paths)
             plans.append(
                 ManifestAuditPlan(
                     manifest_path=relative,
                     paths=ordered_audit_paths,
+                    input_sha256=input_sha256,
                 )
             )
         except (ClaimCIError, ReviewError, OSError, ValueError, RuntimeError):
@@ -385,26 +454,262 @@ def plan_manifest_audits(
     return tuple(plans)
 
 
+def _revalidate_reserved_manifest_audit_plans(
+    root: Path,
+    manifest_paths: Sequence[str],
+    reserved_plans: Sequence[ManifestAuditPlan],
+    *,
+    limits: ReviewLimits,
+    selected_paths: Sequence[str],
+    issued_paths: Sequence[str] | None,
+) -> tuple[ManifestAuditPlan, ...]:
+    """Admit only unchanged exact plans without expanding their path boundary."""
+
+    if not isinstance(reserved_plans, Sequence) or isinstance(
+        reserved_plans, (str, bytes)
+    ):
+        raise ReviewError("reserved manifest audit plans must be a sequence")
+    if not all(isinstance(plan, ManifestAuditPlan) for plan in reserved_plans):
+        raise ReviewError("reserved manifest audit plans contain an invalid value")
+    candidates = {
+        relative
+        for raw in manifest_paths
+        if (relative := _relative(raw)) is not None
+    }
+    if not isinstance(selected_paths, Sequence) or isinstance(
+        selected_paths, (str, bytes)
+    ):
+        raise ReviewError("selected manifest paths must be a sequence")
+    selected: set[str] = set()
+    for raw in selected_paths:
+        relative = _relative(raw)
+        if relative is None:
+            raise ReviewError("selected manifest path is unsafe")
+        selected.add(relative)
+    if len(selected) > limits.max_files:
+        raise ReviewError("selected paths exceed the global review file limit")
+    issued: set[str] | None = None
+    if issued_paths is not None:
+        if not isinstance(issued_paths, Sequence) or isinstance(
+            issued_paths, (str, bytes)
+        ):
+            raise ReviewError("issued manifest paths must be a sequence")
+        issued = set()
+        for raw in issued_paths:
+            relative = _relative(raw)
+            if relative is None:
+                raise ReviewError("issued manifest path is unsafe")
+            issued.add(relative)
+
+    admitted: list[ManifestAuditPlan] = []
+    for plan in reserved_plans:
+        relative = _relative(plan.manifest_path)
+        if not isinstance(plan.paths, Sequence) or isinstance(
+            plan.paths, (str, bytes)
+        ):
+            continue
+        normalized_paths = tuple(_relative(path) for path in plan.paths)
+        if (
+            relative is None
+            or relative not in candidates
+            or not normalized_paths
+            or any(path is None for path in normalized_paths)
+            or normalized_paths != plan.paths
+            or normalized_paths[0] != relative
+            or len(set(normalized_paths)) != len(normalized_paths)
+        ):
+            continue
+        plan_paths = set(normalized_paths)
+        # A reserved plan never grants authority to a path omitted from the
+        # coordinate-bound scope. Reject it before touching even its manifest.
+        if issued is not None and not plan_paths.issubset(issued):
+            continue
+        if len(selected | plan_paths) > limits.max_files:
+            continue
+        reserved_input_sha256 = plan.input_sha256
+        if reserved_input_sha256 and not _valid_manifest_input_sha256(plan):
+            continue
+        current_input_sha256 = _capture_manifest_input_sha256(
+            root, normalized_paths, limits
+        )
+        if current_input_sha256 is None or (
+            reserved_input_sha256
+            and current_input_sha256 != reserved_input_sha256
+        ):
+            continue
+        try:
+            lexical_manifest = root / Path(relative)
+            if _has_symlink_component(root, relative) or not _bounded_text(
+                root, lexical_manifest, limits
+            ):
+                continue
+            lexical_artifacts = _declared_artifact_paths(root, relative)
+            if lexical_artifacts is None:
+                continue
+            current_paths = tuple(
+                dict.fromkeys((relative, *lexical_artifacts))
+            )
+            # Parsing the issued manifest may reveal drift, but a changed
+            # declaration is never followed, statted, or substituted into the
+            # exact pre-provider plan.
+            if current_paths != normalized_paths:
+                continue
+            if any(
+                _has_symlink_component(root, path)
+                for path in lexical_artifacts
+            ):
+                continue
+            manifest = lexical_manifest.resolve()
+            manifest.relative_to(root)
+            load_research_spec(manifest, artifact_root=root)
+            if any(
+                not _bounded_text(root, root / Path(artifact_path), limits)
+                for artifact_path in lexical_artifacts
+            ):
+                continue
+            if (
+                _capture_manifest_input_sha256(root, normalized_paths, limits)
+                != current_input_sha256
+            ):
+                continue
+            selected.update(plan_paths)
+            admitted.append(
+                ManifestAuditPlan(
+                    manifest_path=relative,
+                    paths=normalized_paths,
+                    input_sha256=current_input_sha256,
+                )
+            )
+        except (ClaimCIError, ReviewError, OSError, ValueError, RuntimeError):
+            continue
+    return tuple(admitted)
+
+
+def revalidate_manifest_audit_input_identities(
+    repository_root: Path,
+    reserved_plans: Sequence[ManifestAuditPlan],
+    *,
+    limits: ReviewLimits = ReviewLimits(),
+    issued_paths: Sequence[str] | None = None,
+) -> tuple[ManifestAuditPlan, ...]:
+    """Retain exact plans whose already-issued bytes remain unchanged.
+
+    This identity-only post-provider check never parses a manifest, discovers
+    dependencies, or runs deterministic Audit.  It re-captures only the paths
+    frozen into an existing reservation.
+    """
+
+    root = _root(repository_root)
+    if not isinstance(limits, ReviewLimits):
+        raise ReviewError("manifest audit limits must be ReviewLimits")
+    if not isinstance(reserved_plans, Sequence) or isinstance(
+        reserved_plans, (str, bytes)
+    ):
+        raise ReviewError("reserved manifest audit plans must be a sequence")
+    if not all(isinstance(plan, ManifestAuditPlan) for plan in reserved_plans):
+        raise ReviewError("reserved manifest audit plans contain an invalid value")
+    issued: set[str] | None = None
+    if issued_paths is not None:
+        if not isinstance(issued_paths, Sequence) or isinstance(
+            issued_paths, (str, bytes)
+        ):
+            raise ReviewError("issued manifest paths must be a sequence")
+        issued = set()
+        for raw in issued_paths:
+            relative = _relative(raw)
+            if relative is None:
+                raise ReviewError("issued manifest path is unsafe")
+            issued.add(relative)
+
+    retained: list[ManifestAuditPlan] = []
+    selected: set[str] = set()
+    for plan in reserved_plans:
+        if not isinstance(plan.paths, Sequence) or isinstance(
+            plan.paths, (str, bytes)
+        ):
+            continue
+        normalized_paths = tuple(_relative(path) for path in plan.paths)
+        if (
+            not normalized_paths
+            or any(path is None for path in normalized_paths)
+            or normalized_paths != plan.paths
+            or len(set(normalized_paths)) != len(normalized_paths)
+        ):
+            continue
+        plan_paths = set(normalized_paths)
+        if issued is not None and not plan_paths.issubset(issued):
+            continue
+        if len(selected | plan_paths) > limits.max_files:
+            continue
+        # Empty identities preserve compatibility for manually constructed
+        # legacy plans.  Production plans always carry exact captures.
+        if not plan.input_sha256:
+            retained.append(plan)
+            selected.update(plan_paths)
+            continue
+        if not _valid_manifest_input_sha256(plan):
+            continue
+        current = _capture_manifest_input_sha256(root, plan.paths, limits)
+        if current == plan.input_sha256:
+            retained.append(plan)
+            selected.update(plan_paths)
+    return tuple(retained)
+
+
 def collect_manifest_audits(
     repository_root: Path,
     manifest_paths: Sequence[str],
     *,
     limits: ReviewLimits = ReviewLimits(),
     selected_paths: Sequence[str] = (),
+    reserved_plans: Sequence[ManifestAuditPlan] | None = None,
+    issued_paths: Sequence[str] | None = None,
 ) -> tuple[ManifestAuditBundle, ...]:
-    """Run planned audits and retain their exact lexical input paths."""
+    """Run planned audits and retain their exact lexical input paths.
+
+    Existing callers may omit ``reserved_plans`` and retain discovery-time
+    planning. Coordinate-bound callers pass their pre-provider plans so this
+    step can only revalidate those exact paths and cannot broaden after model
+    execution.
+    """
 
     root = _root(repository_root)
-    plans = plan_manifest_audits(
-        root,
-        manifest_paths,
-        limits=limits,
-        selected_paths=selected_paths,
-    )
+    if not isinstance(limits, ReviewLimits):
+        raise ReviewError("manifest audit limits must be ReviewLimits")
+    if reserved_plans is None:
+        plans = plan_manifest_audits(
+            root,
+            manifest_paths,
+            limits=limits,
+            selected_paths=selected_paths,
+            issued_paths=issued_paths,
+        )
+        plans = _revalidate_reserved_manifest_audit_plans(
+            root,
+            manifest_paths,
+            plans,
+            limits=limits,
+            selected_paths=selected_paths,
+            issued_paths=issued_paths,
+        )
+    else:
+        plans = _revalidate_reserved_manifest_audit_plans(
+            root,
+            manifest_paths,
+            reserved_plans,
+            limits=limits,
+            selected_paths=selected_paths,
+            issued_paths=issued_paths,
+        )
     bundles: list[ManifestAuditBundle] = []
     for plan in plans:
         try:
             result = audit_research(root / Path(plan.manifest_path), artifact_root=root)
+            if plan.input_sha256 and (
+                _capture_manifest_input_sha256(root, plan.paths, limits)
+                != plan.input_sha256
+            ):
+                continue
             bundles.append(
                 ManifestAuditBundle(
                     snapshot=snapshot_audit_result(result, repository_root=root),
@@ -422,6 +727,8 @@ def run_manifest_audits(
     *,
     limits: ReviewLimits = ReviewLimits(),
     selected_paths: Sequence[str] = (),
+    reserved_plans: Sequence[ManifestAuditPlan] | None = None,
+    issued_paths: Sequence[str] | None = None,
 ) -> tuple[DeterministicAuditSnapshot, ...]:
     """Compatibility view returning only immutable deterministic snapshots."""
 
@@ -432,5 +739,7 @@ def run_manifest_audits(
             manifest_paths,
             limits=limits,
             selected_paths=selected_paths,
+            reserved_plans=reserved_plans,
+            issued_paths=issued_paths,
         )
     )

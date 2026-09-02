@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from claimci.audit import audit_research
 from claimci.models import AuditResult, Finding, Impact, Severity, Verdict
@@ -155,6 +156,71 @@ candidate:
         ),
     )
     assert opened and set(opened) == {"research.yaml"}
+
+
+@pytest.mark.parametrize("use_reserved_plan", [True, False])
+def test_manifest_allowlist_rejects_drift_without_dependency_access(
+    study_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    use_reserved_plan: bool,
+) -> None:
+    """Neither exact execution nor its allowlisted public fallback may broaden."""
+
+    manifest = study_factory()
+    root = manifest.parent
+    issued_paths = (
+        "research.yaml",
+        "base/config.yaml",
+        "base/results.json",
+        "base/train.jsonl",
+        "base/eval.jsonl",
+        "candidate/config.yaml",
+        "candidate/results.json",
+        "candidate/train.jsonl",
+        "candidate/eval.jsonl",
+    )
+    plans = plan_manifest_audits(
+        root,
+        ("research.yaml",),
+        issued_paths=issued_paths,
+    )
+    assert len(plans) == 1
+
+    unissued = root / "private" / "unissued-results.json"
+    unissued.parent.mkdir()
+    unissued.write_text(
+        '{"runs":[{"seed":1,"accuracy":0.99}]}\n', encoding="utf-8"
+    )
+    payload = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    payload["candidate"]["results"] = "private/unissued-results.json"
+    manifest.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    unissued_accesses: list[str] = []
+    original_stat = Path.stat
+    original_open = Path.open
+
+    def traced_stat(path: Path, *args, **kwargs):
+        if path == unissued:
+            unissued_accesses.append("stat")
+        return original_stat(path, *args, **kwargs)
+
+    def traced_open(path: Path, *args, **kwargs):
+        if path == unissued:
+            unissued_accesses.append("open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", traced_stat)
+    monkeypatch.setattr(Path, "open", traced_open)
+
+    kwargs = {"issued_paths": issued_paths}
+    if use_reserved_plan:
+        kwargs["reserved_plans"] = plans
+    snapshots = run_manifest_audits(root, ("research.yaml",), **kwargs)
+
+    assert snapshots == ()
+    assert unissued_accesses == []
 
 
 def test_manifest_audit_rejects_internal_symlink_artifacts(study_factory) -> None:
