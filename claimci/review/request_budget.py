@@ -15,7 +15,14 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
-from .models import ReviewError, ReviewLimits, ReviewScope, ScopeIssue, SourceBundle
+from .models import (
+    ReviewError,
+    ReviewLimits,
+    ReviewScope,
+    ScopeIssue,
+    SourceBundle,
+    SourceRecord,
+)
 
 
 REVIEW_SYSTEM_POLICY = (
@@ -605,9 +612,9 @@ def output_budget_ready(limits: ReviewLimits) -> bool:
 def _reserved_claims(
     max_claims: int,
     max_output_chars: int,
-    repository_paths: Sequence[str] = (),
+    sources: Sequence[SourceRecord] = (),
 ) -> list[dict[str, Any]]:
-    """Model provider-bounded claim JSON plus deterministic validation fields."""
+    """Model provider-bounded claims plus worst trusted source augmentation."""
 
     raw_claims = [
         {
@@ -636,12 +643,17 @@ def _reserved_claims(
         1,
         max_output_chars - base + 1,
     )
-    source_path = (
-        max(repository_paths, key=lambda path: (serialized_chars(path), path))
-        if repository_paths
-        else None
+    source_augmentations = tuple(
+        (source.kind.value, source.path) for source in sources
     )
-    source_kind = "repository_file" if source_path is not None else "pull_request_title"
+    source_kind, source_path = max(
+        source_augmentations or (("pull_request_description", None),),
+        key=lambda item: (
+            serialized_chars({"kind": item[0], "path": item[1]}),
+            item[0],
+            item[1] or "",
+        ),
+    )
     return [
         {
             "claim_id": f"claim-{index:016x}",
@@ -708,13 +720,10 @@ def worst_valid_synthesis_request_chars(
 
     if not isinstance(scope, ReviewScope) or not isinstance(limits, ReviewLimits):
         raise ReviewError("synthesis reservation requires scope and ReviewLimits")
-    repository_paths = tuple(
-        source.path for source in scope.sources if source.path is not None
-    )
     claims = _reserved_claims(
         limits.max_claims,
         limits.max_output_chars,
-        repository_paths,
+        scope.sources,
     )
     owners = {claim["claim_id"]: [] for claim in claims}
     mandatory = build_synthesis_request_parts(

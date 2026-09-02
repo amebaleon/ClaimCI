@@ -19,6 +19,7 @@ from claimci.review.models import (
     ChangeStatus,
     ComparisonBasis,
     GateDisposition,
+    MaterialClaimSeed,
     PreflightGateResult,
     ReviewConfig,
     ReviewLimits,
@@ -2060,6 +2061,154 @@ def test_synthesis_reserve_covers_all_claim_numeric_and_location_normalization()
     assert actual_chars == 60_001
     assert reserved >= actual_chars
     assert gate3.disposition is GateDisposition.FAIL
+
+
+def test_synthesis_reserve_uses_worst_actual_source_augmentation_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.review.orchestrator as orchestrator_module
+    import claimci.review.preflight as preflight_module
+
+    source_id = "source-1111111111111111"
+    raw_claims = [
+        {
+            "source_text": "",
+            "claim_type": "other_scientific",
+            "subject": f"subject-{index}",
+            "metric": None,
+            "direction": "not_applicable",
+            "claimed_magnitude": {
+                "raw": "1e15",
+                "value": 1e15,
+                "unit": None,
+                "kind": "relative",
+            },
+            "qualifiers": [],
+            "source": {
+                "source_id": source_id,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            "confidence": 1,
+            "evidence_hints": [],
+        }
+        for index in range(16)
+    ]
+
+    def raw_output() -> str:
+        return json.dumps(
+            {"claims": raw_claims},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).replace('"value":1000000000000000.0', '"value":1e15')
+
+    fixed = len(raw_output())
+    prefix = "Benchmark accuracy improves by 5%; see a.py. "
+    quote_length = (24_000 - fixed) // len(raw_claims)
+    quote = prefix + "x" * (quote_length - len(prefix))
+    subject_padding = 24_000 - fixed - len(quote) * len(raw_claims)
+    for claim in raw_claims:
+        claim["source_text"] = quote
+    raw_claims[0]["subject"] += "y" * subject_padding
+    serialized_raw = raw_output()
+    source = SourceRecord(
+        source_id=source_id,
+        kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+        path=None,
+        text="\n" * 9_999 + quote,
+        sha256="0" * 64,
+    )
+    validation = validate_claim_candidates_best_effort(
+        json.loads(serialized_raw),
+        SourceBundle(
+            sources=(source,),
+            repository_paths=("a.py",),
+            total_chars=len(source.text),
+        ),
+    )
+    claims = validation.claims
+    parts = build_synthesis_request_parts(
+        claims,
+        (),
+        {claim.claim_id: () for claim in claims},
+        {},
+        (),
+        (),
+    )
+    actual_chars = logical_request_chars(parts.task, parts.payload, parts.schema)
+    scope = ReviewScope(
+        mode="legacy_pairwise_v1",
+        inventory=_inventory((ChangeEntry("a.py", ChangeStatus.ADDED),)),
+        issued_paths=("a.py",),
+        issued_changed_paths=("a.py",),
+        selected_paths=("a.py",),
+        sources=(source,),
+        seeds=(
+            MaterialClaimSeed(
+                origin_source_id=source_id,
+                category="comparative_causal",
+                route_terms=("improves",),
+            ),
+        ),
+        complete=True,
+        issues=(),
+        materialized_chars=len(source.text) + 1,
+        materialized_path_chars=(("a.py", 1),),
+    )
+    config = ReviewConfig(
+        enabled=True,
+        limits=ReviewLimits(max_context_chars=37_000),
+    )
+
+    reserved = worst_valid_synthesis_request_chars(scope, config.limits)
+    gate3 = preflight_module._gate3(scope, config)
+
+    assert len(serialized_raw) == 24_000
+    assert len(claims) == 16
+    assert all(claim.source.start_line == 10_000 for claim in claims)
+    assert actual_chars == 37_089
+    assert reserved >= actual_chars
+    assert gate3.disposition is GateDisposition.FAIL
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("x", encoding="utf-8")
+    constructions = 0
+
+    class SentinelProvider:
+        def extract_claims(self, _request: StructuredRequest) -> ProviderResponse:
+            return ProviderResponse(
+                output_text='{"claims":[]}',
+                provider="fake",
+                model="fake-model",
+            )
+
+        def synthesize_review(self, _request: StructuredRequest) -> ProviderResponse:
+            return ProviderResponse(
+                output_text='{"interpretations":[]}',
+                provider="fake",
+                model="fake-model",
+            )
+
+    def provider_sentinel(**_kwargs: Any) -> SentinelProvider:
+        nonlocal constructions
+        constructions += 1
+        return SentinelProvider()
+
+    monkeypatch.setattr(preflight_module, "build_review_scope", lambda *_args: scope)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "OpenAIReviewerProvider",
+        provider_sentinel,
+    )
+    result = run_review(ReviewInputs(repository_root=root), config)
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "PREFLIGHT_G3_SYNTHESIS_RESERVED_CONTEXT_LIMIT"
+    assert result.provider_calls == ()
+    assert constructions == 0
 
 
 def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
