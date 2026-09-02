@@ -614,7 +614,9 @@ def _reserved_claims(
             "direction": "not_applicable",
             "claimed_magnitude": None,
             "qualifiers": [],
-            "confidence": 1.0,
+            # Extraction accepts the shortest JSON number spelling, while
+            # validation normalizes confidence to float for synthesis.
+            "confidence": 1,
             "evidence_hints": [],
         }
         for index in range(max_claims)
@@ -637,6 +639,7 @@ def _reserved_claims(
         {
             "claim_id": f"claim-{index:016x}",
             **claim,
+            "confidence": float(claim["confidence"]),
             "source": {
                 **claim["source"],
                 "kind": source_kind,

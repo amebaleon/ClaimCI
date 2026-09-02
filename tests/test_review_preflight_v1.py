@@ -28,6 +28,7 @@ from claimci.review.models import (
     ScopeIssue,
     SnapshotIdentity,
     SnapshotRole,
+    SourceBundle,
     SourceKind,
     SourceRecord,
 )
@@ -38,6 +39,7 @@ from claimci.review.inventory import (
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.preflight import build_review_scope, preflight_review, scope_source_bundle
 from claimci.review.provider import ProviderResponse, StructuredRequest
+from claimci.review.sources import validate_claim_candidates
 from claimci.review.tools import ManifestAuditPlan
 from claimci.review.request_budget import (
     RequestParts,
@@ -1753,6 +1755,103 @@ def test_synthesis_reserve_uses_worst_exact_serialized_source_path() -> None:
     assert len(longer_plain_path) > len(more_escaped_path)
     assert actual_chars == 62_855
     assert reserved >= actual_chars
+
+
+def test_synthesis_reserve_covers_accepted_integer_confidence_normalization() -> None:
+    import claimci.review.preflight as preflight_module
+
+    escaped_path = "sourcé/" + ('"' * 728) + ".py"
+    source_id = "source-escaped-path"
+    raw_claims = [
+        {
+            "source_text": "",
+            "claim_type": "other_scientific",
+            "subject": f"subject-{index}",
+            "metric": None,
+            "direction": "not_applicable",
+            "claimed_magnitude": None,
+            "qualifiers": [],
+            "source": {
+                "source_id": source_id,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            "confidence": 1,
+            "evidence_hints": [],
+        }
+        for index in range(16)
+    ]
+    fixed = len(
+        json.dumps(
+            {"claims": raw_claims},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    quote = "x" * ((24_000 - fixed) // len(raw_claims))
+    subject_padding = 24_000 - fixed - len(quote) * len(raw_claims)
+    for claim in raw_claims:
+        claim["source_text"] = quote
+    raw_claims[0]["subject"] += "y" * subject_padding
+    raw_chars = len(
+        json.dumps(
+            {"claims": raw_claims},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    source = SourceRecord(
+        source_id=source_id,
+        kind=SourceKind.REPOSITORY_FILE,
+        path=escaped_path,
+        text=quote,
+        sha256="0" * 64,
+    )
+    claims = validate_claim_candidates(
+        {"claims": raw_claims},
+        SourceBundle(
+            sources=(source,),
+            repository_paths=(escaped_path,),
+            total_chars=len(quote),
+        ),
+    )
+    parts = build_synthesis_request_parts(
+        claims,
+        (),
+        {claim.claim_id: () for claim in claims},
+        {},
+        (),
+        (),
+    )
+    actual_chars = logical_request_chars(parts.task, parts.payload, parts.schema)
+    inventory = _inventory((ChangeEntry(escaped_path, ChangeStatus.ADDED),))
+    scope = ReviewScope(
+        mode="declared_changed_v1",
+        inventory=inventory,
+        issued_paths=(escaped_path,),
+        issued_changed_paths=(escaped_path,),
+        selected_paths=(escaped_path,),
+        sources=(source,),
+        seeds=(),
+        complete=True,
+        issues=(),
+        materialized_chars=len(quote),
+        materialized_path_chars=((escaped_path, len(quote)),),
+    )
+
+    reserved = worst_valid_synthesis_request_chars(scope, ReviewLimits())
+    gate3 = preflight_module._gate3(scope, ReviewConfig(enabled=True))
+
+    assert raw_chars == 24_000
+    assert all(claim.confidence == 1.0 for claim in claims)
+    assert actual_chars == 60_017
+    assert reserved >= actual_chars
+    assert gate3.disposition is GateDisposition.FAIL
+    assert {
+        issue.code for issue in gate3.reasons
+    } == {"PREFLIGHT_G3_SYNTHESIS_RESERVED_CONTEXT_LIMIT"}
 
 
 def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
