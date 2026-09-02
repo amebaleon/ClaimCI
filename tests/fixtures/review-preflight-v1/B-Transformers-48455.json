@@ -1,0 +1,4 @@
+{"schema_version":1,"candidate":"B-Transformers-48455","repository":"huggingface/transformers","pull_request":48455,"requested_base_sha":"8e35c981dbdb2caf75b341023e243d834f829b2b","comparison_base_sha":"8e35c981dbdb2caf75b341023e243d834f829b2b","head_sha":"7d6d2ca28ac3be64204d49b89cf0651bd8ed923f","comparison_basis":"direct_base","declared_entry_count":2,"entries":[
+  {"path":"src/transformers/models/glm5_next/modeling_glm5_next.py","status":"modified"},
+  {"path":"src/transformers/models/glm5_next/modular_glm5_next.py","status":"modified"}
+]}

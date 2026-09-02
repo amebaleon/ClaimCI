@@ -39,7 +39,6 @@ from .models import (
     ScientificClaim,
     SourceBundle,
 )
-from .openai_provider import OpenAIReviewerProvider
 from .provider import ProviderResponse, ReviewerProvider, StructuredRequest
 
 
@@ -316,6 +315,8 @@ def run_analysis_review(
     if provider is None:
         if config.provider != "openai":
             raise ReviewError("configured analysis review provider is unavailable")
+        from .openai_provider import OpenAIReviewerProvider
+
         provider = OpenAIReviewerProvider(
             model=config.model,
             timeout_seconds=config.limits.timeout_seconds,

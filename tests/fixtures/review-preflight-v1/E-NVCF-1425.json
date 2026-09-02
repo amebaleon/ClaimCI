@@ -1,0 +1,12 @@
+{"schema_version":1,"candidate":"E-NVCF-1425","repository":"NVIDIA/nvcf","pull_request":1425,"requested_base_sha":"72485b3e08a08461474fef5d0977456a6544e73a","comparison_base_sha":"812a162ad964c077357a86a69f8f08ba11f87d9b","head_sha":"c2a1dd54782e17a2eb443b428cd01eb9964abdd1","comparison_basis":"merge_base","declared_entry_count":10,"entries":[
+  {"path":"examples/load-tests/README.md","status":"modified"},
+  {"path":"examples/load-tests/llm-gateway/README.md","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/chat_completions_stream_test.js","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/chat_completions_test.js","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/embeddings_test.js","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/gateway_health_test.js","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/lib/common.js","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/responses_test.js","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/test-configs/k6_llm_breakpoint_config.json","status":"added"},
+  {"path":"examples/load-tests/llm-gateway/test-configs/k6_llm_smoke_config.json","status":"added"}
+]}
