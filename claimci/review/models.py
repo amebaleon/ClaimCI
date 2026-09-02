@@ -49,6 +49,20 @@ class SourceKind(str, Enum):
     REPOSITORY_FILE = "repository_file"
 
 
+class ReviewMaterialKind(str, Enum):
+    """Passive material categories used only to plan evidence routes."""
+
+    DOCUMENT = "document"
+    SOURCE = "source"
+    TEST = "test"
+    CONFIG = "config"
+    RESULT = "result"
+    MANIFEST = "manifest"
+    BENCHMARK = "benchmark"
+    SUBMISSION_CONFIG = "submission_config"
+    OTHER = "other"
+
+
 class ReviewStatus(str, Enum):
     DISABLED = "DISABLED"
     COMPLETE = "COMPLETE"
@@ -462,6 +476,126 @@ class SourceBundle:
             or self.total_chars != sum(len(source.text) for source in self.sources)
         ):
             raise ReviewError("source total_chars is inconsistent")
+
+
+@dataclass(frozen=True)
+class MaterialClaimSeed:
+    """Deterministic routing metadata, never a scientific claim or evidence."""
+
+    origin_source_id: str
+    category: str
+    route_terms: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _nonempty_text(self.origin_source_id, "material seed origin_source_id", max_chars=128)
+        category = _nonempty_text(self.category, "material seed category", max_chars=64)
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", category):
+            raise ReviewError("material seed category must be a lowercase identifier")
+        if not isinstance(self.route_terms, tuple) or not self.route_terms:
+            raise ReviewError("material seed route_terms must be a non-empty tuple")
+        if not all(
+            isinstance(term, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9_.+-]*", term)
+            and len(term) <= 128
+            for term in self.route_terms
+        ):
+            raise ReviewError("material seed route_terms are invalid")
+        if tuple(sorted(set(self.route_terms))) != self.route_terms:
+            raise ReviewError("material seed route_terms must be sorted and unique")
+
+
+@dataclass(frozen=True)
+class ScopeIssue:
+    """Stable, content-free explanation of one bounded-scope omission."""
+
+    code: str
+    path: str | None = None
+    observed: int | None = None
+    limit: int | None = None
+
+    def __post_init__(self) -> None:
+        code = _nonempty_text(self.code, "scope issue code", max_chars=128)
+        if not re.fullmatch(r"PREFLIGHT_G[123]_[A-Z0-9_]+", code):
+            raise ReviewError("scope issue code is invalid")
+        if self.path is not None:
+            object.__setattr__(self, "path", _portable_inventory_path(self.path))
+        for label in ("observed", "limit"):
+            value = getattr(self, label)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ReviewError(
+                    f"scope issue {label} must be a non-negative integer or null"
+                )
+
+
+@dataclass(frozen=True)
+class ReviewScope:
+    """Complete inventory plus its bounded, deterministic materialization plan."""
+
+    mode: str
+    inventory: ChangeInventory
+    issued_paths: tuple[str, ...]
+    issued_changed_paths: tuple[str, ...]
+    selected_paths: tuple[str, ...]
+    sources: tuple[SourceRecord, ...]
+    seeds: tuple[MaterialClaimSeed, ...]
+    complete: bool
+    issues: tuple[ScopeIssue, ...]
+    materialized_chars: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"declared_changed_v1", "legacy_pairwise_v1"}:
+            raise ReviewError("review scope mode is invalid")
+        if not isinstance(self.inventory, ChangeInventory):
+            raise ReviewError("review scope inventory is invalid")
+        for label in ("issued_paths", "issued_changed_paths", "selected_paths"):
+            values = getattr(self, label)
+            if not isinstance(values, tuple):
+                raise ReviewError(f"review scope {label} must be a tuple")
+            normalized = tuple(_portable_inventory_path(path) for path in values)
+            if normalized != values or len(set(values)) != len(values):
+                raise ReviewError(
+                    f"review scope {label} must contain unique canonical paths"
+                )
+        issued = set(self.issued_paths)
+        selected = set(self.selected_paths)
+        if not set(self.issued_changed_paths).issubset(issued):
+            raise ReviewError("issued changed paths must be issued paths")
+        if not selected.issubset(issued):
+            raise ReviewError("selected paths must be issued paths")
+        inventory_head_paths = {
+            entry.path
+            for entry in self.inventory.entries
+            if entry.status is not ChangeStatus.DELETED
+        }
+        if not set(self.issued_changed_paths).issubset(inventory_head_paths):
+            raise ReviewError("issued changed paths must be non-deleted inventory paths")
+        if not isinstance(self.sources, tuple) or not all(
+            isinstance(source, SourceRecord) for source in self.sources
+        ):
+            raise ReviewError("review scope sources must be SourceRecord values")
+        if any(
+            source.path is not None and source.path not in selected
+            for source in self.sources
+        ):
+            raise ReviewError("repository sources must be selected paths")
+        if not isinstance(self.seeds, tuple) or not all(
+            isinstance(seed, MaterialClaimSeed) for seed in self.seeds
+        ):
+            raise ReviewError("review scope seeds must be MaterialClaimSeed values")
+        if not isinstance(self.complete, bool):
+            raise ReviewError("review scope completeness must be a boolean")
+        if not isinstance(self.issues, tuple) or not all(
+            isinstance(issue, ScopeIssue) for issue in self.issues
+        ):
+            raise ReviewError("review scope issues must be ScopeIssue values")
+        if (
+            isinstance(self.materialized_chars, bool)
+            or not isinstance(self.materialized_chars, int)
+            or self.materialized_chars < 0
+        ):
+            raise ReviewError("review scope materialized_chars must be non-negative")
 
 
 @dataclass(frozen=True)
