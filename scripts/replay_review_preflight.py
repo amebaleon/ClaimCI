@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,9 @@ MAX_MANIFEST_BYTES = 1_048_576
 MAX_METADATA_BYTES = 1_048_576
 MAX_GIT_OUTPUT_BYTES = 128 * 1024 * 1024
 MAX_GIT_METADATA_BYTES = 256 * 1024 * 1024
+MAX_GIT_OBJECT_ENTRIES = 250_000
+MAX_GIT_OBJECT_PATH_BYTES = 64 * 1024 * 1024
+MAX_GIT_OBJECT_INFO_BYTES = 16 * 1024 * 1024
 MAX_MATERIAL_BLOB_BYTES = 16 * 1024 * 1024
 MAX_GIT_ERROR_BYTES = 65_536
 GIT_TIMEOUT_SECONDS = 120.0
@@ -728,6 +732,87 @@ def _digest_metadata_tree(root: Path, *, namespace: str, sink: Any) -> tuple[int
     return count, total
 
 
+def _digest_object_store(root: Path) -> tuple[int, int, int, str]:
+    """Passively inventory Git objects without opening object payloads.
+
+    Paths, entry types, and sizes detect loose-object and pack additions while
+    keeping reads independent of repository size.  Only ``objects/info`` files
+    are content-hashed because their contents can redirect or alter object
+    lookup behavior.
+    """
+
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise ValueError("Git object store is unavailable") from exc
+    root_attributes = getattr(root_stat, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    root_is_junction = getattr(root, "is_junction", lambda: False)()
+    if (
+        root.is_symlink()
+        or root_is_junction
+        or (reparse_flag and root_attributes & reparse_flag)
+        or not stat.S_ISDIR(root_stat.st_mode)
+    ):
+        raise ValueError("Git object store is unsafe")
+
+    records: list[tuple[str, str, int, Path]] = []
+    directories = [root]
+    path_bytes = 0
+    while directories:
+        directory = directories.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise ValueError("Git object inventory is unavailable") from exc
+                    attributes = getattr(entry_stat, "st_file_attributes", 0)
+                    is_junction = getattr(path, "is_junction", lambda: False)()
+                    if (
+                        entry.is_symlink()
+                        or is_junction
+                        or (reparse_flag and attributes & reparse_flag)
+                    ):
+                        raise ValueError("Git object store contains a link")
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        kind = "directory"
+                        directories.append(path)
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        kind = "file"
+                    else:
+                        raise ValueError("Git object store contains a special entry")
+                    relative = path.relative_to(root).as_posix()
+                    encoded_relative = relative.encode("utf-8", errors="strict")
+                    path_bytes += len(encoded_relative)
+                    records.append((relative, kind, entry_stat.st_size, path))
+                    if len(records) > MAX_GIT_OBJECT_ENTRIES:
+                        raise ValueError("Git object inventory exceeds its entry bound")
+                    if path_bytes > MAX_GIT_OBJECT_PATH_BYTES:
+                        raise ValueError("Git object inventory exceeds its path bound")
+        except OSError as exc:
+            raise ValueError("Git object inventory is unavailable") from exc
+
+    digest = hashlib.sha256()
+    info_bytes = 0
+    for relative, kind, size, path in sorted(records, key=lambda record: record[0]):
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(kind.encode("ascii") + b"\0")
+        digest.update(str(size).encode("ascii") + b"\0")
+        if kind == "file" and relative.startswith("info/"):
+            remaining = MAX_GIT_OBJECT_INFO_BYTES - info_bytes
+            if remaining < 0 or size > remaining:
+                raise ValueError("Git object info exceeds its content bound")
+            raw = _read_bounded(path, limit=remaining)
+            if len(raw) != size:
+                raise ValueError("Git object info changed during identity capture")
+            info_bytes += len(raw)
+            digest.update(b"info-content\0" + raw)
+    return len(records), path_bytes, info_bytes, digest.hexdigest()
+
+
 def _source_identity(source: Path, empty_hooks: Path) -> dict[str, Any]:
     top = _run_git(
         source,
@@ -778,6 +863,12 @@ def _source_identity(source: Path, empty_hooks: Path) -> dict[str, Any]:
         count, size = _digest_metadata_tree(root, namespace=namespace, sink=digest)
         metadata_files += count
         metadata_bytes += size
+    (
+        object_entries,
+        object_path_bytes,
+        object_info_bytes,
+        object_digest,
+    ) = _digest_object_store(common_dir / "objects")
     return {
         "head_sha": _git_head(source, empty_hooks),
         "porcelain_status_sha256": hashlib.sha256(status).hexdigest(),
@@ -787,6 +878,10 @@ def _source_identity(source: Path, empty_hooks: Path) -> dict[str, Any]:
         "git_metadata_file_count": metadata_files,
         "git_metadata_bytes": metadata_bytes,
         "git_metadata_sha256": digest.hexdigest(),
+        "git_object_store_entry_count": object_entries,
+        "git_object_store_path_bytes": object_path_bytes,
+        "git_object_store_info_bytes": object_info_bytes,
+        "git_object_store_sha256": object_digest,
     }
 
 
@@ -1099,9 +1194,40 @@ def replay_study(
         "candidates": results,
     }
     rendered = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    destination.write_text(rendered, encoding="utf-8", newline="\n")
+    _publish_output(destination, rendered)
     print(rendered, end="")
     return payload
+
+
+def _publish_output(destination: Path, rendered: str) -> None:
+    """Atomically replace an output entry without opening its existing inode."""
+
+    raw = rendered.encode("utf-8", errors="strict")
+    descriptor: int | None = None
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".claimci-replay-",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        if temporary.parent.resolve(strict=True) != destination.parent:
+            raise ValueError("temporary replay output escaped its destination directory")
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("temporary replay output is not a regular file")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -45,8 +45,10 @@ from claimci.review.provider import ProviderResponse, StructuredRequest
 from scripts.replay_review_preflight import (
     CandidateInputLayout,
     FrozenCandidate,
+    _source_identity,
     load_frozen_manifests,
     replay_candidate,
+    replay_study,
     resolve_replay_paths,
     serialize_preflight,
 )
@@ -611,6 +613,79 @@ def test_replay_paths_reject_urls_and_outputs_inside_study(tmp_path: Path) -> No
         study.resolve(),
         outside.resolve(),
     )
+
+
+def test_source_identity_detects_unreferenced_object_store_addition(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "source").resolve()
+    _new_repo(source)
+    _write(source, "tracked.txt", "tracked\n")
+    _commit(source, "baseline")
+    empty_hooks = (tmp_path / "empty-hooks").resolve()
+    empty_hooks.mkdir()
+    before = _source_identity(source, empty_hooks)
+
+    completed = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=source,
+        env=_credential_free_env(),
+        input=b"unreferenced frozen-source mutation\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+
+    after = _source_identity(source, empty_hooks)
+
+    assert before != after
+    assert before["head_sha"] == after["head_sha"]
+    assert before["tracked_file_identity_sha256"] == after[
+        "tracked_file_identity_sha256"
+    ]
+    assert after["git_object_store_entry_count"] > before[
+        "git_object_store_entry_count"
+    ]
+    assert after["git_object_store_sha256"] != before["git_object_store_sha256"]
+
+
+def test_replay_publication_never_truncates_an_outside_hardlink_to_study_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    study.mkdir()
+    frozen = study / "frozen-source.txt"
+    frozen_bytes = b"frozen study content must remain byte-identical\n"
+    frozen.write_bytes(frozen_bytes)
+    destination = (tmp_path / "replay.json").resolve()
+    os.link(frozen, destination)
+    aliased_inode = frozen.stat().st_ino
+
+    def provider_free_result(_study, candidate, _layout, _config, *, temp_parent=None):
+        assert temp_parent is None
+        return {
+            "candidate": candidate.candidate,
+            "ready": True,
+            "provider_calls": 0,
+        }
+
+    monkeypatch.setattr(
+        "scripts.replay_review_preflight.replay_candidate", provider_free_result
+    )
+
+    payload = replay_study(study, destination, fixture_directory=FIXTURES)
+
+    assert payload["ready_count"] == 5
+    assert payload["provider_calls"] == 0
+    assert frozen.read_bytes() == frozen_bytes
+    assert frozen.stat().st_ino == aliased_inode
+    assert destination.stat().st_ino != aliased_inode
+    assert json.loads(destination.read_text(encoding="utf-8"))[
+        "mode"
+    ] == "provider_free_frozen_local_replay"
+    assert not tuple(destination.parent.glob(".claimci-replay-*.tmp"))
 
 
 def _merge_replay_source(study: Path) -> tuple[FrozenCandidate, CandidateInputLayout]:
