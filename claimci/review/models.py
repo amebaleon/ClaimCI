@@ -567,6 +567,7 @@ class ReviewScope:
     complete: bool
     issues: tuple[ScopeIssue, ...]
     materialized_chars: int = 0
+    materialized_path_chars: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.mode not in {"declared_changed_v1", "legacy_pairwise_v1"}:
@@ -620,6 +621,23 @@ class ReviewScope:
             or self.materialized_chars < 0
         ):
             raise ReviewError("review scope materialized_chars must be non-negative")
+        if (
+            not isinstance(self.materialized_path_chars, tuple)
+            or any(
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or item[0] not in selected
+                or isinstance(item[1], bool)
+                or not isinstance(item[1], int)
+                or item[1] < 0
+                for item in self.materialized_path_chars
+            )
+            or tuple(sorted(self.materialized_path_chars))
+            != self.materialized_path_chars
+            or len({path for path, _chars in self.materialized_path_chars})
+            != len(self.materialized_path_chars)
+        ):
+            raise ReviewError("review scope materialized_path_chars is invalid")
 
 
 @dataclass(frozen=True)
@@ -694,6 +712,24 @@ class ReviewPreflight:
         ):
             raise ReviewError("review preflight must contain gates 1, 2, and 3 in order")
         dispositions = tuple(gate.disposition for gate in self.gates)
+        failure_indexes = tuple(
+            index
+            for index, disposition in enumerate(dispositions)
+            if disposition is GateDisposition.FAIL
+        )
+        not_evaluated_indexes = tuple(
+            index
+            for index, disposition in enumerate(dispositions)
+            if disposition is GateDisposition.NOT_EVALUATED
+        )
+        if failure_indexes:
+            first_failure = failure_indexes[0]
+            if failure_indexes != (first_failure,) or dispositions[first_failure + 1 :] != (
+                GateDisposition.NOT_EVALUATED,
+            ) * (2 - first_failure):
+                raise ReviewError("review preflight gate sequence is impossible")
+        elif not_evaluated_indexes:
+            raise ReviewError("review preflight gate sequence is impossible")
         failed = GateDisposition.FAIL in dispositions
         expected_ready = all(
             disposition

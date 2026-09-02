@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import yaml
+import pytest
 
 from claimci.review.config import load_review_config
 from claimci.review.models import (
@@ -15,11 +16,20 @@ from claimci.review.models import (
     ReviewConfig,
     ReviewLimits,
     ReviewStatus,
+    SourceBundle,
+    SourceKind,
 )
 from claimci.review.openai_provider import OpenAIReviewerProvider
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
-from claimci.review.request_budget import output_budget_ready
+from claimci.review.request_budget import (
+    MAX_SYNTHESIS_AUDIT_CHARS,
+    bound_synthesis_audits,
+    build_extraction_request_parts,
+    logical_request_chars,
+    output_budget_ready,
+)
+from claimci.review.sources import _record
 
 
 def _request(task: str = "extract_claims") -> StructuredRequest:
@@ -40,6 +50,31 @@ def test_review_limits_default_to_material_claim_and_task_specific_budgets() -> 
     assert limits.max_output_chars == 24_000
 
 
+def test_request_policy_and_contracts_have_one_provider_free_authority() -> None:
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.provider as provider
+    import claimci.review.request_budget as budget
+
+    assert provider.REVIEW_SYSTEM_POLICY is budget.REVIEW_SYSTEM_POLICY
+    assert not hasattr(orchestrator, "_EXTRACTION_CONTRACT")
+    assert not hasattr(orchestrator, "_SYNTHESIS_CONTRACT")
+    assert not hasattr(orchestrator, "_EXTRACTION_SCHEMA")
+    assert not hasattr(orchestrator, "_SYNTHESIS_SCHEMA")
+
+
+def test_synthesis_audit_allocation_keeps_only_complete_bounded_snapshots() -> None:
+    small = {"manifest_path": "research.yaml", "findings": []}
+    oversized = {
+        "manifest_path": "large/research.yaml",
+        "findings": [{"explanation": "x" * MAX_SYNTHESIS_AUDIT_CHARS}],
+    }
+
+    retained, omitted = bound_synthesis_audits((small, oversized))
+
+    assert retained == (small,)
+    assert omitted == 1
+
+
 def test_preflight_output_reserve_requires_the_full_frozen_two_call_budget() -> None:
     assert output_budget_ready(ReviewLimits()) is True
     assert output_budget_ready(ReviewLimits(max_output_chars=23_999)) is False
@@ -51,6 +86,41 @@ def test_preflight_output_reserve_requires_the_full_frozen_two_call_budget() -> 
         output_budget_ready(ReviewLimits(synthesis_max_output_tokens=3_999))
         is False
     )
+    with pytest.raises(ValueError, match="max_output_chars"):
+        ReviewLimits(max_output_chars=24_001)
+
+
+@pytest.mark.parametrize("max_claims", [15, 16])
+def test_extraction_schema_accepts_every_valid_claim_cap_boundary(
+    max_claims: int,
+) -> None:
+    parts = build_extraction_request_parts(SourceBundle(), max_claims)
+
+    assert parts.schema["properties"]["claims"]["maxItems"] == max_claims
+
+
+def test_review_limits_reject_seventeen_claims() -> None:
+    with pytest.raises(ValueError, match="max_claims"):
+        ReviewLimits(max_claims=17)
+
+
+@pytest.mark.parametrize("target", [59_999, 60_000, 60_001])
+def test_exact_extraction_logical_character_boundaries(target: int) -> None:
+    empty_record = _record(SourceKind.PULL_REQUEST_DESCRIPTION, None, "")
+    empty_bundle = SourceBundle(
+        sources=(empty_record,),
+        total_chars=0,
+    )
+    empty_parts = build_extraction_request_parts(empty_bundle, 16)
+    fixed = logical_request_chars(
+        empty_parts.task, empty_parts.payload, empty_parts.schema
+    )
+    text = "x" * (target - fixed)
+    record = _record(SourceKind.PULL_REQUEST_DESCRIPTION, None, text)
+    bundle = SourceBundle(sources=(record,), total_chars=len(text))
+    parts = build_extraction_request_parts(bundle, 16)
+
+    assert logical_request_chars(parts.task, parts.payload, parts.schema) == target
 
 
 def test_enabled_config_accepts_new_budgets_and_legacy_config_remains_readable(

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
@@ -33,7 +34,11 @@ from .models import (
     SourceRecord,
 )
 from .path_policy import classify_review_material
-from .inventory import MAX_CHANGESET_METADATA_BYTES, build_git_change_inventory
+from .inventory import (
+    MAX_CHANGESET_METADATA_BYTES,
+    InventoryVerificationError,
+    build_git_change_inventory,
+)
 from .request_budget import (
     build_extraction_request_parts,
     build_synthesis_request_parts,
@@ -42,7 +47,17 @@ from .request_budget import (
     plain,
     worst_valid_synthesis_request_chars,
 )
-from .sources import MAX_SOURCE_FILE_BYTES, _record, source_bundle_from_scope
+from .sources import (
+    MAX_CHANGE_COMPARISON_BYTES,
+    MAX_CHANGE_COMPARISON_FILE_BYTES,
+    MAX_CHANGE_COMPARISON_FILES,
+    MAX_REPOSITORY_DEPTH,
+    MAX_REPOSITORY_ENTRIES,
+    MAX_REPOSITORY_PATHS,
+    MAX_SOURCE_FILE_BYTES,
+    _record,
+    source_bundle_from_scope,
+)
 
 
 class _ScopeInputs(Protocol):
@@ -350,6 +365,7 @@ def build_review_scope(
     ]
 
     selected: list[str] = []
+    materialized_path_chars: dict[str, int] = {}
     issues: list[ScopeIssue] = []
     materialized_chars = sum(len(record.text) for record in records)
     if not inventory.complete:
@@ -378,8 +394,10 @@ def build_review_scope(
             except PassiveFileError as exc:
                 code = {
                     "outside": "PREFLIGHT_G1_MATERIAL_PATH_OUTSIDE_ROOT",
+                    "unsafe_path": "PREFLIGHT_G1_MATERIAL_PATH_OUTSIDE_ROOT",
                     "symlink": "PREFLIGHT_G1_MATERIAL_PATH_SYMLINK",
                     "not_regular": "PREFLIGHT_G1_MATERIAL_PATH_NOT_REGULAR",
+                    "unavailable": "PREFLIGHT_G1_MATERIAL_PATH_NOT_REGULAR",
                     "changed": "PREFLIGHT_G1_MATERIAL_PATH_IDENTITY_CHANGED",
                     "too_large": "PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
                 }.get(exc.code, "PREFLIGHT_G2_CANDIDATE_UNREADABLE")
@@ -418,6 +436,7 @@ def build_review_scope(
                     )
                 )
             selected.append(entry.path)
+            materialized_path_chars[entry.path] = len(text)
             materialized_chars += len(text)
             remaining_chars -= len(text)
             if kind is ReviewMaterialKind.DOCUMENT:
@@ -573,6 +592,7 @@ def build_review_scope(
         complete=bool(seeds and selected_paths and not unique_issues),
         issues=unique_issues,
         materialized_chars=materialized_chars,
+        materialized_path_chars=tuple(sorted(materialized_path_chars.items())),
     )
 
 
@@ -580,6 +600,242 @@ def scope_source_bundle(scope: ReviewScope) -> SourceBundle:
     """Adapt a planned scope to the unchanged extraction SourceBundle contract."""
 
     return source_bundle_from_scope(scope)
+
+
+def _legacy_regular_paths(root: Path) -> tuple[tuple[str, ...], tuple[ScopeIssue, ...]]:
+    """Enumerate a complete legacy index while surfacing every fixed bound."""
+
+    paths: list[str] = []
+    entry_count = 0
+    issues: list[ScopeIssue] = []
+    seen = {root}
+
+    def visit(directory: Path, depth: int) -> bool:
+        nonlocal entry_count
+        if depth > MAX_REPOSITORY_DEPTH:
+            issues.append(
+                ScopeIssue(
+                    code="PREFLIGHT_G1_REPOSITORY_DEPTH_LIMIT",
+                    observed=depth,
+                    limit=MAX_REPOSITORY_DEPTH,
+                )
+            )
+            return False
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError:
+            issues.append(ScopeIssue(code="PREFLIGHT_G1_HEAD_ROOT_INVALID"))
+            return False
+        for entry in sorted(entries, key=lambda item: (item.name.casefold(), item.name)):
+            entry_count += 1
+            if entry_count > MAX_REPOSITORY_ENTRIES:
+                issues.append(
+                    ScopeIssue(
+                        code="PREFLIGHT_G1_REPOSITORY_ENTRY_LIMIT",
+                        observed=entry_count,
+                        limit=MAX_REPOSITORY_ENTRIES,
+                    )
+                )
+                return False
+            candidate = Path(entry.path)
+            try:
+                if entry.name.casefold() in {".git", "__pycache__"}:
+                    continue
+                if entry.is_symlink() or candidate.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(root)
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        if not visit(candidate, depth + 1):
+                            return False
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                relative = candidate.resolve(strict=True).relative_to(root).as_posix()
+                if "\\" in relative:
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if len(paths) >= MAX_REPOSITORY_PATHS:
+                issues.append(
+                    ScopeIssue(
+                        code="PREFLIGHT_G1_REPOSITORY_PATH_LIMIT",
+                        observed=len(paths) + 1,
+                        limit=MAX_REPOSITORY_PATHS,
+                    )
+                )
+                return False
+            paths.append(relative)
+        return True
+
+    visit(root, 0)
+    return tuple(sorted(paths)), tuple(sorted(set(issues), key=_issue_sort_key))
+
+
+def _legacy_inventory(
+    inputs: _ScopeInputs,
+) -> tuple[ChangeInventory | None, tuple[ScopeIssue, ...]]:
+    """Build a provider-free compatibility inventory with explicit exhaustion."""
+
+    try:
+        requested_head = Path(inputs.repository_root)
+        if requested_head.is_symlink():
+            raise OSError
+        head = requested_head.resolve(strict=True)
+        if not head.is_dir():
+            raise OSError
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None, (ScopeIssue(code="PREFLIGHT_G1_HEAD_ROOT_INVALID"),)
+    raw_base = getattr(inputs, "base_root", None)
+    base: Path | None = None
+    if raw_base is not None:
+        try:
+            requested_base = Path(raw_base)
+            if requested_base.is_symlink():
+                raise OSError
+            base = requested_base.resolve(strict=True)
+            if not base.is_dir():
+                raise OSError
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None, (
+                ScopeIssue(code="PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"),
+                ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID"),
+            )
+    paths, traversal_issues = _legacy_regular_paths(head)
+    if traversal_issues:
+        return None, traversal_issues
+    comparison_files = 0
+    comparison_bytes = 0
+    entries: list[ChangeEntry] = []
+    issues: list[ScopeIssue] = []
+    for path in paths:
+        if classify_review_material(path) is ReviewMaterialKind.OTHER:
+            continue
+        if base is None:
+            entries.append(ChangeEntry(path, ChangeStatus.ADDED))
+            continue
+        head_path = head / Path(path)
+        base_path = base / Path(path)
+        try:
+            head_size = head_path.stat().st_size
+            if not base_path.is_file() or base_path.is_symlink():
+                entries.append(ChangeEntry(path, ChangeStatus.ADDED))
+                continue
+            base_size = base_path.stat().st_size
+        except OSError:
+            issues.append(
+                ScopeIssue(code="PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN", path=path)
+            )
+            continue
+        if base_size != head_size:
+            entries.append(ChangeEntry(path, ChangeStatus.MODIFIED))
+            continue
+        if head_size > MAX_CHANGE_COMPARISON_FILE_BYTES:
+            issues.append(
+                ScopeIssue(
+                    code="PREFLIGHT_G1_COMPARISON_PER_FILE_BYTES_LIMIT",
+                    path=path,
+                    observed=head_size,
+                    limit=MAX_CHANGE_COMPARISON_FILE_BYTES,
+                )
+            )
+            break
+        if comparison_files >= MAX_CHANGE_COMPARISON_FILES:
+            issues.append(
+                ScopeIssue(
+                    code="PREFLIGHT_G1_COMPARISON_FILE_LIMIT",
+                    observed=comparison_files + 1,
+                    limit=MAX_CHANGE_COMPARISON_FILES,
+                )
+            )
+            break
+        required = head_size + base_size
+        if comparison_bytes + required > MAX_CHANGE_COMPARISON_BYTES:
+            issues.append(
+                ScopeIssue(
+                    code="PREFLIGHT_G1_COMPARISON_BYTES_LIMIT",
+                    observed=comparison_bytes + required,
+                    limit=MAX_CHANGE_COMPARISON_BYTES,
+                )
+            )
+            break
+        comparison_files += 1
+        comparison_bytes += required
+        try:
+            head_capture = capture_confined_regular_file(
+                head, path, max_bytes=head_size
+            )
+            base_capture = capture_confined_regular_file(
+                base, path, max_bytes=base_size
+            )
+        except PassiveFileError:
+            issues.append(
+                ScopeIssue(code="PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN", path=path)
+            )
+            continue
+        if head_capture.sha256 != base_capture.sha256:
+            entries.append(ChangeEntry(path, ChangeStatus.MODIFIED))
+    if any(issue.code.startswith("PREFLIGHT_G1_") for issue in issues):
+        return None, tuple(sorted(set(issues), key=_issue_sort_key))
+    inventory = ChangeInventory(
+        schema_version=1,
+        requested_base_sha="0" * 40,
+        comparison_base_sha="0" * 40,
+        head_sha="0" * 40,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.LEGACY_PAIRWISE,
+        declared_entry_count=len(entries),
+        complete=True,
+        entries=tuple(sorted(entries, key=lambda item: (item.path, item.status.value))),
+    )
+    return inventory, tuple(sorted(set(issues), key=_issue_sort_key))
+
+
+def legacy_preflight_failure(
+    inputs: _ScopeInputs, config: ReviewConfig
+) -> ReviewPreflight | None:
+    """Return only a legacy hard-bound failure; preserve the legacy ready path."""
+
+    if not isinstance(config, ReviewConfig):
+        raise ReviewError("config must be ReviewConfig")
+    inventory, issues = _legacy_inventory(inputs)
+    if inventory is not None and not issues:
+        return None
+    gate1_reasons = tuple(
+        issue for issue in issues if issue.code.startswith("PREFLIGHT_G1_")
+    )
+    gate2_reasons = tuple(
+        issue for issue in issues if issue.code.startswith("PREFLIGHT_G2_")
+    )
+    if gate1_reasons or inventory is None:
+        gate1 = _gate_result(1, GateDisposition.FAIL, gate1_reasons, {})
+        gates = (gate1, _upstream_gate(2), _upstream_gate(3))
+    else:
+        gate1 = _gate_result(
+            1,
+            GateDisposition.PASS_COMPLETE,
+            (),
+            {
+                "change_count": len(inventory.entries),
+                "inventory_complete": inventory.complete,
+                "inventory_source": inventory.source.value,
+            },
+        )
+        gate2 = _gate_result(2, GateDisposition.FAIL, gate2_reasons, {})
+        gates = (gate1, gate2, _upstream_gate(3))
+    return ReviewPreflight(
+        schema_version=1,
+        requested_base_sha="0" * 40,
+        comparison_base_sha="0" * 40,
+        head_sha="0" * 40,
+        gates=gates,
+        ready_for_provider=False,
+        review_status_ceiling=ReviewStatus.UNAVAILABLE,
+        scope=None,
+    )
 
 
 def _upstream_gate(gate: int) -> PreflightGateResult:
@@ -781,7 +1037,19 @@ def _gate_result(
 
 def _gate2(scope: ReviewScope) -> PreflightGateResult:
     reasons = tuple(issue for issue in scope.issues if issue.code.startswith("PREFLIGHT_G2_"))
-    routable = bool(scope.seeds and scope.selected_paths)
+    references = _source_path_references(scope.sources)
+    selected_kinds = {
+        path: classify_review_material(path) for path in scope.selected_paths
+    }
+    routed_seed_count = sum(
+        1
+        for seed in scope.seeds
+        if any(
+            _exact_mentions(path, seed, references) or _kind_agrees(kind, seed)
+            for path, kind in selected_kinds.items()
+        )
+    )
+    routable = routed_seed_count > 0
     disposition = (
         GateDisposition.FAIL
         if not routable
@@ -794,8 +1062,101 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
         {
             "issue_count": len(reasons),
             "material_seed_count": len(scope.seeds),
+            "routed_seed_count": routed_seed_count,
             "selected_path_count": len(scope.selected_paths),
         },
+    )
+
+
+def _routed_seeds(scope: ReviewScope) -> tuple[MaterialClaimSeed, ...]:
+    references = _source_path_references(scope.sources)
+    selected_kinds = {
+        path: classify_review_material(path) for path in scope.selected_paths
+    }
+    return tuple(
+        seed
+        for seed in scope.seeds
+        if any(
+            _exact_mentions(path, seed, references) or _kind_agrees(kind, seed)
+            for path, kind in selected_kinds.items()
+        )
+    )
+
+
+def _scope_routes_required_seeds(
+    scope: ReviewScope, required: tuple[MaterialClaimSeed, ...]
+) -> bool:
+    source_ids = {source.source_id for source in scope.sources}
+    routed = set(_routed_seeds(scope))
+    return bool(required) and all(
+        seed.origin_source_id in source_ids and seed in routed for seed in required
+    )
+
+
+def _trim_scope_for_gate3(scope: ReviewScope, config: ReviewConfig) -> ReviewScope:
+    """Drop lowest-ranked issued paths until both provider envelopes can fit."""
+
+    limits = config.limits
+    original_count = len(scope.selected_paths)
+    current = scope
+    required_seeds = _routed_seeds(scope)
+    trimmed: list[str] = []
+    while current.selected_paths:
+        bundle = scope_source_bundle(current)
+        extraction = build_extraction_request_parts(bundle, limits.max_claims)
+        extraction_chars = logical_request_chars(
+            extraction.task, extraction.payload, extraction.schema
+        )
+        synthesis_chars = worst_valid_synthesis_request_chars(current, limits)
+        if (
+            extraction_chars <= limits.max_context_chars
+            and synthesis_chars <= limits.max_context_chars
+        ):
+            break
+        removable = None
+        for path in reversed(current.selected_paths):
+            retained = tuple(item for item in current.selected_paths if item != path)
+            retained_set = set(retained)
+            candidate = replace(
+                current,
+                issued_paths=tuple(item for item in current.issued_paths if item in retained_set),
+                issued_changed_paths=tuple(
+                    item for item in current.issued_changed_paths if item in retained_set
+                ),
+                selected_paths=retained,
+                sources=tuple(
+                    source
+                    for source in current.sources
+                    if source.path is None or source.path in retained_set
+                ),
+                materialized_chars=current.materialized_chars
+                - dict(current.materialized_path_chars).get(path, 0),
+                materialized_path_chars=tuple(
+                    item for item in current.materialized_path_chars if item[0] in retained_set
+                ),
+            )
+            if _scope_routes_required_seeds(candidate, required_seeds):
+                removable = (path, candidate)
+                break
+        if removable is None:
+            break
+        path, current = removable
+        trimmed.append(path)
+    if not trimmed:
+        return current
+    issues = (*current.issues,) + tuple(
+        ScopeIssue(
+            code="PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT",
+            path=path,
+            observed=original_count,
+            limit=len(current.selected_paths),
+        )
+        for path in trimmed
+    )
+    return replace(
+        current,
+        complete=False,
+        issues=tuple(sorted(set(issues), key=_issue_sort_key)),
     )
 
 
@@ -818,6 +1179,11 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
     synthesis_reserved_chars = worst_valid_synthesis_request_chars(scope, limits)
     reasons: list[ScopeIssue] = []
     hard_failure = False
+    reasons.extend(
+        issue
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT"
+    )
     if limits.max_calls < 2:
         reasons.append(
             ScopeIssue(
@@ -869,7 +1235,10 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
         if issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
     )
     if truncated:
-        required = len(scope.selected_paths) + len({issue.path for issue in truncated})
+        required = max(
+            (issue.observed or 0 for issue in truncated),
+            default=len(scope.selected_paths) + len({issue.path for issue in truncated}),
+        )
         reasons.append(
             ScopeIssue(
                 code="PREFLIGHT_G3_SELECTED_FILE_LIMIT",
@@ -923,76 +1292,15 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
     )
 
 
-def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPreflight:
-    """Evaluate all free gates before any provider module can be imported."""
-
-    if not isinstance(config, ReviewConfig):
-        raise ReviewError("config must be ReviewConfig")
-    requested_sha = _coordinate_sha(inputs, "requested_base", "requested_base_sha")
-    comparison_sha = _coordinate_sha(inputs, "comparison_base", "comparison_base_sha")
-    head_sha = _coordinate_sha(inputs, "head", "head_sha")
-    gate1_reasons = _gate1_precheck(inputs)
-    inventory = getattr(inputs, "inventory", None)
-    if gate1_reasons or not isinstance(inventory, ChangeInventory):
-        gate1 = _gate_result(1, GateDisposition.FAIL, gate1_reasons, {})
-        return ReviewPreflight(
-            schema_version=1,
-            requested_base_sha=requested_sha,
-            comparison_base_sha=comparison_sha,
-            head_sha=head_sha,
-            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
-            ready_for_provider=False,
-            review_status_ceiling=ReviewStatus.UNAVAILABLE,
-            scope=None,
-        )
-    requested = inputs.requested_base
-    comparison = inputs.comparison_base
-    head = inputs.head
-    assert requested is not None and comparison is not None and head is not None
-    try:
-        verified = build_git_change_inventory(
-            requested, comparison, head, inventory.comparison_basis
-        )
-    except ReviewError as exc:
-        message = str(exc).casefold()
-        code = (
-            "PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH"
-            if "sha" in message or "head" in message or "commit" in message
-            else (
-                "PREFLIGHT_G1_COMPARISON_BASE_MISMATCH"
-                if "merge base" in message or "comparison base" in message
-                else "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"
-            )
-        )
-        gate1 = _gate_result(1, GateDisposition.FAIL, (ScopeIssue(code=code),), {})
-        return ReviewPreflight(
-            schema_version=1,
-            requested_base_sha=requested_sha,
-            comparison_base_sha=comparison_sha,
-            head_sha=head_sha,
-            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
-            ready_for_provider=False,
-            review_status_ceiling=ReviewStatus.UNAVAILABLE,
-            scope=None,
-        )
-    if verified != inventory:
-        gate1 = _gate_result(
-            1,
-            GateDisposition.FAIL,
-            (ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_MISMATCH"),),
-            {},
-        )
-        return ReviewPreflight(
-            schema_version=1,
-            requested_base_sha=requested_sha,
-            comparison_base_sha=comparison_sha,
-            head_sha=head_sha,
-            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
-            ready_for_provider=False,
-            review_status_ceiling=ReviewStatus.UNAVAILABLE,
-            scope=None,
-        )
-    scope = build_review_scope(inputs, config, inventory)
+def _evaluate_material_gates(
+    scope: ReviewScope,
+    config: ReviewConfig,
+    *,
+    requested_sha: str,
+    comparison_sha: str,
+    head_sha: str,
+) -> ReviewPreflight:
+    inventory = scope.inventory
     material_issues = tuple(
         issue for issue in scope.issues if issue.code.startswith("PREFLIGHT_G1_")
     )
@@ -1020,17 +1328,17 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
     )
     gate2 = _gate2(scope)
     if gate2.disposition is GateDisposition.FAIL:
-        gates = (gate1, gate2, _upstream_gate(3))
         return ReviewPreflight(
             schema_version=1,
             requested_base_sha=requested_sha,
             comparison_base_sha=comparison_sha,
             head_sha=head_sha,
-            gates=gates,
+            gates=(gate1, gate2, _upstream_gate(3)),
             ready_for_provider=False,
             review_status_ceiling=ReviewStatus.UNAVAILABLE,
             scope=scope,
         )
+    scope = _trim_scope_for_gate3(scope, config)
     gate3 = _gate3(scope, config)
     gates = (gate1, gate2, gate3)
     ready = gate3.disposition in {
@@ -1059,9 +1367,163 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
     )
 
 
+def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPreflight:
+    """Evaluate all free gates before any provider module can be imported."""
+
+    if not isinstance(config, ReviewConfig):
+        raise ReviewError("config must be ReviewConfig")
+    declared = any(
+        getattr(inputs, field, None) is not None
+        for field in ("requested_base", "comparison_base", "head", "inventory")
+    )
+    if not declared:
+        inventory, legacy_issues = _legacy_inventory(inputs)
+        if inventory is None:
+            gate1 = _gate_result(1, GateDisposition.FAIL, legacy_issues, {})
+            return ReviewPreflight(
+                schema_version=1,
+                requested_base_sha="0" * 40,
+                comparison_base_sha="0" * 40,
+                head_sha="0" * 40,
+                gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
+                ready_for_provider=False,
+                review_status_ceiling=ReviewStatus.UNAVAILABLE,
+                scope=None,
+            )
+        scope = build_review_scope(inputs, config, inventory)
+        if legacy_issues:
+            scope = replace(
+                scope,
+                complete=False,
+                issues=tuple(
+                    sorted(set((*scope.issues, *legacy_issues)), key=_issue_sort_key)
+                ),
+            )
+        return _evaluate_material_gates(
+            scope,
+            config,
+            requested_sha="0" * 40,
+            comparison_sha="0" * 40,
+            head_sha="0" * 40,
+        )
+    requested_sha = _coordinate_sha(inputs, "requested_base", "requested_base_sha")
+    comparison_sha = _coordinate_sha(inputs, "comparison_base", "comparison_base_sha")
+    head_sha = _coordinate_sha(inputs, "head", "head_sha")
+    gate1_reasons = _gate1_precheck(inputs)
+    inventory = getattr(inputs, "inventory", None)
+    if gate1_reasons or not isinstance(inventory, ChangeInventory):
+        gate1 = _gate_result(1, GateDisposition.FAIL, gate1_reasons, {})
+        return ReviewPreflight(
+            schema_version=1,
+            requested_base_sha=requested_sha,
+            comparison_base_sha=comparison_sha,
+            head_sha=head_sha,
+            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
+            ready_for_provider=False,
+            review_status_ceiling=ReviewStatus.UNAVAILABLE,
+            scope=None,
+        )
+    requested = inputs.requested_base
+    comparison = inputs.comparison_base
+    head = inputs.head
+    assert requested is not None and comparison is not None and head is not None
+    try:
+        verified = build_git_change_inventory(
+            requested, comparison, head, inventory.comparison_basis
+        )
+    except InventoryVerificationError as exc:
+        gate1 = _gate_result(
+            1,
+            GateDisposition.FAIL,
+            (ScopeIssue(code=exc.code),),
+            {},
+        )
+        return ReviewPreflight(
+            schema_version=1,
+            requested_base_sha=requested_sha,
+            comparison_base_sha=comparison_sha,
+            head_sha=head_sha,
+            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
+            ready_for_provider=False,
+            review_status_ceiling=ReviewStatus.UNAVAILABLE,
+            scope=None,
+        )
+    except ReviewError:
+        gate1 = _gate_result(
+            1,
+            GateDisposition.FAIL,
+            (
+                ScopeIssue(
+                    code="PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"
+                ),
+            ),
+            {},
+        )
+        return ReviewPreflight(
+            schema_version=1,
+            requested_base_sha=requested_sha,
+            comparison_base_sha=comparison_sha,
+            head_sha=head_sha,
+            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
+            ready_for_provider=False,
+            review_status_ceiling=ReviewStatus.UNAVAILABLE,
+            scope=None,
+        )
+    if verified != inventory:
+        reasons: list[ScopeIssue] = []
+        if (
+            verified.requested_base_sha != inventory.requested_base_sha
+            or verified.head_sha != inventory.head_sha
+        ):
+            reasons.append(ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH"))
+        if (
+            verified.comparison_base_sha != inventory.comparison_base_sha
+            or verified.comparison_basis is not inventory.comparison_basis
+        ):
+            reasons.append(
+                ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_MISMATCH")
+            )
+        if len(verified.entries) != len(inventory.entries):
+            reasons.append(
+                ScopeIssue(
+                    code="PREFLIGHT_G1_CHANGED_FILE_COUNT_MISMATCH",
+                    observed=len(inventory.entries),
+                    limit=len(verified.entries),
+                )
+            )
+        elif verified.entries != inventory.entries:
+            reasons.append(
+                ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED")
+            )
+        gate1 = _gate_result(
+            1,
+            GateDisposition.FAIL,
+            tuple(reasons),
+            {},
+        )
+        return ReviewPreflight(
+            schema_version=1,
+            requested_base_sha=requested_sha,
+            comparison_base_sha=comparison_sha,
+            head_sha=head_sha,
+            gates=(gate1, _upstream_gate(2), _upstream_gate(3)),
+            ready_for_provider=False,
+            review_status_ceiling=ReviewStatus.UNAVAILABLE,
+            scope=None,
+        )
+    return _evaluate_material_gates(
+        build_review_scope(inputs, config, inventory),
+        config,
+        requested_sha=requested_sha,
+        comparison_sha=comparison_sha,
+        head_sha=head_sha,
+    )
+
+
 __all__ = [
     "build_review_scope",
     "classify_review_material",
+    "legacy_preflight_failure",
     "preflight_review",
     "scope_source_bundle",
 ]

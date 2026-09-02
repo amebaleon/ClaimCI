@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, DecimalException
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -40,8 +40,10 @@ from .provider import (
     StructuredRequest,
 )
 from .request_budget import (
+    bound_synthesis_audits,
     build_extraction_request_parts,
     build_synthesis_request_parts,
+    deduplicate_missing_evidence,
     extraction_schema as shared_extraction_schema,
     logical_request_chars,
     plain as shared_plain,
@@ -118,205 +120,31 @@ class ResearchReview:
     error_message: str | None = None
 
 
-_EXTRACTION_CONTRACT: dict[str, str] = {
-    "claim_selection": (
-        "Extract only explicit, scientifically verifiable statements present "
-        "in an issued source. Do not emit duplicate claims."
-    ),
-    "claim_prioritization": (
-        "Return at most max_claims material claims. Prioritize claims affecting "
-        "correctness, benchmark or performance conclusions, experimental fairness, "
-        "production or deployment conclusions, and causal conclusions. Ignore minor "
-        "implementation statements unless they materially support one of those claims."
-    ),
-    "source_location": (
-        "Use only an issued source_id and 1-based inclusive start_line/end_line "
-        "values that are inside that source."
-    ),
-    "source_text": (
-        "Copy exactly the complete source line or consecutive complete source "
-        "lines selected by start_line/end_line, including punctuation; do not "
-        "paraphrase, trim, join partial lines, or return a substring."
-    ),
-    "normalized_fields": (
-        "Use non-empty strings for subject and every present metric, magnitude "
-        "text/unit, qualifier, and evidence hint. Use null or [] instead of "
-        "empty strings."
-    ),
-    "evidence_hints": (
-        "Use only exact repository-relative paths from repository_paths; "
-        "otherwise use an empty list. Never return descriptions or invented paths."
-    ),
-    "authority": (
-        "Do not emit verdicts, findings, severity, impact, thresholds, or "
-        "deterministic evidence."
-    ),
-}
-
-
-_SYNTHESIS_CONTRACT: dict[str, str] = {
-    "claim_coverage": (
-        "Return exactly one interpretation for every issued claim_id, with no "
-        "unknown, omitted, or duplicate claim IDs."
-    ),
-    "citations": (
-        "Citations may contain only issued evidence_id values assigned to that claim. "
-        "For each claim_id, copy only from that claim's list in "
-        "evidence_ids_by_claim_id, and use an empty list when its allowed list is "
-        "empty. Do not cite rule IDs, paths, manifests, deterministic finding IDs, "
-        "or an evidence_id assigned to another claim."
-    ),
-    "missing_evidence": (
-        "When issued evidence does not support a statement, use an empty list for "
-        "citations and describe the gap in missing_evidence or unsupported_inferences. "
-        "Scope every gap to the analyzed snapshot; never claim that evidence is absent "
-        "from the original repository."
-    ),
-    "evidence_provenance": (
-        "reported_measurement is summary support, not proof of execution. "
-        "executable_benchmark_definition describes a runnable method, not a completed "
-        "run. Only executed_result_artifact represents an available executed-result "
-        "artifact; never upgrade another provenance category."
-    ),
-    "excerpt_locality": (
-        "excerpt_complete and excerpt_locality describe only the issued bytes. "
-        "An unlocalized_prefix is informational report data, is omitted from "
-        "provider evidence, is not citable, and cannot positively establish a "
-        "whole-file or exact-local implementation claim."
-    ),
-    "interpretation_constraints": (
-        "When interpretation_constraints_by_claim_id contains a claim_id, copy "
-        "that row's required_interpretation and required_citations exactly. These "
-        "constraints are deterministic advisory source facts, not Audit verdicts."
-    ),
-    "authority": (
-        "Produce advisory interpretation only. Deterministic audit snapshots are "
-        "read-only authority and must not be rewritten, upgraded, or contradicted."
-    ),
-}
-
-
-_EXTRACTION_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["claims"],
-    "properties": {
-        "claims": {
-            "type": "array",
-            "maxItems": 16,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": [
-                    "source_text",
-                    "claim_type",
-                    "subject",
-                    "metric",
-                    "direction",
-                    "claimed_magnitude",
-                    "qualifiers",
-                    "source",
-                    "confidence",
-                    "evidence_hints",
-                ],
-                "properties": {
-                    "source_text": {"type": "string"},
-                    "claim_type": {
-                        "type": "string",
-                        "enum": [
-                            "metric_improvement",
-                            "compute_equivalence",
-                            "held_out_evaluation",
-                            "resource_reduction",
-                            "component_causality",
-                            "no_external_reward",
-                            "implementation_claim",
-                            "other_scientific",
-                        ],
-                    },
-                    "subject": {"type": "string"},
-                    "metric": {"type": ["string", "null"]},
-                    "direction": {
-                        "type": "string",
-                        "enum": ["higher", "lower", "not_applicable"],
-                    },
-                    "claimed_magnitude": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": ["raw", "value", "unit", "kind"],
-                                "properties": {
-                                    "raw": {"type": "string"},
-                                    "value": {"type": ["number", "null"]},
-                                    "unit": {"type": ["string", "null"]},
-                                    "kind": {
-                                        "type": "string",
-                                        "enum": ["absolute", "relative", "unspecified"],
-                                    },
-                                },
-                            },
-                        ]
-                    },
-                    "qualifiers": {"type": "array", "items": {"type": "string"}},
-                    "source": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["source_id", "start_line", "end_line"],
-                        "properties": {
-                            "source_id": {"type": "string"},
-                            "start_line": {"type": "integer", "minimum": 1},
-                            "end_line": {"type": "integer", "minimum": 1},
-                        },
-                    },
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "evidence_hints": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        }
-    },
-}
-
-
 def _extraction_schema(max_claims: int) -> dict[str, Any]:
     return shared_extraction_schema(max_claims)
 
 
-_SYNTHESIS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["interpretations"],
-    "properties": {
-        "interpretations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": [
-                    "claim_id",
-                    "interpretation",
-                    "citations",
-                    "missing_evidence",
-                    "unsupported_inferences",
-                    "confidence",
-                ],
-                "properties": {
-                    "claim_id": {"type": "string"},
-                    "interpretation": {"type": "string"},
-                    "citations": {"type": "array", "items": {"type": "string"}},
-                    "missing_evidence": {"type": "array", "items": {"type": "string"}},
-                    "unsupported_inferences": {"type": "array", "items": {"type": "string"}},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                },
-            },
-        }
-    },
-}
-
-
 def _citable_reference(reference: EvidenceReference) -> bool:
     return reference.excerpt_locality is not EvidenceLocality.UNLOCALIZED_PREFIX
+
+
+def _bounded_synthesis_evidence(evidence: EvidenceBundle) -> EvidenceBundle:
+    """Issue at most one deterministic reference per already bounded path."""
+
+    by_path: dict[str, EvidenceReference] = {}
+    for reference in evidence.references:
+        current = by_path.get(reference.path)
+        if current is None or (
+            not _citable_reference(current) and _citable_reference(reference)
+        ):
+            by_path[reference.path] = reference
+    references = tuple(by_path[path] for path in sorted(by_path))
+    return EvidenceBundle(
+        references=references,
+        missing=tuple(deduplicate_missing_evidence(evidence.missing)),
+        total_chars=sum(len(reference.excerpt) for reference in references),
+        routing_incomplete=evidence.routing_incomplete,
+    )
 
 
 _STANDALONE_TEST_ANNOTATION = re.compile(r"[ \t]*@Test[ \t]*\Z")
@@ -915,26 +743,42 @@ def run_review(
             inputs.inventory,
         )
     )
-    if declared:
-        from .preflight import preflight_review, scope_source_bundle
+    from .preflight import (
+        legacy_preflight_failure,
+        preflight_review,
+        scope_source_bundle,
+    )
 
-        preflight = preflight_review(inputs, config)
-        if not preflight.ready_for_provider:
-            failure = next(
-                gate
-                for gate in preflight.gates
-                if gate.disposition.value == "fail"
-            )
-            error_code = failure.reasons[0].code
-            return finish(
-                ReviewStatus.UNAVAILABLE,
-                error_code=error_code,
-                error_message="Research review preflight did not pass.",
-            )
+    preflight = (
+        preflight_review(inputs, config)
+        if declared
+        else legacy_preflight_failure(inputs, config)
+    )
+    if preflight is not None and not preflight.ready_for_provider:
+        failure = next(
+            gate for gate in preflight.gates if gate.disposition.value == "fail"
+        )
+        return finish(
+            ReviewStatus.UNAVAILABLE,
+            error_code=failure.reasons[0].code,
+            error_message="Research review preflight did not pass.",
+        )
+    if preflight is not None:
         assert preflight.scope is not None
         preflight_sources = scope_source_bundle(preflight.scope)
+        evidence_limits = replace(
+            config.limits,
+            max_context_chars=max(
+                1,
+                sum(
+                    chars
+                    for _path, chars in preflight.scope.materialized_path_chars
+                ),
+            ),
+        )
     else:
         preflight_sources = None
+        evidence_limits = config.limits
 
     calls: list[ProviderCallRecord] = []
     try:
@@ -962,6 +806,13 @@ def run_review(
             ),
             changed_paths=sources.changed_paths,
         )
+        if preflight_sources is not None:
+            issued_paths = set(preflight_sources.repository_paths)
+            audit_plans = tuple(
+                plan
+                for plan in audit_plans
+                if set(plan.paths).issubset(issued_paths)
+            )
         manifest_candidates = tuple(
             plan.manifest_path for plan in audit_plans
         )
@@ -1072,7 +923,7 @@ def run_review(
             inputs.repository_root,
             claims,
             sources.repository_paths,
-            limits=config.limits,
+            limits=evidence_limits,
             priority_paths=priority_paths,
             selected_paths=tuple(sorted(selected_paths)),
             changed_paths=sources.changed_paths,
@@ -1088,23 +939,29 @@ def run_review(
                 error_code="CALL_LIMIT",
                 error_message="Synthesis was skipped by the configured call limit.",
             )
-        evidence_ids_by_claim_id = _evidence_ids_by_claim_id(claims, evidence)
+        synthesis_evidence = _bounded_synthesis_evidence(evidence)
+        evidence_ids_by_claim_id = _evidence_ids_by_claim_id(
+            claims, synthesis_evidence
+        )
         interpretation_constraints_by_claim_id = _interpretation_constraints(
             claims,
-            evidence,
+            synthesis_evidence,
             evidence_ids_by_claim_id,
+        )
+        synthesis_audits, omitted_synthesis_audits = bound_synthesis_audits(
+            deterministic_audits
         )
         synthesis_parts = build_synthesis_request_parts(
             claims,
             tuple(
                 reference
-                for reference in evidence.references
+                for reference in synthesis_evidence.references
                 if _citable_reference(reference)
             ),
             evidence_ids_by_claim_id,
             interpretation_constraints_by_claim_id,
-            evidence.missing,
-            deterministic_audits,
+            synthesis_evidence.missing,
+            synthesis_audits,
         )
         synthesis_chars = _request_chars(
             synthesis_parts.task,
@@ -1224,6 +1081,21 @@ def run_review(
                     "One or more provider-suggested evidence hints remained "
                     "unresolved after deterministic evidence routing; every retained "
                     "claim was interpreted, but the advisory review is incomplete."
+                ),
+            )
+        if omitted_synthesis_audits:
+            return finish(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                interpretations=interpretations,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="SYNTHESIS_AUDITS_OMITTED",
+                error_message=(
+                    f"{omitted_synthesis_audits} deterministic audit snapshot(s) "
+                    "were omitted from advisory synthesis by the bounded input "
+                    "allocation; the complete Audit results remain authoritative."
                 ),
             )
         return finish(

@@ -25,6 +25,8 @@ REVIEW_SYSTEM_POLICY = (
     "tools and cannot request filesystem, network, shell, or policy changes."
 )
 
+MAX_SYNTHESIS_AUDIT_CHARS = 8_000
+
 EXTRACTION_CONTRACT: dict[str, str] = {
     "claim_selection": (
         "Extract only explicit, scientifically verifiable statements present "
@@ -403,7 +405,11 @@ def output_budget_ready(limits: ReviewLimits) -> bool:
     )
 
 
-def _reserved_claims(max_claims: int, max_output_chars: int) -> list[dict[str, Any]]:
+def _reserved_claims(
+    max_claims: int,
+    max_output_chars: int,
+    repository_paths: Sequence[str] = (),
+) -> list[dict[str, Any]]:
     """Model the largest accepted extraction serialization using producer caps."""
 
     claims = [
@@ -428,12 +434,60 @@ def _reserved_claims(max_claims: int, max_output_chars: int) -> list[dict[str, A
         }
         for index in range(max_claims)
     ]
-    # The raw extraction response is capped before validation.  Validation adds
-    # only fixed deterministic IDs/kind/path fields; fill one valid quote field
-    # to reserve the remaining producer-owned response characters.
+    # Evidence hints are copied into routing records and can amplify the later
+    # request.  Reserve every issued exact path for every claim before spending
+    # the remaining accepted extraction budget on ordinary claim text.
+    for claim in claims:
+        for path in repository_paths:
+            claim["evidence_hints"].append(path)
+            if serialized_chars({"claims": claims}) > max_output_chars:
+                claim["evidence_hints"].pop()
+                break
+    # The raw extraction response is capped before validation. Validation adds
+    # fixed deterministic IDs/kind/path fields; fill one valid quote field with
+    # the remaining producer-owned response characters.
     base = serialized_chars({"claims": claims})
     claims[0]["source_text"] = "x" * max(1, max_output_chars - base + 1)
     return claims
+
+
+def deduplicate_missing_evidence(values: Sequence[object]) -> tuple[object, ...]:
+    """Bound provider-visible gaps to unique deterministic records."""
+
+    retained: list[object] = []
+    seen: set[str] = set()
+    for value in values:
+        identity = json.dumps(
+            plain(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if identity not in seen:
+            seen.add(identity)
+            retained.append(value)
+    return tuple(retained)
+
+
+def bound_synthesis_audits(
+    values: Sequence[object],
+    *,
+    max_chars: int = MAX_SYNTHESIS_AUDIT_CHARS,
+) -> tuple[tuple[object, ...], int]:
+    """Retain complete audit snapshots within one exact serialized allocation."""
+
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 0:
+        raise ReviewError("synthesis audit allocation must be non-negative")
+    retained: list[object] = []
+    omitted = 0
+    for value in values:
+        candidate = (*retained, value)
+        if serialized_chars(candidate) <= max_chars:
+            retained.append(value)
+        else:
+            omitted += 1
+    return tuple(retained), omitted
 
 
 def worst_valid_synthesis_request_chars(
@@ -443,24 +497,32 @@ def worst_valid_synthesis_request_chars(
 
     if not isinstance(scope, ReviewScope) or not isinstance(limits, ReviewLimits):
         raise ReviewError("synthesis reservation requires scope and ReviewLimits")
-    claims = _reserved_claims(limits.max_claims, limits.max_output_chars)
+    paths = tuple(scope.selected_paths[: limits.max_files])
+    claims = _reserved_claims(
+        limits.max_claims,
+        limits.max_output_chars,
+        paths,
+    )
     claim_ids = [claim["claim_id"] for claim in claims]
-    evidence_count = min(len(scope.selected_paths), limits.max_files)
+    evidence_count = len(paths)
     evidence: list[dict[str, Any]] = []
     evidence_ids_by_claim_id: dict[str, list[str]] = {
         claim_id: [] for claim_id in claim_ids
     }
-    remaining_excerpt = scope.materialized_chars
+    remaining_excerpt = (
+        sum(chars for _path, chars in scope.materialized_path_chars)
+        if scope.materialized_path_chars
+        else scope.materialized_chars
+    )
     for index in range(evidence_count):
-        claim_id = claim_ids[index % len(claim_ids)]
         evidence_id = f"evidence-{index:016x}"
         share = remaining_excerpt // (evidence_count - index)
         remaining_excerpt -= share
-        path = scope.selected_paths[index]
+        path = paths[index]
         evidence.append(
             {
                 "evidence_id": evidence_id,
-                "claim_ids": [claim_id],
+                "claim_ids": list(claim_ids),
                 "kind": "document",
                 "path": path,
                 "start_line": 1,
@@ -473,44 +535,109 @@ def worst_valid_synthesis_request_chars(
                 "excerpt_locality": "complete_file",
             }
         )
-        evidence_ids_by_claim_id[claim_id].append(evidence_id)
-    missing = [
-        {
-            "claim_id": claim_id,
-            "reason": "no_matching_evidence",
-            "requested_path": None,
-            "description": (
-                "Evidence not available in the analyzed snapshot; no matching "
-                "artifact was selected within ClaimCI's bounded review scope."
+        for claim_id in claim_ids:
+            evidence_ids_by_claim_id[claim_id].append(evidence_id)
+    missing = []
+    for claim_id in claim_ids:
+        for path in paths:
+            missing.append(
+                {
+                    "claim_id": claim_id,
+                    "reason": "unresolved_provider_hint",
+                    "requested_path": path,
+                    "description": (
+                        "Provider-suggested evidence hint was unresolved because it "
+                        "did not exactly match a safely routed artifact in the "
+                        "analyzed snapshot."
+                    ),
+                }
+            )
+        for reason, description in (
+            (
+                "executed_result_not_available",
+                "No executed result artifact was available in the analyzed snapshot.",
             ),
-        }
-        for claim_id in claim_ids
-    ]
+        ):
+            missing.append(
+                {
+                    "claim_id": claim_id,
+                    "reason": reason,
+                    "requested_path": None,
+                    "description": description,
+                }
+            )
+    has_java_path = any(path.casefold().endswith(".java") for path in paths)
+    has_locality_path = any(
+        path.casefold().endswith(
+            (
+                ".c",
+                ".cc",
+                ".cpp",
+                ".cs",
+                ".go",
+                ".h",
+                ".hpp",
+                ".java",
+                ".js",
+                ".jsx",
+                ".kt",
+                ".py",
+                ".rs",
+                ".scala",
+                ".swift",
+                ".ts",
+                ".tsx",
+            )
+        )
+        for path in paths
+    )
     constraints = {
         claim_id: {
-            "kind": "unlocalized_evidence",
-            "state": "incomplete",
-            "evidence_ids": [],
-            "required_interpretation": (
-                "ClaimCI cannot verify this claim from the exact source/test evidence "
-                "because the available bounded excerpts could not be localized to the "
-                "material region."
+            "kind": "java_test_cardinality",
+            "state": "contradicted",
+            "claimed_count": 999999999999999,
+            "observed_count": 999999999999998,
+            "evidence_id": (
+                evidence_ids_by_claim_id[claim_id][0]
+                if evidence_ids_by_claim_id[claim_id]
+                else None
             ),
-            "required_citations": [],
+            "evidence_ids": list(evidence_ids_by_claim_id[claim_id]),
+            "required_interpretation": (
+                "The complete source contains a bounded deterministic cardinality "
+                "that contradicts the claimed count; this is source support and not "
+                "evidence that any tests were executed."
+            ),
+            "required_citations": list(evidence_ids_by_claim_id[claim_id]),
         }
         for claim_id in claim_ids
+        if has_java_path
     }
-    audits = [
-        {
-            "manifest_path": f"audit-{index}.yaml",
-            "verdict": "PASS",
-            "metric": "metric",
-            "minimum_improvement": 0.0,
-            "direction": "higher",
-            "findings": [],
+    if has_locality_path and not has_java_path:
+        constraints = {
+            claim_id: {
+                "kind": "unlocalized_evidence",
+                "state": "incomplete",
+                "evidence_ids": list(evidence_ids_by_claim_id[claim_id]),
+                "required_interpretation": (
+                    "ClaimCI cannot verify this claim from the exact source/test "
+                    "evidence because the available bounded excerpts could not be "
+                    "localized to the material region."
+                ),
+                "required_citations": [],
+            }
+            for claim_id in claim_ids
         }
-        for index in range(min(4, evidence_count))
-    ]
+    manifest_count = sum(
+        path.casefold().endswith(("research.yaml", "research.yml"))
+        for path in paths
+    )
+    audits: list[dict[str, str]] = []
+    if manifest_count:
+        placeholder = [{"reserved": ""}]
+        fixed = serialized_chars(placeholder)
+        placeholder[0]["reserved"] = "x" * (MAX_SYNTHESIS_AUDIT_CHARS - fixed)
+        audits = placeholder
     parts = build_synthesis_request_parts(
         claims,
         evidence,
@@ -524,11 +651,14 @@ def worst_valid_synthesis_request_chars(
 
 __all__ = [
     "EXTRACTION_CONTRACT",
+    "MAX_SYNTHESIS_AUDIT_CHARS",
     "REVIEW_SYSTEM_POLICY",
     "RequestParts",
     "SYNTHESIS_CONTRACT",
     "build_extraction_request_parts",
     "build_synthesis_request_parts",
+    "bound_synthesis_audits",
+    "deduplicate_missing_evidence",
     "extraction_schema",
     "logical_request_chars",
     "output_budget_ready",

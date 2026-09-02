@@ -27,6 +27,16 @@ _GIT_TIMEOUT_SECONDS = 10.0
 _MAX_GIT_ERROR_BYTES = 4_096
 
 
+class InventoryVerificationError(ReviewError):
+    """Typed, content-free failure at the trusted inventory boundary."""
+
+    def __init__(self, code: str, message: str) -> None:
+        if not isinstance(code, str) or not code.startswith("PREFLIGHT_G1_"):
+            raise ValueError("inventory verification code is invalid")
+        self.code = code
+        super().__init__(message)
+
+
 class _GitCommandError(Exception):
     """A Git invocation failed without retaining its untrusted diagnostics."""
 
@@ -174,13 +184,22 @@ def _verify_snapshot(identity: SnapshotIdentity) -> None:
             stdout_limit=129,
         ).strip()
     except (_GitCommandError, _GitOutputLimitError) as exc:
-        raise ReviewError("snapshot Git identity could not be verified") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot Git identity could not be verified",
+        ) from exc
     try:
         actual_sha = resolved_head.decode("ascii")
     except UnicodeDecodeError as exc:
-        raise ReviewError("snapshot Git identity could not be verified") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot Git identity could not be verified",
+        ) from exc
     if actual_sha != identity.sha:
-        raise ReviewError("snapshot SHA identity mismatch")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH",
+            "snapshot SHA identity mismatch",
+        )
 
     try:
         _run_git(
@@ -189,7 +208,10 @@ def _verify_snapshot(identity: SnapshotIdentity) -> None:
             stdout_limit=0,
         )
     except (_GitCommandError, _GitOutputLimitError) as exc:
-        raise ReviewError("snapshot index is dirty or unavailable") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot index is dirty or unavailable",
+        ) from exc
 
     try:
         worktree_changes = _run_git(
@@ -206,9 +228,15 @@ def _verify_snapshot(identity: SnapshotIdentity) -> None:
             stdout_limit=1,
         )
     except (_GitCommandError, _GitOutputLimitError) as exc:
-        raise ReviewError("snapshot worktree is dirty or unavailable") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot worktree is dirty or unavailable",
+        ) from exc
     if worktree_changes:
-        raise ReviewError("snapshot worktree is dirty")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot worktree is dirty",
+        )
 
 
 def _require_commit_object(root: Path, sha: str) -> None:
@@ -219,7 +247,10 @@ def _require_commit_object(root: Path, sha: str) -> None:
             stdout_limit=0,
         )
     except (_GitCommandError, _GitOutputLimitError) as exc:
-        raise ReviewError("required Git commit object is unavailable") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "required Git commit object is unavailable",
+        ) from exc
 
 
 def _verify_coordinates(
@@ -235,24 +266,39 @@ def _verify_coordinates(
         SnapshotRole.HEAD,
     )
     if not all(isinstance(identity, SnapshotIdentity) for identity in identities):
-        raise ReviewError("snapshot identities are invalid")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot identities are invalid",
+        )
     if tuple(identity.role for identity in identities) != expected_roles:
-        raise ReviewError("snapshot roles do not match their coordinates")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot roles do not match their coordinates",
+        )
     if not isinstance(comparison_basis, ComparisonBasis):
-        raise ReviewError("comparison basis is invalid")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_COMPARISON_BASE_MISMATCH",
+            "comparison basis is invalid",
+        )
 
     shas_by_root: dict[Path, str] = {}
     for identity in identities:
         prior = shas_by_root.setdefault(identity.root, identity.sha)
         if prior != identity.sha:
-            raise ReviewError("one snapshot root cannot identify different commits")
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH",
+                "one snapshot root cannot identify different commits",
+            )
         _verify_snapshot(identity)
 
     _require_commit_object(head.root, requested_base.sha)
     _require_commit_object(head.root, comparison_base.sha)
     if comparison_basis is ComparisonBasis.DIRECT_BASE:
         if comparison_base.sha != requested_base.sha:
-            raise ReviewError("direct comparison base does not match requested base")
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_COMPARISON_BASE_MISMATCH",
+                "direct comparison base does not match requested base",
+            )
         return
 
     try:
@@ -263,24 +309,42 @@ def _verify_coordinates(
         )
         lines = encoded.decode("ascii").splitlines()
     except (_GitCommandError, _GitOutputLimitError, UnicodeDecodeError) as exc:
-        raise ReviewError("unique Git merge base could not be verified") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_COMPARISON_BASE_MISMATCH",
+            "unique Git merge base could not be verified",
+        ) from exc
     if len(lines) != 1:
-        raise ReviewError("unique Git merge base could not be verified")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_COMPARISON_BASE_MISMATCH",
+            "unique Git merge base could not be verified",
+        )
     if lines[0] != comparison_base.sha:
-        raise ReviewError("declared comparison base does not match Git merge base")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_COMPARISON_BASE_MISMATCH",
+            "declared comparison base does not match Git merge base",
+        )
 
 
 def _parse_change_entries(encoded: bytes) -> tuple[ChangeEntry, ...]:
     if not encoded:
         return ()
     if not encoded.endswith(b"\0"):
-        raise ReviewError("Git change metadata is malformed")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "Git change metadata is malformed",
+        )
     fields = encoded[:-1].split(b"\0")
     if len(fields) % 2 != 0:
-        raise ReviewError("Git change metadata is malformed")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "Git change metadata is malformed",
+        )
     entry_count = len(fields) // 2
     if entry_count > MAX_CHANGE_INVENTORY_ENTRIES:
-        raise ReviewError("Git change metadata exceeds the entry limit")
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGESET_PATH_LIMIT",
+            "Git change metadata exceeds the entry limit",
+        )
 
     statuses = {
         b"A": ChangeStatus.ADDED,
@@ -291,12 +355,18 @@ def _parse_change_entries(encoded: bytes) -> tuple[ChangeEntry, ...]:
     for index in range(0, len(fields), 2):
         status = statuses.get(fields[index])
         if status is None:
-            raise ReviewError("Git change metadata has an unsupported status")
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_CHANGE_INVENTORY_STATUS_INVALID",
+                "Git change metadata has an unsupported status",
+            )
         try:
             path = fields[index + 1].decode("utf-8", errors="strict")
             entries.append(ChangeEntry(path=path, status=status))
         except (UnicodeDecodeError, ReviewError) as exc:
-            raise ReviewError("Git change metadata contains an invalid path") from exc
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH",
+                "Git change metadata contains an invalid path",
+            ) from exc
     return tuple(sorted(entries, key=lambda entry: (entry.path, entry.status.value)))
 
 
@@ -327,9 +397,15 @@ def build_git_change_inventory(
             stdout_limit=MAX_CHANGESET_METADATA_BYTES,
         )
     except _GitOutputLimitError as exc:
-        raise ReviewError("Git change metadata exceeds the metadata limit") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGESET_METADATA_BYTES_LIMIT",
+            "Git change metadata exceeds the metadata limit",
+        ) from exc
     except _GitCommandError as exc:
-        raise ReviewError("Git change metadata is unavailable") from exc
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_UNAVAILABLE",
+            "Git change metadata is unavailable",
+        ) from exc
     entries = _parse_change_entries(encoded)
     return ChangeInventory(
         schema_version=1,
