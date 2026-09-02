@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 class ReviewError(ValueError):
@@ -55,8 +56,32 @@ class ReviewStatus(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class ComparisonBasis(str, Enum):
+    DIRECT_BASE = "direct_base"
+    MERGE_BASE = "merge_base"
+
+
+class ChangeStatus(str, Enum):
+    ADDED = "added"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+
+
+class ChangeInventorySource(str, Enum):
+    TRUSTED_GIT_OBJECT_GRAPH = "trusted_git_object_graph"
+    LEGACY_PAIRWISE = "legacy_pairwise"
+
+
+class SnapshotRole(str, Enum):
+    REQUESTED_BASE = "requested_base"
+    COMPARISON_BASE = "comparison_base"
+    HEAD = "head"
+
+
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 MAX_RECORDED_TOKEN_COUNT = 1_000_000_000_000
+MAX_CHANGE_INVENTORY_ENTRIES = 8_192
 
 
 def _nonempty_text(value: object, label: str, *, max_chars: int = 16_000) -> str:
@@ -84,6 +109,125 @@ def _relative_path(value: object, label: str) -> str:
     if normalized in {"", "."}:
         raise ReviewError(f"{label} must name a file")
     return normalized
+
+
+def _full_git_object_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _FULL_GIT_OBJECT_ID.fullmatch(value):
+        raise ReviewError(f"{label} must be a full lowercase Git object ID")
+    return value
+
+
+def _portable_inventory_path(value: object) -> str:
+    """Validate an already-canonical portable repository path.
+
+    Inventory metadata is an identity boundary, so aliases are rejected rather
+    than normalized into another spelling.
+    """
+
+    text = _nonempty_text(value, "change path", max_chars=4_096)
+    windows = PureWindowsPath(text)
+    components = text.split("/")
+    if (
+        "\\" in text
+        or windows.drive
+        or PurePosixPath(text).is_absolute()
+        or any(component in {"", ".", ".."} for component in components)
+        or any(unicodedata.category(character) == "Cc" for character in text)
+    ):
+        raise ReviewError("change path must be a canonical portable relative path")
+    if PurePosixPath(text).as_posix() != text:
+        raise ReviewError("change path must be a canonical portable relative path")
+    return text
+
+
+@dataclass(frozen=True)
+class SnapshotIdentity:
+    role: SnapshotRole
+    root: Path
+    sha: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, SnapshotRole):
+            raise ReviewError("snapshot role is invalid")
+        if not isinstance(self.root, Path):
+            raise ReviewError("snapshot root must be a Path")
+        try:
+            if not self.root.is_absolute() or self.root.is_symlink():
+                raise ReviewError("snapshot root must be a resolved regular directory")
+            resolved = self.root.resolve(strict=True)
+        except ReviewError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ReviewError("snapshot root must be a resolved regular directory") from exc
+        if resolved != self.root or not resolved.is_dir():
+            raise ReviewError("snapshot root must be a resolved regular directory")
+        _full_git_object_id(self.sha, "snapshot sha")
+
+
+@dataclass(frozen=True)
+class ChangeEntry:
+    path: str
+    status: ChangeStatus
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _portable_inventory_path(self.path))
+        if not isinstance(self.status, ChangeStatus):
+            raise ReviewError("change status is invalid")
+
+
+@dataclass(frozen=True)
+class ChangeInventory:
+    schema_version: int
+    requested_base_sha: str
+    comparison_base_sha: str
+    head_sha: str
+    comparison_basis: ComparisonBasis
+    source: ChangeInventorySource
+    declared_entry_count: int
+    complete: bool
+    entries: tuple[ChangeEntry, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != 1
+        ):
+            raise ReviewError("change inventory schema_version must be 1")
+        _full_git_object_id(self.requested_base_sha, "requested base sha")
+        _full_git_object_id(self.comparison_base_sha, "comparison base sha")
+        _full_git_object_id(self.head_sha, "head sha")
+        if not isinstance(self.comparison_basis, ComparisonBasis):
+            raise ReviewError("comparison basis is invalid")
+        if not isinstance(self.source, ChangeInventorySource):
+            raise ReviewError("change inventory source is invalid")
+        if (
+            isinstance(self.declared_entry_count, bool)
+            or not isinstance(self.declared_entry_count, int)
+            or not 0 <= self.declared_entry_count <= MAX_CHANGE_INVENTORY_ENTRIES
+        ):
+            raise ReviewError("declared change entry count is invalid")
+        if not isinstance(self.complete, bool):
+            raise ReviewError("change inventory completeness must be a boolean")
+        if not isinstance(self.entries, tuple) or not all(
+            isinstance(entry, ChangeEntry) for entry in self.entries
+        ):
+            raise ReviewError("change inventory entries must be ChangeEntry values")
+        if self.declared_entry_count != len(self.entries):
+            raise ReviewError("declared change entry count is inconsistent")
+        if self.source is ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH and not self.complete:
+            raise ReviewError("trusted Git change inventory must be complete")
+        if (
+            self.comparison_basis is ComparisonBasis.DIRECT_BASE
+            and self.comparison_base_sha != self.requested_base_sha
+        ):
+            raise ReviewError("direct comparison base must equal requested base")
+        expected = tuple(sorted(self.entries, key=lambda entry: (entry.path, entry.status.value)))
+        if expected != self.entries:
+            raise ReviewError("change inventory entries must be in canonical POSIX order")
+        folded_paths = tuple(entry.path.casefold() for entry in self.entries)
+        if len(set(folded_paths)) != len(folded_paths):
+            raise ReviewError("change inventory paths must be unique")
 
 
 def _positive_int(value: object, label: str, maximum: int) -> int:
