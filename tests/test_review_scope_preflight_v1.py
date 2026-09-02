@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 
 import claimci.review.preflight as preflight_module
+from claimci.passive_files import PassiveFileError
 from claimci.review.models import (
     ChangeEntry,
     ChangeInventory,
     ChangeInventorySource,
     ChangeStatus,
     ComparisonBasis,
+    GateDisposition,
     MaterialClaimSeed,
     ReviewConfig,
     ReviewLimits,
@@ -21,7 +23,11 @@ from claimci.review.models import (
     SourceKind,
 )
 from claimci.review.orchestrator import ReviewInputs
-from claimci.review.preflight import build_review_scope, scope_source_bundle
+from claimci.review.preflight import (
+    build_review_scope,
+    preflight_review,
+    scope_source_bundle,
+)
 
 
 BASE = "a" * 40
@@ -633,3 +639,45 @@ def test_incomplete_legacy_inventory_cannot_claim_declared_complete_scope(
     assert "PREFLIGHT_G1_CHANGESET_INCOMPLETE" in {
         issue.code for issue in scope.issues
     }
+
+
+def test_legacy_gate1_failure_filters_prior_gate2_inventory_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later comparison cap cannot misfile an earlier status error in Gate 1."""
+
+    head = (tmp_path / "head").resolve()
+    base = (tmp_path / "base").resolve()
+    head.mkdir()
+    base.mkdir()
+    for name in ("a-results.json", "b-results.json"):
+        _write(head, name, "same\n")
+        _write(base, name, "same\n")
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def first_status_unknown(root: Path, path: str, *, max_bytes: int):
+        if path == "a-results.json":
+            raise PassiveFileError("identity changed", code="changed")
+        return real_capture(root, path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "MAX_CHANGE_COMPARISON_FILES", 1)
+    monkeypatch.setattr(
+        preflight_module, "capture_confined_regular_file", first_status_unknown
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Benchmark accuracy improves in a-results.json",
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert {reason.code for reason in result.gates[0].reasons} == {
+        "PREFLIGHT_G1_COMPARISON_FILE_LIMIT"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED

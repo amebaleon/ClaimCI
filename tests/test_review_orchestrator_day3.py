@@ -18,6 +18,7 @@ from typing import Any, Callable
 import pytest
 import yaml
 
+from claimci.passive_files import PassiveFileError
 from claimci.review.models import (
     ChangeEntry,
     ChangeInventory,
@@ -493,6 +494,138 @@ def test_provider_ready_partial_legacy_scope_is_retained_and_caps_status(
     assert result.preflight.scope.complete is False
     assert result.status is ReviewStatus.PARTIAL
     assert len(provider.calls) == 2
+
+
+def test_legacy_one_shot_change_status_failure_is_not_rescanned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient second pass must not erase the first hard Gate-2 result."""
+
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.preflight as preflight_module
+
+    head = (tmp_path / "head").resolve()
+    base = (tmp_path / "base").resolve()
+    head.mkdir()
+    base.mkdir()
+    (head / "results.json").write_text("same\n", encoding="utf-8")
+    (base / "results.json").write_text("same\n", encoding="utf-8")
+    real_capture = preflight_module.capture_confined_regular_file
+    comparison_capture_attempts = 0
+
+    def one_shot_changed(root: Path, path: str, *, max_bytes: int):
+        nonlocal comparison_capture_attempts
+        if path == "results.json":
+            comparison_capture_attempts += 1
+            if comparison_capture_attempts == 1:
+                raise PassiveFileError("identity changed once", code="changed")
+        return real_capture(root, path, max_bytes=max_bytes)
+
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("hard legacy failure reached provider construction")
+
+    monkeypatch.setattr(
+        preflight_module, "capture_confined_regular_file", one_shot_changed
+    )
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Benchmark accuracy improves in results.json",
+        ),
+        _config(),
+    )
+
+    assert comparison_capture_attempts == 1
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.preflight is not None
+    assert result.preflight.gates[1].disposition.value == "fail"
+    assert {
+        reason.code for reason in result.preflight.gates[1].reasons
+    } >= {"PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN"}
+    assert result.preflight.gates[2].disposition.value == "not_evaluated"
+    assert result.provider_calls == ()
+
+
+def test_legacy_empty_sole_route_failure_does_not_fall_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An issued but non-citable sole route remains the original Gate-2 failure."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    repository = (tmp_path / "repo").resolve()
+    repository.mkdir()
+    (repository / "results.json").write_text("", encoding="utf-8")
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("empty sole route reached provider construction")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Benchmark accuracy improves in results.json",
+        ),
+        _config(),
+    )
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.selected_paths == ("results.json",)
+    assert {
+        reason.code for reason in result.preflight.gates[1].reasons
+    } >= {
+        "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED",
+        "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH",
+    }
+    assert result.preflight.gates[2].disposition.value == "not_evaluated"
+    assert result.provider_calls == ()
+
+
+def test_legacy_gate3_failure_does_not_fall_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy compatibility cannot bypass the fixed two-call preflight gate."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs = _inputs(tmp_path)
+    (inputs.repository_root / "results.json").write_text(
+        '{"accuracy": 0.95}\n', encoding="utf-8"
+    )
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("failed Gate 3 reached provider construction")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(inputs, _config(max_calls=1))
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "PREFLIGHT_G3_CALL_LIMIT_LT_TWO"
+    assert result.preflight is not None
+    assert result.preflight.gates[2].disposition.value == "fail"
+    assert result.provider_calls == ()
 
 
 def test_disabled_review_skips_preflight_and_default_provider_factory(
@@ -1037,6 +1170,78 @@ def test_context_limit_allocates_oversized_synthesis_inputs_before_second_call(
         16_000,
         16_000,
     ]
+
+
+def test_synthesis_rejects_citation_to_evidence_omitted_from_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full review evidence cannot authorize an ID omitted by allocation."""
+
+    omitted_id = "evidence-omitted-by-synthesis-budget"
+
+    def oversized_evidence(
+        _root: Path,
+        claims: tuple[Any, ...],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> EvidenceBundle:
+        claim_id = claims[0].claim_id
+        excerpt = "x" * 16_000
+        return EvidenceBundle(
+            references=(
+                EvidenceReference(
+                    evidence_id=omitted_id,
+                    claim_ids=(claim_id,),
+                    kind=EvidenceKind.BENCHMARK,
+                    path="README.md",
+                    start_line=1,
+                    end_line=1,
+                    sha256="0" * 64,
+                    size=len(excerpt),
+                    excerpt=excerpt,
+                ),
+            ),
+            total_chars=len(excerpt),
+        )
+
+    def cite_omitted_evidence(request: StructuredRequest) -> str:
+        claim_id = request.payload["claims"][0]["claim_id"]
+        assert request.payload["evidence"] == []
+        assert request.payload["evidence_ids_by_claim_id"] == {claim_id: []}
+        return json.dumps(
+            {
+                "interpretations": [
+                    {
+                        "claim_id": claim_id,
+                        "interpretation": "The omitted evidence supports the claim.",
+                        "citations": [omitted_id],
+                        "missing_evidence": [],
+                        "unsupported_inferences": [],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.discover_evidence", oversized_evidence
+    )
+    provider = FakeProvider(synthesis=cite_omitted_evidence)
+
+    result = _run(
+        tmp_path,
+        provider,
+        config=_config(max_context_chars=4_000),
+    )
+
+    assert len(provider.calls) == 2
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "SYNTHESIS_INVALID"
+    assert result.interpretations == ()
+    assert {reference.evidence_id for reference in result.evidence.references} == {
+        omitted_id
+    }
 
 
 def test_file_limit_is_global_across_sources_evidence_and_manifests(

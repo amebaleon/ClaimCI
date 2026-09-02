@@ -32,6 +32,7 @@ from .models import (
     ReviewConfig,
     ReviewError,
     ReviewInventoryFailure,
+    ReviewMaterialKind,
     ReviewPreflight,
     ReviewStatus,
     ScientificClaim,
@@ -44,6 +45,7 @@ from .provider import (
     ReviewerProvider,
     StructuredRequest,
 )
+from .path_policy import classify_review_material
 from .request_budget import (
     allocate_synthesis_inputs,
     build_extraction_request_parts,
@@ -71,6 +73,19 @@ from .tools import (
 
 
 MAX_PROVIDER_JSON_DEPTH = 64
+_LEGACY_COMPATIBILITY_GATE2_REASONS = frozenset(
+    {
+        "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
+        "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+        "PREFLIGHT_G2_EXTERNAL_EVIDENCE_ONLY",
+        "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED",
+        "PREFLIGHT_G2_NO_MATERIAL_CLAIM_SEED",
+        "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH",
+        "PREFLIGHT_G2_ONLY_DELETED_ROUTABLE_PATH",
+        "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+        "PREFLIGHT_G2_UNSUPPORTED_MATERIAL_TYPE",
+    }
+)
 
 
 def OpenAIReviewerProvider(**kwargs: Any) -> ReviewerProvider:
@@ -490,6 +505,7 @@ def _parse_interpretations(
     claims: tuple[ScientificClaim, ...],
     evidence: EvidenceBundle,
     interpretation_constraints_by_claim_id: Mapping[str, Mapping[str, Any]] | None = None,
+    issued_evidence_ids_by_claim_id: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[ClaimInterpretation, ...]:
     if not isinstance(value, Mapping) or set(value) != {"interpretations"}:
         raise ReviewError("synthesis response must contain only interpretations")
@@ -502,6 +518,37 @@ def _parse_interpretations(
         for item in evidence.references
         if _citable_reference(item)
     }
+    if issued_evidence_ids_by_claim_id is None:
+        issued_evidence_claims = {
+            claim_id: frozenset(
+                evidence_id
+                for evidence_id, owners in evidence_claims.items()
+                if claim_id in owners
+            )
+            for claim_id in claim_ids
+        }
+    else:
+        if (
+            not isinstance(issued_evidence_ids_by_claim_id, Mapping)
+            or set(issued_evidence_ids_by_claim_id) != claim_ids
+        ):
+            raise ReviewError("synthesis issued evidence ownership is invalid")
+        issued_evidence_claims: dict[str, frozenset[str]] = {}
+        for claim_id, raw_ids in issued_evidence_ids_by_claim_id.items():
+            if not isinstance(raw_ids, Sequence) or isinstance(raw_ids, (str, bytes)):
+                raise ReviewError("synthesis issued evidence ownership is invalid")
+            allowed = tuple(raw_ids)
+            if (
+                any(
+                    not isinstance(evidence_id, str)
+                    or evidence_id not in evidence_claims
+                    or claim_id not in evidence_claims[evidence_id]
+                    for evidence_id in allowed
+                )
+                or len(set(allowed)) != len(allowed)
+            ):
+                raise ReviewError("synthesis issued evidence ownership is invalid")
+            issued_evidence_claims[claim_id] = frozenset(allowed)
     constraints = interpretation_constraints_by_claim_id or {}
     expected = {
         "claim_id",
@@ -528,10 +575,11 @@ def _parse_interpretations(
         if any(
             citation not in evidence_claims
             or claim_id not in evidence_claims[citation]
+            or citation not in issued_evidence_claims[claim_id]
             for citation in citations
         ):
             raise ReviewError(
-                "synthesis cites unknown or claim-mismatched repository evidence"
+                "synthesis cites unknown, omitted, or claim-mismatched repository evidence"
             )
         constraint = constraints.get(claim_id)
         if constraint is not None and (
@@ -644,6 +692,46 @@ def _record_call(
         usage=response.usage,
         input_chars=input_chars,
         output_chars=len(response.output_text),
+    )
+
+
+def _legacy_compatibility_fallback_allowed(
+    planned: ReviewPreflight,
+) -> bool:
+    """Allow only historical soft routing gaps without recomputing preflight."""
+
+    gate1, gate2, gate3 = planned.gates
+    scope = planned.scope
+    soft_reasons = {reason.code for reason in gate2.reasons}
+    has_legacy_document = bool(
+        scope
+        and any(
+            source.path is not None and bool(source.text)
+            for source in scope.sources
+        )
+    )
+    has_legacy_source_or_test = bool(
+        scope
+        and any(
+            classify_review_material(path)
+            in {ReviewMaterialKind.SOURCE, ReviewMaterialKind.TEST}
+            for path in scope.selected_paths
+        )
+    )
+    return (
+        not planned.ready_for_provider
+        and scope is not None
+        and gate1.disposition is GateDisposition.PASS_COMPLETE
+        and gate2.disposition is GateDisposition.FAIL
+        and bool(soft_reasons)
+        and soft_reasons.issubset(_LEGACY_COMPATIBILITY_GATE2_REASONS)
+        and (
+            not scope.selected_paths
+            or has_legacy_document
+            or has_legacy_source_or_test
+            or "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE" in soft_reasons
+        )
+        and gate3.disposition is GateDisposition.NOT_EVALUATED
     )
 
 
@@ -807,7 +895,6 @@ def run_review(
         )
     )
     from .preflight import (
-        legacy_preflight_failure,
         preflight_review,
         scope_source_bundle,
     )
@@ -815,15 +902,14 @@ def run_review(
     if declared:
         preflight = preflight_review(inputs, config)
     else:
-        # A legacy caller keeps the established permissive review path when
-        # material-seed routing alone cannot establish the new coordinate-
-        # bound contract.  When the bounded legacy planner is provider-ready,
-        # retain that scope identity and consume its exact shortlist.
+        # Preserve only established soft legacy routing compatibility. Every
+        # hard result keeps the exact first-pass gates; preflight and inventory
+        # are never recomputed to seek a more permissive outcome.
         planned_legacy = preflight_review(inputs, config)
         preflight = (
-            planned_legacy
-            if planned_legacy.ready_for_provider
-            else legacy_preflight_failure(inputs, config)
+            None
+            if _legacy_compatibility_fallback_allowed(planned_legacy)
+            else planned_legacy
         )
     if preflight is not None and not preflight.ready_for_provider:
         failure = next(
@@ -1248,6 +1334,7 @@ def run_review(
                 synthesis_parts.payload[
                     "interpretation_constraints_by_claim_id"
                 ],
+                synthesis_parts.payload["evidence_ids_by_claim_id"],
             )
         except ReviewError as exc:
             validation_message = (

@@ -1534,7 +1534,12 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
     if not declared:
         inventory, legacy_issues = _legacy_inventory(inputs)
         if inventory is None:
-            gate1 = _gate_result(1, GateDisposition.FAIL, legacy_issues, {})
+            gate1_reasons = tuple(
+                issue
+                for issue in legacy_issues
+                if issue.code.startswith("PREFLIGHT_G1_")
+            )
+            gate1 = _gate_result(1, GateDisposition.FAIL, gate1_reasons, {})
             return ReviewPreflight(
                 schema_version=1,
                 requested_base_sha="0" * 40,
