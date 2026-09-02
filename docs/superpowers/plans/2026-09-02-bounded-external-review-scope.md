@@ -122,10 +122,10 @@
   ```text
   git -c core.quotepath=false rev-parse --verify HEAD^{commit}
   git -c core.quotepath=false merge-base --all <requested-base> <head>
-  git -c core.quotepath=false diff-tree -r --no-commit-id --name-status -z --no-renames --no-ext-diff --ignore-submodules=all <comparison-base> <head>
+  git -c core.quotepath=false diff-tree -r --no-commit-id --name-status -z --no-renames --no-ext-diff <comparison-base> <head>
   ```
 
-  Read at most 1 MiB plus one sentinel byte from the metadata stream, enforce 8,192 entries, parse only `A`, `M`, and `D`, require a unique merge base, and sort normalized `ChangeEntry` values by `(path, status.value)`. Do not invoke the shell and do not use `git diff` content, patches, attributes, textconv, submodules, hooks, or worktree file reads.
+  Read at most 1 MiB plus one sentinel byte from the metadata stream, enforce 8,192 entries, parse only `A`, `M`, and `D`, require a unique merge base, and sort normalized `ChangeEntry` values by `(path, status.value)`. Retain added, modified, and deleted gitlink metadata in the complete inventory, but never traverse or materialize a submodule worktree merely because its gitlink changed. Do not invoke the shell and do not use `git diff` content, patches, attributes, textconv, submodule contents, hooks, or worktree file reads.
 
 - [ ] **Step 7: Verify Task 1 and commit**
 

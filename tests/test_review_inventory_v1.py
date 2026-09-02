@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -703,6 +704,14 @@ def _command_argv(*values: str) -> str:
     return shlex.join(values)
 
 
+def _remove_disposable_tree(path: Path) -> None:
+    def make_writable_and_retry(function: object, name: str, _: object) -> None:
+        os.chmod(name, 0o700)
+        function(name)  # type: ignore[operator]
+
+    shutil.rmtree(path, onerror=make_writable_and_retry)
+
+
 @pytest.mark.parametrize("filter_mode", ["clean", "process"])
 def test_git_cleanliness_never_invokes_configured_clean_or_process_filter(
     tmp_path: Path, filter_mode: str, monkeypatch: pytest.MonkeyPatch
@@ -891,3 +900,101 @@ def test_git_runner_rejects_reader_that_remains_alive_after_join(
             )
     finally:
         release.set()
+
+
+def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    submodule_source = (tmp_path / "gitlink-source").resolve()
+    submodule_source.mkdir()
+    _git(submodule_source, "init", "-q")
+    _git(submodule_source, "config", "user.email", "tests@claimci.invalid")
+    _git(submodule_source, "config", "user.name", "ClaimCI Tests")
+    _write(submodule_source, "tracked.txt", "version one\n")
+    gitlink_v1 = _commit(submodule_source, "gitlink v1")
+    _write(submodule_source, "tracked.txt", "version two\n")
+    gitlink_v2 = _commit(submodule_source, "gitlink v2")
+
+    root = (tmp_path / "superproject").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    for relative in ("deps/deleted", "deps/modified"):
+        _git(
+            root,
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            str(submodule_source),
+            relative,
+        )
+        _git(root / relative, "checkout", "-q", gitlink_v1)
+    base = _commit(root, "base gitlinks")
+    base_root = (tmp_path / "base-snapshot").resolve()
+    _git(root, "worktree", "add", "-q", "--detach", str(base_root), base)
+
+    _git(root / "deps" / "modified", "checkout", "-q", gitlink_v2)
+    _remove_disposable_tree(root / "deps" / "deleted")
+    _git(
+        root,
+        "-c",
+        "protocol.file.allow=always",
+        "clone",
+        "-q",
+        str(submodule_source),
+        "deps/added",
+    )
+    _git(root / "deps" / "added", "checkout", "-q", gitlink_v2)
+    head = _commit(root, "head gitlinks")
+
+    marker = tmp_path / "gitlink-worktree-executed.txt"
+    filter_helper = tmp_path / "gitlink-filter.py"
+    filter_helper.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('filter', encoding='utf-8')\n"
+        "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    filter_command = _command_argv(sys.executable, str(filter_helper), str(marker))
+    nested_roots = tuple((root / relative).resolve() for relative in ("deps/added", "deps/modified"))
+    for nested_root in nested_roots:
+        _git(nested_root, "config", "filter.danger.clean", filter_command)
+        _write(nested_root, ".gitattributes", "tracked.txt filter=danger\n")
+        _write(nested_root, "tracked.txt", "dirty worktree\n")
+        hook = nested_root / ".git" / "hooks" / "pre-commit"
+        hook.write_text(
+            f"#!/bin/sh\nprintf hook > {shlex.quote(str(marker))}\nexit 91\n",
+            encoding="utf-8",
+        )
+        os.chmod(hook, 0o700)
+
+    git_cwds: list[Path] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object):
+        cwd = kwargs.get("cwd")
+        assert isinstance(cwd, str)
+        git_cwds.append(Path(cwd).resolve())
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(inventory_module.subprocess, "Popen", recording_popen)
+    inventory = build_git_change_inventory(
+        _identity(SnapshotRole.REQUESTED_BASE, base_root, base),
+        _identity(SnapshotRole.COMPARISON_BASE, base_root, base),
+        _identity(SnapshotRole.HEAD, root, head),
+        ComparisonBasis.DIRECT_BASE,
+    )
+
+    assert inventory.complete is True
+    assert inventory.entries == (
+        ChangeEntry("deps/added", ChangeStatus.ADDED),
+        ChangeEntry("deps/deleted", ChangeStatus.DELETED),
+        ChangeEntry("deps/modified", ChangeStatus.MODIFIED),
+    )
+    assert not marker.exists()
+    assert not set(git_cwds).intersection(nested_roots)
