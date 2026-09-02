@@ -173,6 +173,120 @@ def test_exact_path_then_category_overlap_kind_priority_and_path_order_are_deter
     assert bundles[0].total_chars == bundles[1].total_chars
 
 
+def test_failed_captures_consume_the_fixed_read_budget_without_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "results/z_safe.json", "{\"accuracy\": 95}\n")
+    inventory = _inventory(
+        ("results/a_missing.json", ChangeStatus.MODIFIED),
+        ("results/b_missing.json", ChangeStatus.MODIFIED),
+        ("results/z_safe.json", ChangeStatus.MODIFIED),
+    )
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", traced_capture)
+    scope = _scope(
+        root,
+        inventory,
+        title="Benchmark accuracy improves by 5%",
+        limits=ReviewLimits(max_files=2),
+    )
+    assert opened == ["results/a_missing.json", "results/b_missing.json"]
+    assert not scope.selected_paths
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        and issue.path == "results/z_safe.json"
+        for issue in scope.issues
+    )
+
+
+def test_changed_document_seeds_rerank_the_remaining_fixed_budget(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(
+        root,
+        "docs/study.md",
+        "Accuracy improves by 10%; use zz_target/result.json.\n",
+    )
+    _write(root, "aa/result.json", "{\"accuracy\": 90}\n")
+    _write(root, "zz_target/result.json", "{\"accuracy\": 95}\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("aa/result.json", ChangeStatus.MODIFIED),
+            ("docs/study.md", ChangeStatus.MODIFIED),
+            ("zz_target/result.json", ChangeStatus.MODIFIED),
+        ),
+        limits=ReviewLimits(max_files=2),
+    )
+    assert scope.selected_paths == (
+        "docs/study.md",
+        "zz_target/result.json",
+    )
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        and issue.path == "aa/result.json"
+        for issue in scope.issues
+    )
+
+
+def test_path_prefix_is_not_an_exact_inventory_path_mention(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "config/aaa.yaml", "seed: 1\n")
+    _write(root, "config/train.yaml", "seed: 2\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("config/aaa.yaml", ChangeStatus.MODIFIED),
+            ("config/train.yaml", ChangeStatus.MODIFIED),
+        ),
+        description="Reproduce with config/train.yaml.bak.",
+        limits=ReviewLimits(max_files=1),
+    )
+    assert scope.selected_paths == ("config/aaa.yaml",)
+
+
+@pytest.mark.parametrize(
+    "unsafe_reference",
+    [
+        "/outside/results.json",
+        "/results.json",
+        "../../outside/results.json",
+        "../results.json",
+        r"C:\outside\results.json",
+        r"C:\results.json",
+        r"\\server\share\results.json",
+        r"outside\results.json",
+    ],
+)
+def test_absolute_traversal_and_backslash_path_references_are_never_admitted(
+    tmp_path: Path,
+    unsafe_reference: str,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    scope = _scope(
+        root,
+        _inventory(("benchmarks/safe.py", ChangeStatus.MODIFIED)),
+        description=f"Accuracy improved by 10%; see {unsafe_reference}.",
+    )
+    assert scope.issued_paths == ("benchmarks/safe.py",)
+    assert any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH" and issue.path is None
+        for issue in scope.issues
+    )
+
+
 def test_prose_seed_without_a_validated_local_changed_candidate_is_incomplete(
     tmp_path: Path,
 ) -> None:

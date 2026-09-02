@@ -52,8 +52,10 @@ def classify_review_material(path: str) -> ReviewMaterialKind:
     suffix = relative.suffix.casefold()
     tokens = _name_tokens(relative)
 
-    if suffix in {".sh", ".bash"} and tokens & _SUBMISSION_SHELL_TOKENS:
-        return ReviewMaterialKind.SUBMISSION_CONFIG
+    if suffix in {".sh", ".bash"}:
+        if tokens & _SUBMISSION_SHELL_TOKENS:
+            return ReviewMaterialKind.SUBMISSION_CONFIG
+        return ReviewMaterialKind.OTHER
     if suffix in {".md", ".markdown"} or name == "paper.tex":
         return ReviewMaterialKind.DOCUMENT
     if is_test_source_file(portable):

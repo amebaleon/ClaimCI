@@ -70,6 +70,8 @@ def _candidate(
         ("transformers/submit_jobs_qwen3asr.sh", ReviewMaterialKind.SUBMISSION_CONFIG),
         ("scripts/launch_eval.bash", ReviewMaterialKind.SUBMISSION_CONFIG),
         ("scripts/install.sh", ReviewMaterialKind.OTHER),
+        ("benchmarks/install.sh", ReviewMaterialKind.OTHER),
+        ("benchmarks/helpers.bash", ReviewMaterialKind.OTHER),
         ("assets/logo.png", ReviewMaterialKind.OTHER),
     ],
 )

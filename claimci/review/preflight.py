@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from claimci.passive_files import PassiveFileError, capture_confined_regular_file
 
 from .models import (
+    ChangeEntry,
     ChangeInventory,
     ChangeInventorySource,
     ChangeStatus,
@@ -77,8 +79,15 @@ _CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:[_.+-][a-z0-9]+)*")
-_PATH_LITERAL_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_.+-]+/)+[A-Za-z0-9_.+-]+\.[A-Za-z0-9]+"
+_PATH_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.+\\/-])"
+    r"(?:"
+    r"((?:[A-Za-z]:[\\/]|\\\\|/|(?:\.\.?[\\/])+))"
+    r"([A-Za-z0-9_.+-]+(?:[\\/][A-Za-z0-9_.+-]+)*)"
+    r"|"
+    r"([A-Za-z0-9_.+-]+(?:[\\/][A-Za-z0-9_.+-]+)+)"
+    r")"
+    r"(?![A-Za-z0-9_+\\/-])"
 )
 _STOP_TERMS = frozenset(
     {
@@ -174,6 +183,37 @@ def _path_tokens(path: str) -> frozenset[str]:
     return _tokens(" ".join(PurePosixPath(path).parts))
 
 
+@dataclass(frozen=True)
+class _PathReferences:
+    canonical: frozenset[str]
+    unsafe_count: int
+
+
+def _path_references(value: str) -> _PathReferences:
+    canonical: set[str] = set()
+    unsafe_count = 0
+    for match in _PATH_REFERENCE_PATTERN.finditer(value):
+        candidate = "".join(group or "" for group in match.groups()).rstrip(
+            ".,;:!?)]}"
+        )
+        parts = candidate.split("/")
+        if (
+            not candidate
+            or "\\" in candidate
+            or candidate.startswith("/")
+            or re.match(r"^[A-Za-z]:", candidate)
+            or any(part in {"", ".", ".."} for part in parts)
+            or PurePosixPath(candidate).is_absolute()
+        ):
+            unsafe_count += 1
+            continue
+        if PurePosixPath(candidate).as_posix() == candidate:
+            canonical.add(candidate)
+        else:
+            unsafe_count += 1
+    return _PathReferences(frozenset(canonical), unsafe_count)
+
+
 def _seeds(records: tuple[SourceRecord, ...], max_seeds: int) -> tuple[MaterialClaimSeed, ...]:
     seeds: list[MaterialClaimSeed] = []
     for record in records:
@@ -194,12 +234,19 @@ def _seeds(records: tuple[SourceRecord, ...], max_seeds: int) -> tuple[MaterialC
     return tuple(seeds)
 
 
-def _source_text_by_id(records: tuple[SourceRecord, ...]) -> dict[str, str]:
-    return {record.source_id: record.text.casefold() for record in records}
+def _source_path_references(
+    records: tuple[SourceRecord, ...],
+) -> dict[str, _PathReferences]:
+    return {record.source_id: _path_references(record.text) for record in records}
 
 
-def _exact_mentions(path: str, seed: MaterialClaimSeed, texts: dict[str, str]) -> bool:
-    return path.casefold() in texts.get(seed.origin_source_id, "")
+def _exact_mentions(
+    path: str,
+    seed: MaterialClaimSeed,
+    references: dict[str, _PathReferences],
+) -> bool:
+    source_references = references.get(seed.origin_source_id)
+    return source_references is not None and path in source_references.canonical
 
 
 def _kind_agrees(kind: ReviewMaterialKind, seed: MaterialClaimSeed) -> bool:
@@ -210,9 +257,9 @@ def _rank_key(
     path: str,
     kind: ReviewMaterialKind,
     seeds: tuple[MaterialClaimSeed, ...],
-    texts: dict[str, str],
+    references: dict[str, _PathReferences],
 ) -> tuple[int, int, int, int, str]:
-    exact = any(_exact_mentions(path, seed, texts) for seed in seeds)
+    exact = any(_exact_mentions(path, seed, references) for seed in seeds)
     category = any(_kind_agrees(kind, seed) for seed in seeds)
     path_terms = _path_tokens(path)
     overlap = max(
@@ -229,28 +276,6 @@ def _issue_sort_key(issue: ScopeIssue) -> tuple[str, str, int, int]:
         -1 if issue.observed is None else issue.observed,
         -1 if issue.limit is None else issue.limit,
     )
-
-
-def _path_mentions(records: tuple[SourceRecord, ...]) -> tuple[tuple[str, ...], int]:
-    mentions: set[str] = set()
-    unsafe_count = 0
-    for record in records:
-        for match in _PATH_LITERAL_PATTERN.findall(record.text):
-            candidate = match.rstrip(".,;:)")
-            try:
-                parts = PurePosixPath(candidate).parts
-                if (
-                    PurePosixPath(candidate).is_absolute()
-                    or any(part in {"", ".", ".."} for part in parts)
-                    or "\\" in candidate
-                ):
-                    unsafe_count += 1
-                    continue
-            except (TypeError, ValueError):
-                unsafe_count += 1
-                continue
-            mentions.add(candidate)
-    return tuple(sorted(mentions)), unsafe_count
 
 
 def build_review_scope(
@@ -292,7 +317,7 @@ def build_review_scope(
 
     metadata_records = tuple(records)
     initial_seeds = _seeds(metadata_records, limits.max_claims)
-    texts = _source_text_by_id(metadata_records)
+    initial_references = _source_path_references(metadata_records)
     classified = tuple(
         (entry, classify_review_material(entry.path)) for entry in inventory.entries
     )
@@ -302,71 +327,124 @@ def build_review_scope(
         if entry.status is not ChangeStatus.DELETED
         and kind is not ReviewMaterialKind.OTHER
     ]
-    candidates.sort(
-        key=lambda item: _rank_key(item[0].path, item[1], initial_seeds, texts)
-    )
 
     selected: list[str] = []
     issues: list[ScopeIssue] = []
-    attempted: set[str] = set()
     materialized_chars = sum(len(record.text) for record in records)
     if not inventory.complete:
         issues.append(ScopeIssue(code="PREFLIGHT_G1_CHANGESET_INCOMPLETE"))
 
-    for entry, kind in candidates:
-        if len(selected) >= limits.max_files or remaining_chars <= 0:
-            continue
-        attempted.add(entry.path)
-        try:
-            capture = capture_confined_regular_file(
-                root,
-                entry.path,
-                max_bytes=MAX_SOURCE_FILE_BYTES,
-            )
-            decoded = capture.content.decode("utf-8", errors="strict")
-        except PassiveFileError as exc:
-            code = (
-                "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"
-                if exc.code == "too_large"
-                else "PREFLIGHT_G2_CANDIDATE_UNREADABLE"
-            )
-            issues.append(
-                ScopeIssue(
-                    code=code,
-                    path=entry.path,
-                    observed=(MAX_SOURCE_FILE_BYTES + 1 if exc.code == "too_large" else None),
-                    limit=(MAX_SOURCE_FILE_BYTES if exc.code == "too_large" else None),
+    def materialize(shortlist: list[tuple[ChangeEntry, ReviewMaterialKind]]) -> None:
+        nonlocal materialized_chars, remaining_chars
+        for entry, kind in shortlist:
+            if remaining_chars <= 0:
+                issues.append(
+                    ScopeIssue(
+                        code="PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+                        path=entry.path,
+                        observed=0,
+                        limit=0,
+                    )
                 )
-            )
-            continue
-        except (UnicodeError, ValueError, RecursionError):
-            issues.append(
-                ScopeIssue(code="PREFLIGHT_G2_CANDIDATE_UNREADABLE", path=entry.path)
-            )
-            continue
-
-        normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
-        excerpt_limit = min(limits.max_file_chars, remaining_chars)
-        text = normalized[:excerpt_limit]
-        if len(normalized) > len(text):
-            issues.append(
-                ScopeIssue(
-                    code="PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
-                    path=entry.path,
-                    observed=len(normalized),
-                    limit=excerpt_limit,
+                continue
+            try:
+                capture = capture_confined_regular_file(
+                    root,
+                    entry.path,
+                    max_bytes=MAX_SOURCE_FILE_BYTES,
                 )
-            )
-        selected.append(entry.path)
-        materialized_chars += len(text)
-        remaining_chars -= len(text)
-        if kind is ReviewMaterialKind.DOCUMENT:
-            records.append(_record(SourceKind.REPOSITORY_FILE, entry.path, text))
+                decoded = capture.content.decode("utf-8", errors="strict")
+            except PassiveFileError as exc:
+                code = (
+                    "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"
+                    if exc.code == "too_large"
+                    else "PREFLIGHT_G2_CANDIDATE_UNREADABLE"
+                )
+                issues.append(
+                    ScopeIssue(
+                        code=code,
+                        path=entry.path,
+                        observed=(
+                            MAX_SOURCE_FILE_BYTES + 1
+                            if exc.code == "too_large"
+                            else None
+                        ),
+                        limit=(MAX_SOURCE_FILE_BYTES if exc.code == "too_large" else None),
+                    )
+                )
+                continue
+            except (UnicodeError, ValueError, RecursionError):
+                issues.append(
+                    ScopeIssue(
+                        code="PREFLIGHT_G2_CANDIDATE_UNREADABLE",
+                        path=entry.path,
+                    )
+                )
+                continue
 
+            normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
+            excerpt_limit = min(limits.max_file_chars, remaining_chars)
+            text = normalized[:excerpt_limit]
+            if len(normalized) > len(text):
+                issues.append(
+                    ScopeIssue(
+                        code="PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+                        path=entry.path,
+                        observed=len(normalized),
+                        limit=excerpt_limit,
+                    )
+                )
+            selected.append(entry.path)
+            materialized_chars += len(text)
+            remaining_chars -= len(text)
+            if kind is ReviewMaterialKind.DOCUMENT:
+                records.append(
+                    _record(
+                        SourceKind.REPOSITORY_FILE,
+                        entry.path,
+                        text,
+                    )
+                )
+
+    documents = [
+        item for item in candidates if item[1] is ReviewMaterialKind.DOCUMENT
+    ]
+    documents.sort(
+        key=lambda item: _rank_key(
+            item[0].path,
+            item[1],
+            initial_seeds,
+            initial_references,
+        )
+    )
+    document_shortlist = documents[: limits.max_files]
+    materialize(document_shortlist)
+
+    document_seed_records = tuple(records)
+    planning_seeds = _seeds(document_seed_records, limits.max_claims)
+    planning_references = _source_path_references(document_seed_records)
+    remaining_candidates = [
+        item for item in candidates if item[1] is not ReviewMaterialKind.DOCUMENT
+    ]
+    remaining_candidates.sort(
+        key=lambda item: _rank_key(
+            item[0].path,
+            item[1],
+            planning_seeds,
+            planning_references,
+        )
+    )
+    remaining_slots = limits.max_files - len(document_shortlist)
+    material_shortlist = remaining_candidates[:remaining_slots]
+    materialize(material_shortlist)
+
+    shortlisted_paths = {
+        entry.path for entry, _kind in document_shortlist + material_shortlist
+    }
     omitted = [
         entry.path
         for entry, _kind in candidates
-        if entry.path not in attempted and entry.path not in selected
+        if entry.path not in shortlisted_paths
     ]
     for path in omitted:
         issues.append(
@@ -380,14 +458,14 @@ def build_review_scope(
 
     all_records = tuple(records)
     seeds = _seeds(all_records, limits.max_claims)
-    texts = _source_text_by_id(all_records)
+    references = _source_path_references(all_records)
     selected_kinds = {
         path: classify_review_material(path) for path in selected
     }
     unrouted_seed_count = 0
     for seed in seeds:
         if any(
-            _exact_mentions(path, seed, texts) or _kind_agrees(kind, seed)
+            _exact_mentions(path, seed, references) or _kind_agrees(kind, seed)
             for path, kind in selected_kinds.items()
         ):
             continue
@@ -414,9 +492,13 @@ def build_review_scope(
         issues.append(ScopeIssue(code="PREFLIGHT_G2_NO_MATERIAL_CLAIM_SEED"))
     if seeds and not selected:
         issues.append(ScopeIssue(code="PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH"))
-    lowered_source_text = "\n".join(record.text.casefold() for record in all_records)
+    all_path_mentions = frozenset(
+        path
+        for source_references in references.values()
+        for path in source_references.canonical
+    )
     mentioned_deleted = tuple(
-        entry for entry in eligible_deleted if entry.path.casefold() in lowered_source_text
+        entry for entry in eligible_deleted if entry.path in all_path_mentions
     )
     for entry in mentioned_deleted:
         issues.append(
@@ -431,12 +513,14 @@ def build_review_scope(
         issues.append(ScopeIssue(code="PREFLIGHT_G2_UNSUPPORTED_MATERIAL_TYPE"))
 
     inventory_paths = {entry.path for entry in inventory.entries}
-    path_mentions, unsafe_mention_count = _path_mentions(all_records)
-    for mention in path_mentions:
+    for mention in sorted(all_path_mentions):
         if mention not in inventory_paths:
             issues.append(
                 ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=mention)
             )
+    unsafe_mention_count = sum(
+        source_references.unsafe_count for source_references in references.values()
+    )
     if unsafe_mention_count:
         issues.append(
             ScopeIssue(
