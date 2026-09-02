@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from claimci.review.evidence import discover_evidence
+from claimci.review.evidence import (
+    EvidenceKind,
+    EvidenceLocality,
+    EvidenceProvenance,
+    discover_evidence,
+)
 from claimci.review.models import (
     ClaimType,
     ReviewError,
@@ -168,6 +173,126 @@ def test_provider_hint_must_still_match_the_trusted_claim_route(
         "PRIVATE_SECRET_NEVER_EGRESS" not in reference.excerpt
         for reference in bundle.references
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_kind"),
+    [
+        ("configs/opaque.ini", EvidenceKind.CONFIG),
+        ("outputs/opaque.json", EvidenceKind.RESULTS),
+        ("manifests/opaque.lock", EvidenceKind.MANIFEST),
+        ("benchmarks/opaque.txt", EvidenceKind.BENCHMARK),
+        ("transformers/submit_jobs_qwen3asr.sh", EvidenceKind.CONFIG),
+    ],
+)
+def test_exact_changed_issued_supporting_artifact_bypasses_only_semantic_route(
+    tmp_path: Path,
+    path: str,
+    expected_kind: EvidenceKind,
+) -> None:
+    """Removing the constrained bypass recreates real exact-hint false gaps."""
+
+    _write(tmp_path, path, "OPAQUE_LOCAL_SUPPORTING_CONFIGURATION\n")
+    claim = ScientificClaim(
+        claim_id="claim-exact-supporting-artifact",
+        source_text="The candidate improves accuracy by five percent.",
+        claim_type=ClaimType.METRIC_IMPROVEMENT,
+        subject="candidate accuracy",
+        source=SourceLocation(
+            source_id="pr-description",
+            kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+            path=None,
+            start_line=1,
+            end_line=1,
+        ),
+        evidence_hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        [claim],
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    reference = next(item for item in bundle.references if item.path == path)
+    assert reference.claim_ids == (claim.claim_id,)
+    assert reference.kind is expected_kind
+    assert reference.provenance is EvidenceProvenance.SUPPORTING_ARTIFACT
+    assert reference.excerpt_locality is EvidenceLocality.COMPLETE_FILE
+    assert not any(item.reason == "route_mismatch" for item in bundle.missing)
+    assert bundle.routing_incomplete is False
+
+
+def test_unissued_exact_hint_is_not_opened_and_cannot_expand_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact provider path outside the issued shortlist remains metadata only."""
+
+    issued = "notes/issued.txt"
+    outside = "private/outside-results.json"
+    _write(tmp_path, issued, "UNRELATED_ISSUED_NOTE\n")
+    _write(tmp_path, outside, "SECRET_OUTSIDE_SCOPE_NEVER_READ\n")
+    claim = _claim("metric_improvement")
+    claim = replace(claim, evidence_hints=(outside,))
+
+    import claimci.review.evidence as evidence_module
+
+    opened: list[str] = []
+    original_capture = evidence_module.capture_confined_regular_file
+
+    def traced_capture(root: Path, relative: str, **kwargs: object):
+        opened.append(relative)
+        return original_capture(root, relative, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_module, "capture_confined_regular_file", traced_capture
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        [claim],
+        (issued,),
+        selected_paths=(issued,),
+        changed_paths=(issued,),
+    )
+
+    assert outside not in opened
+    assert all(
+        "SECRET_OUTSIDE_SCOPE_NEVER_READ" not in ref.excerpt
+        for ref in bundle.references
+    )
+    assert any(
+        item.requested_path == outside
+        and item.reason == "unresolved_provider_hint"
+        for item in bundle.missing
+    )
+    assert bundle.routing_incomplete is True
+
+
+def test_arbitrary_shell_hint_is_not_promoted_to_review_evidence(tmp_path: Path) -> None:
+    """Shell support is a fixed submission-runner exception, not a suffix allowlist."""
+
+    path = "scripts/metrics.sh"
+    _write(tmp_path, path, "echo ARBITRARY_SHELL_MUST_NOT_ROUTE\n")
+    claim = _claim("metric_improvement")
+    claim = replace(claim, evidence_hints=(path,))
+
+    bundle = discover_evidence(
+        tmp_path,
+        [claim],
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    assert bundle.references == ()
+    assert any(
+        item.requested_path == path and item.reason == "route_mismatch"
+        for item in bundle.missing
+    )
+    assert bundle.routing_incomplete is True
 
 
 def test_provider_normalization_terms_cannot_expand_beyond_the_exact_quote(

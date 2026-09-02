@@ -1384,9 +1384,9 @@ def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
     assert isinstance(reserved, int)
     assert actual_chars <= reserved <= 60_000
     assert result.status is ReviewStatus.PARTIAL
-    assert "PREFLIGHT_G3_SYNTHESIS_MISSING_EVIDENCE_OMITTED" in _issue_codes(
-        result.preflight, 3
-    )
+    issue_codes = _issue_codes(result.preflight, 3)
+    assert "PREFLIGHT_G3_SYNTHESIS_EVIDENCE_OMITTED" in issue_codes
+    assert "PREFLIGHT_G3_SYNTHESIS_MISSING_EVIDENCE_OMITTED" not in issue_codes
 
 
 def test_runtime_allocates_all_provider_valid_missing_rows_with_explicit_omissions(

@@ -201,6 +201,49 @@ def _run(
     return run_review(_inputs(tmp_path, title=title), config or _config(), provider=provider)
 
 
+def _declared_run_inputs(
+    tmp_path: Path,
+    *,
+    title: str = "Benchmark accuracy improves by 5% in results.json",
+) -> tuple[ReviewInputs, ChangeInventory]:
+    """Build a compact coordinate-bound fixture without invoking Git."""
+
+    base = (tmp_path / "base").resolve()
+    head = (tmp_path / "head").resolve()
+    base.mkdir(parents=True)
+    head.mkdir(parents=True)
+    (head / "results.json").write_text('{"accuracy": 0.95}\n', encoding="utf-8")
+    requested_sha = "1" * 40
+    head_sha = "2" * 40
+    inventory = ChangeInventory(
+        schema_version=1,
+        requested_base_sha=requested_sha,
+        comparison_base_sha=requested_sha,
+        head_sha=head_sha,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
+        declared_entry_count=1,
+        complete=True,
+        entries=(ChangeEntry("results.json", ChangeStatus.ADDED),),
+    )
+    return (
+        ReviewInputs(
+            repository_root=head,
+            pr_title=title,
+            pr_description="The bounded result is included in this change.",
+            requested_base=SnapshotIdentity(
+                SnapshotRole.REQUESTED_BASE, base, requested_sha
+            ),
+            comparison_base=SnapshotIdentity(
+                SnapshotRole.COMPARISON_BASE, base, requested_sha
+            ),
+            head=SnapshotIdentity(SnapshotRole.HEAD, head, head_sha),
+            inventory=inventory,
+        ),
+        inventory,
+    )
+
+
 def _wrap_pipeline(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
     """Trace every trusted stage while retaining its implementation."""
 
@@ -222,6 +265,147 @@ def _wrap_pipeline(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(orchestrator, name, traced)
+
+
+def test_coordinate_bound_pipeline_orders_preflight_before_provider_and_uses_comparison_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Factory-before-gates or head-only locality would cross the frozen boundary."""
+
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.preflight as preflight_module
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    events: list[str] = []
+    observed: dict[str, object] = {}
+    provider = FakeProvider(
+        events=events,
+        extraction=lambda request: _extraction_output(
+            request, title=inputs.pr_title
+        ),
+    )
+    original_preflight = preflight_module.preflight_review
+    original_evidence = orchestrator.discover_evidence
+
+    monkeypatch.setattr(
+        preflight_module,
+        "build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    def traced_preflight(*args: Any, **kwargs: Any) -> Any:
+        events.append("preflight")
+        return original_preflight(*args, **kwargs)
+
+    def provider_factory(**_kwargs: Any) -> FakeProvider:
+        events.append("provider_factory")
+        return provider
+
+    def traced_evidence(*args: Any, **kwargs: Any) -> EvidenceBundle:
+        events.append("evidence")
+        observed["issued_paths"] = args[2]
+        observed["selected_paths"] = kwargs.get("selected_paths")
+        observed["changed_paths"] = kwargs.get("changed_paths")
+        observed["base_root"] = kwargs.get("base_root")
+        return original_evidence(*args, **kwargs)
+
+    monkeypatch.setattr(preflight_module, "preflight_review", traced_preflight)
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_factory)
+    monkeypatch.setattr(orchestrator, "discover_evidence", traced_evidence)
+
+    result = run_review(inputs, _config())
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert result.preflight is not None
+    assert result.preflight.scope is not None
+    assert result.preflight.scope.mode == "declared_changed_v1"
+    assert events == [
+        "preflight",
+        "provider_factory",
+        "extract_claims",
+        "evidence",
+        "synthesize_review",
+    ]
+    assert observed["issued_paths"] == result.preflight.scope.issued_paths
+    assert observed["selected_paths"] == result.preflight.scope.selected_paths
+    assert observed["changed_paths"] == result.preflight.scope.issued_changed_paths
+    assert observed["base_root"] == inputs.comparison_base.root
+    assert len(result.provider_calls) == 2
+
+
+def test_partial_preflight_scope_is_carried_and_caps_successful_review_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A perfect fake provider must not upgrade a known scope omission."""
+
+    inputs, inventory = _declared_run_inputs(
+        tmp_path,
+        title=(
+            "Benchmark accuracy improves by 5% in results.json, while "
+            "private/missing.json is outside the declared change."
+        ),
+    )
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    provider = FakeProvider(
+        extraction=lambda request: _extraction_output(
+            request, title=inputs.pr_title
+        )
+    )
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.preflight is not None
+    assert result.preflight.scope is not None
+    assert result.preflight.scope.complete is False
+    assert result.preflight.review_status_ceiling is ReviewStatus.PARTIAL
+    assert result.status is ReviewStatus.PARTIAL
+    assert len(provider.calls) == 2
+
+
+def test_ready_legacy_scope_remains_compatible_and_is_explicitly_identified(
+    tmp_path: Path,
+) -> None:
+    """The compatibility adapter must retain its source mode in the result."""
+
+    inputs = _inputs(tmp_path)
+    (inputs.repository_root / "results.json").write_text(
+        '{"accuracy": 0.95}\n', encoding="utf-8"
+    )
+    provider = FakeProvider()
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.status is ReviewStatus.COMPLETE
+    assert result.preflight is not None
+    assert result.preflight.scope is not None
+    assert result.preflight.scope.mode == "legacy_pairwise_v1"
+    assert len(provider.calls) == 2
+
+
+def test_disabled_review_skips_preflight_and_default_provider_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabled review does no repository or provider work."""
+
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.preflight as preflight_module
+
+    inputs = _inputs(tmp_path)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("disabled review crossed a dormant boundary")
+
+    monkeypatch.setattr(preflight_module, "preflight_review", forbidden)
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden)
+
+    result = run_review(inputs, ReviewConfig(enabled=False))
+
+    assert result.status is ReviewStatus.DISABLED
+    assert result.preflight is None
+    assert result.provider_calls == ()
 
 
 def test_run_review_uses_exact_extract_discover_tools_synthesize_sequence(

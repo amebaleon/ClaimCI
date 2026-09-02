@@ -14,8 +14,18 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from claimci.passive_files import PassiveFileError, capture_confined_regular_file
 
-from .models import ClaimType, ReviewError, ReviewLimits, ScientificClaim
-from .path_policy import is_source_file, is_test_source_file
+from .models import (
+    ClaimType,
+    ReviewError,
+    ReviewLimits,
+    ReviewMaterialKind,
+    ScientificClaim,
+)
+from .path_policy import (
+    classify_review_material,
+    is_source_file,
+    is_test_source_file,
+)
 
 
 MAX_EVIDENCE_FILE_BYTES = 16 * 1024 * 1024
@@ -248,11 +258,22 @@ def _kind(path: str) -> EvidenceKind:
         return EvidenceKind.TEST
     if is_source_file(path):
         return EvidenceKind.SOURCE
+    material_kind = classify_review_material(path)
+    if material_kind is ReviewMaterialKind.SUBMISSION_CONFIG:
+        return EvidenceKind.CONFIG
     if tokens & {"result", "results", "metric", "metrics", "score", "scores"}:
         return EvidenceKind.RESULTS
     if tokens & {"config", "configs", "configuration", "configurations"} or name.endswith((".yaml", ".yml", ".toml")):
         return EvidenceKind.CONFIG
     if tokens & {"benchmark", "benchmarks", "latency", "memory", "cost", "costs"}:
+        return EvidenceKind.BENCHMARK
+    if material_kind is ReviewMaterialKind.MANIFEST:
+        return EvidenceKind.MANIFEST
+    if material_kind is ReviewMaterialKind.RESULT:
+        return EvidenceKind.RESULTS
+    if material_kind is ReviewMaterialKind.CONFIG:
+        return EvidenceKind.CONFIG
+    if material_kind is ReviewMaterialKind.BENCHMARK:
         return EvidenceKind.BENCHMARK
     if tokens & {"data", "dataset", "datasets"} or "data" in segments or name.endswith(".jsonl"):
         return EvidenceKind.DATASET
@@ -554,6 +575,13 @@ def _matches(
     kind = _kind(path)
 
     if (
+        PurePosixPath(path).suffix.casefold() in {".sh", ".bash"}
+        and classify_review_material(path)
+        is not ReviewMaterialKind.SUBMISSION_CONFIG
+    ):
+        return False
+
+    if (
         claim.claim_type in _CHANGED_SOURCE_CLAIMS
         and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
         and path not in changed_paths
@@ -755,7 +783,7 @@ def _regular_excerpt(
     kind: EvidenceKind,
     char_limit: int,
     changed: set[str],
-    exact_source_test_paths: set[str],
+    exact_localized_paths: set[str],
     base_root: Path | None,
 ) -> tuple[str, int, int, bool, EvidenceLocality]:
     """Issue one bounded excerpt with an explicit, deterministic locality."""
@@ -765,8 +793,7 @@ def _regular_excerpt(
         return text, start_line, end_line, True, EvidenceLocality.COMPLETE_FILE
 
     if (
-        relative in exact_source_test_paths
-        and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+        relative in exact_localized_paths
     ):
         if relative in changed:
             region = _changed_region_excerpt(
@@ -879,7 +906,7 @@ def discover_evidence(
     priority_order: list[str] = []
     missing: list[MissingEvidence] = []
     provider_hint_claim_ids: set[str] = set()
-    exact_source_test_claim_ids: dict[str, set[str]] = defaultdict(set)
+    exact_localized_claim_ids: dict[str, set[str]] = defaultdict(set)
 
     claims_by_id = {claim.claim_id: claim for claim in claims}
     claim_ids = set(claims_by_id)
@@ -941,9 +968,38 @@ def discover_evidence(
                     )
                 )
                 continue
+            material_kind = classify_review_material(normalized)
+            if (
+                PurePosixPath(normalized).suffix.casefold() in {".sh", ".bash"}
+                and material_kind is not ReviewMaterialKind.SUBMISSION_CONFIG
+            ):
+                missing.append(
+                    MissingEvidence(
+                        claim_id=claim.claim_id,
+                        requested_path=str(raw_hint),
+                        reason="route_mismatch",
+                        description=(
+                            "Suggested evidence path does not match the trusted "
+                            "routing rules for this claim type."
+                        ),
+                    )
+                )
+                continue
             kind = _kind(normalized)
             exact_source_test = kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
-            if not exact_source_test and not _matches(claim, normalized, changed):
+            exact_changed_supporting = (
+                normalized in changed
+                and material_kind
+                in {
+                    ReviewMaterialKind.CONFIG,
+                    ReviewMaterialKind.RESULT,
+                    ReviewMaterialKind.MANIFEST,
+                    ReviewMaterialKind.BENCHMARK,
+                    ReviewMaterialKind.SUBMISSION_CONFIG,
+                }
+            )
+            exact_localized = exact_source_test or exact_changed_supporting
+            if not exact_localized and not _matches(claim, normalized, changed):
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -971,8 +1027,8 @@ def discover_evidence(
                 )
                 continue
             by_path[normalized].add(claim.claim_id)
-            if exact_source_test:
-                exact_source_test_claim_ids[normalized].add(claim.claim_id)
+            if exact_localized:
+                exact_localized_claim_ids[normalized].add(claim.claim_id)
 
     markdown_candidates: dict[str, set[str]] = {
         path: {
@@ -998,7 +1054,7 @@ def discover_evidence(
     file_limit_counts: dict[str, int] = defaultdict(int)
     remaining = limits.max_context_chars
     priority_set = set(priority_order)
-    exact_source_test_paths = set(exact_source_test_claim_ids)
+    exact_localized_paths = set(exact_localized_claim_ids)
     routed_paths = set(by_path) | set(markdown_candidates)
     ordinarily_routed = set(by_path) - priority_set
     markdown_only = routed_paths - set(by_path) - priority_set
@@ -1135,7 +1191,7 @@ def discover_evidence(
                 kind=kind,
                 char_limit=regular_limit,
                 changed=changed,
-                exact_source_test_paths=exact_source_test_paths,
+                exact_localized_paths=exact_localized_paths,
                 base_root=base,
             )
         else:
@@ -1168,7 +1224,7 @@ def discover_evidence(
             )
             if excerpt_locality is EvidenceLocality.UNLOCALIZED_PREFIX:
                 for claim_id in sorted(
-                    exact_source_test_claim_ids.get(relative, set())
+                    exact_localized_claim_ids.get(relative, set())
                     & regular_claim_ids
                 ):
                     missing.append(
@@ -1177,7 +1233,7 @@ def discover_evidence(
                             requested_path=relative,
                             reason="excerpt_locality_unavailable",
                             description=(
-                                "The exact source/test path was available in the "
+                                "The exact evidence path was available in the "
                                 "analyzed snapshot, but its bounded excerpt could not "
                                 "be localized to the material region and cannot "
                                 "independently verify the claim."

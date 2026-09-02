@@ -795,11 +795,19 @@ def run_review(
         scope_source_bundle,
     )
 
-    preflight = (
-        preflight_review(inputs, config)
-        if declared
-        else legacy_preflight_failure(inputs, config)
-    )
+    if declared:
+        preflight = preflight_review(inputs, config)
+    else:
+        # A legacy caller keeps the established permissive review path when
+        # material-seed routing alone cannot establish the new coordinate-
+        # bound contract.  When the bounded legacy planner is provider-ready,
+        # retain that scope identity and consume its exact shortlist.
+        planned_legacy = preflight_review(inputs, config)
+        preflight = (
+            planned_legacy
+            if planned_legacy.review_status_ceiling is ReviewStatus.COMPLETE
+            else legacy_preflight_failure(inputs, config)
+        )
     if preflight is not None and not preflight.ready_for_provider:
         failure = next(
             gate for gate in preflight.gates if gate.disposition.value == "fail"
@@ -976,9 +984,15 @@ def run_review(
             for snapshot in deterministic_audits
             if (plan := plans_by_manifest.get(snapshot.manifest_path)) is not None
         )
-        selected_paths = {
-            source.path for source in sources.sources if source.path is not None
-        }
+        selected_paths = (
+            set(preflight.scope.selected_paths)
+            if preflight is not None and preflight.scope is not None
+            else {
+                source.path
+                for source in sources.sources
+                if source.path is not None
+            }
+        )
         selected_paths.update(
             path
             for bundle in audit_bundles
@@ -998,7 +1012,12 @@ def run_review(
             priority_paths=priority_paths,
             selected_paths=tuple(sorted(selected_paths)),
             changed_paths=sources.changed_paths,
-            base_root=inputs.base_root,
+            base_root=(
+                inputs.comparison_base.root
+                if preflight_sources is not None
+                and inputs.comparison_base is not None
+                else inputs.base_root
+            ),
         )
         if config.limits.max_calls < 2:
             return finish(
@@ -1214,7 +1233,11 @@ def run_review(
                 ),
             )
         return finish(
-            ReviewStatus.COMPLETE,
+            (
+                preflight.review_status_ceiling
+                if preflight is not None
+                else ReviewStatus.COMPLETE
+            ),
             claims=claims,
             interpretations=interpretations,
             evidence=evidence,

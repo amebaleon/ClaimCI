@@ -487,6 +487,44 @@ def test_changed_exact_source_uses_bounded_contiguous_changed_region_not_prefix(
     assert _locality(reference) == "changed_region"
 
 
+def test_changed_exact_config_without_comparison_locality_is_non_citable(
+    tmp_path: Path,
+) -> None:
+    """A changed supporting artifact cannot turn an arbitrary prefix into proof."""
+
+    path = "configs/opaque.ini"
+    prefix = "PREFIX_IS_NOT_THE_CHANGED_CONFIGURATION\n" + ("x" * 20_000) + "\n"
+    _write(tmp_path, path, prefix + "MATERIAL_CONFIG_AT_END=true\n")
+    claim = _claim(
+        "claim-config-locality",
+        ClaimType.METRIC_IMPROVEMENT,
+        "The candidate improves accuracy by five percent.",
+        "candidate accuracy",
+        hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        [claim],
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    reference = _reference_for(bundle.references, path)
+    assert reference.kind is EvidenceKind.CONFIG
+    assert reference.provenance is EvidenceProvenance.SUPPORTING_ARTIFACT
+    assert _locality(reference) == "unlocalized_prefix"
+    assert "MATERIAL_CONFIG_AT_END" not in reference.excerpt
+    assert any(
+        item.claim_id == claim.claim_id
+        and item.requested_path == path
+        and item.reason == "excerpt_locality_unavailable"
+        for item in bundle.missing
+    )
+    assert bundle.routing_incomplete is True
+
+
 def test_oversized_unchanged_exact_source_is_explicitly_unlocalized_and_incomplete(
     tmp_path: Path,
 ) -> None:
