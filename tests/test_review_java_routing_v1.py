@@ -324,6 +324,7 @@ def test_materially_unresolved_provider_routing_is_advisory_partial(
     head = tmp_path / "head"
     base.mkdir()
     head.mkdir()
+    _write(head, "README.md", "Bounded review context.\n")
     result, provider = _run(
         base,
         head,
@@ -349,6 +350,7 @@ def test_legitimate_zero_evidence_without_routing_failure_remains_complete(
     head = tmp_path / "head"
     base.mkdir()
     head.mkdir()
+    _write(head, "README.md", "Bounded review context.\n")
     result, provider = _run(base, head)
 
     assert result.status is ReviewStatus.COMPLETE

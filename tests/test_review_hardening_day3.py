@@ -320,6 +320,7 @@ def test_full_provider_context_budget_includes_policy_schema_and_wrappers(
 
     repository = tmp_path / "repo"
     repository.mkdir()
+    _write(repository, "README.md", "Bounded review context.\n")
     provider = _empty_provider()
     result = run_review(
         ReviewInputs(repository_root=repository),
@@ -359,6 +360,7 @@ def test_mappingproxy_deterministic_snapshot_reaches_synthesis_as_plain_data(
     provider = _empty_provider()
     repository = tmp_path / "repo"
     repository.mkdir()
+    _write(repository, "README.md", "Bounded review context.\n")
 
     result = run_review(
         ReviewInputs(repository_root=repository),
@@ -439,6 +441,7 @@ def test_aggregate_usage_does_not_report_partial_fields_or_cost_and_status_is_ad
     provider = _empty_provider((first, second))
     repository = tmp_path / "repo"
     repository.mkdir()
+    _write(repository, "README.md", "Bounded review context.\n")
 
     result = run_review(ReviewInputs(repository_root=repository), _enabled_config(), provider=provider)
 
@@ -456,6 +459,7 @@ def test_aggregate_usage_nulls_inconsistent_total_but_preserves_known_fields(tmp
     provider = _empty_provider((usage, usage))
     repository = tmp_path / "repo"
     repository.mkdir()
+    _write(repository, "README.md", "Bounded review context.\n")
 
     result = run_review(ReviewInputs(repository_root=repository), _enabled_config(), provider=provider)
 

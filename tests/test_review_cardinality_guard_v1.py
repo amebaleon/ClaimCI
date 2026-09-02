@@ -388,6 +388,7 @@ final class DatasetServiceEnrichmentTest {
     head.mkdir()
     _write(base, TEST_PATH, source)
     _write(head, TEST_PATH, source)
+    _write(head, "README.md", "Bounded review context.\n")
     provider = _ConstraintAwareProvider()
 
     result = _run(head, provider, base_root=base)
@@ -426,6 +427,7 @@ def test_unavailable_exact_java_test_evidence_cannot_verify_exact_count(
     repository = tmp_path / "head"
     repository.mkdir()
     _write(repository, TEST_PATH, "")
+    _write(repository, "README.md", "Bounded review context.\n")
     provider = _ConstraintAwareProvider()
 
     result = _run(repository, provider)

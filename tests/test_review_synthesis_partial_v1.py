@@ -78,6 +78,9 @@ class _InvalidSynthesisProvider:
 def test_invalid_synthesis_is_partial_and_preserves_trusted_extraction(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "README.md").write_text(
+        "Bounded review context.\n", encoding="utf-8"
+    )
     provider = _InvalidSynthesisProvider()
 
     result = run_review(

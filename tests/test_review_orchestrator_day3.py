@@ -597,6 +597,137 @@ def test_legacy_empty_sole_route_failure_does_not_fall_open(
     assert result.provider_calls == ()
 
 
+def test_legacy_truncated_result_only_route_does_not_fall_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Locality loss alone cannot authorize a result-only legacy review."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    repository = (tmp_path / "repo").resolve()
+    repository.mkdir()
+    (repository / "results.json").write_text("x" * 101, encoding="utf-8")
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError(
+            "truncated result-only route reached provider construction"
+        )
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Benchmark accuracy improves in results.json",
+        ),
+        _config(max_file_chars=100),
+    )
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.selected_paths == ("results.json",)
+    assert {
+        reason.code for reason in result.preflight.gates[1].reasons
+    } >= {
+        "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+        "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED",
+        "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH",
+    }
+    assert result.preflight.gates[2].disposition.value == "not_evaluated"
+    assert result.provider_calls == ()
+
+
+def test_legacy_pr_prose_without_citable_artifact_does_not_fall_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pull-request prose cannot replace a citable repository artifact."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    repository = (tmp_path / "repo").resolve()
+    repository.mkdir()
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("prose-only legacy scope reached provider construction")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Candidate improves benchmark accuracy by five points",
+            pr_description="The repository contains no supporting artifact.",
+        ),
+        _config(),
+    )
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.selected_paths == ()
+    assert result.preflight.gates[1].disposition.value == "fail"
+    assert result.preflight.gates[2].disposition.value == "not_evaluated"
+    assert result.provider_calls == ()
+
+
+@pytest.mark.parametrize(
+    "artifact_path",
+    ("README.md", "src/model.py", "tests/TestModel.java"),
+)
+def test_legacy_unlocalized_artifact_does_not_fall_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_path: str,
+) -> None:
+    """A truncated prefix is not citable document, source, or test support."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    repository = (tmp_path / "repo").resolve()
+    repository.mkdir()
+    artifact = repository / artifact_path
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("x" * 101, encoding="utf-8")
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("unlocalized artifact reached provider construction")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title=f"Benchmark accuracy improves in {artifact_path}",
+        ),
+        _config(max_file_chars=100),
+    )
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.selected_paths == (artifact_path,)
+    assert result.preflight.gates[1].disposition.value == "fail"
+    assert any(
+        reason.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+        and reason.path == artifact_path
+        for reason in result.preflight.gates[1].reasons
+    )
+    assert result.preflight.gates[2].disposition.value == "not_evaluated"
+    assert result.provider_calls == ()
+
+
 def test_legacy_gate3_failure_does_not_fall_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1105,7 +1236,7 @@ def test_context_limit_rejects_oversized_extraction_request_without_provider_cal
     inputs = ReviewInputs(
         repository_root=base_inputs.repository_root,
         pr_title=base_inputs.pr_title,
-        pr_description="x" * 60_000,
+        pr_description="x" * 59_000,
     )
     provider = FakeProvider()
 
@@ -1989,6 +2120,7 @@ def test_file_count_and_file_excerpt_limits_are_forwarded_to_source_collection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs = _inputs(tmp_path)
+    (inputs.repository_root / "README.md").write_text("context", encoding="utf-8")
     for index in range(5):
         (inputs.repository_root / f"note-{index}.md").write_text("x" * 100, encoding="utf-8")
 

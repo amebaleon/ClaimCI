@@ -703,18 +703,26 @@ def _legacy_compatibility_fallback_allowed(
     gate1, gate2, gate3 = planned.gates
     scope = planned.scope
     soft_reasons = {reason.code for reason in gate2.reasons}
-    has_legacy_document = bool(
-        scope
-        and any(
-            source.path is not None and bool(source.text)
-            for source in scope.sources
-        )
+    locality_unavailable_paths = {
+        reason.path
+        for reason in gate2.reasons
+        if reason.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+        and reason.path is not None
+    }
+    materialized_path_chars = (
+        dict(scope.materialized_path_chars) if scope is not None else {}
     )
-    has_legacy_source_or_test = bool(
+    has_legacy_citable_artifact = bool(
         scope
         and any(
-            classify_review_material(path)
-            in {ReviewMaterialKind.SOURCE, ReviewMaterialKind.TEST}
+            materialized_path_chars.get(path, 0) > 0
+            and path not in locality_unavailable_paths
+            and classify_review_material(path)
+            in {
+                ReviewMaterialKind.DOCUMENT,
+                ReviewMaterialKind.SOURCE,
+                ReviewMaterialKind.TEST,
+            }
             for path in scope.selected_paths
         )
     )
@@ -725,12 +733,7 @@ def _legacy_compatibility_fallback_allowed(
         and gate2.disposition is GateDisposition.FAIL
         and bool(soft_reasons)
         and soft_reasons.issubset(_LEGACY_COMPATIBILITY_GATE2_REASONS)
-        and (
-            not scope.selected_paths
-            or has_legacy_document
-            or has_legacy_source_or_test
-            or "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE" in soft_reasons
-        )
+        and has_legacy_citable_artifact
         and gate3.disposition is GateDisposition.NOT_EVALUATED
     )
 

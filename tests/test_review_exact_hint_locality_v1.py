@@ -957,6 +957,7 @@ def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
     )
     _write(base, DAO, oversized)
     _write(head, DAO, oversized)
+    _write(head, "README.md", "Bounded review context.\n")
     claim_text = "The unchanged DAO establishes the material count contract."
     provider = _EvidenceAwareFakeProvider(
         claim_text=claim_text,
