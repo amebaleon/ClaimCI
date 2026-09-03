@@ -336,14 +336,18 @@ class _RecordingProvider:
 
 
 def _run(tmp_path: Path, provider: _RecordingProvider):
-    (tmp_path / "README.md").write_text(
+    document = tmp_path / "docs" / "review.md"
+    document.parent.mkdir(parents=True)
+    document.write_text(
         "Bounded review context.\n", encoding="utf-8"
     )
     return run_review(
         ReviewInputs(
             repository_root=tmp_path,
-            pr_title="The rollup reads 4.0x fewer rows.",
-            pr_description="The benchmark reports zero correctness mismatches.",
+            pr_title="The rollup reads 4.0x fewer rows; see docs/review.md.",
+            pr_description=(
+                "The benchmark reports zero correctness mismatches; see docs/review.md."
+            ),
         ),
         ReviewConfig(enabled=True, limits=ReviewLimits()),
         provider=provider,

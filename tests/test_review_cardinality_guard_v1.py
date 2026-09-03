@@ -282,11 +282,18 @@ def _run(
     base_root: Path | None = None,
     description: str = COUNT_CLAIM,
 ):
+    route_path = (
+        "docs/review.md"
+        if (repository_root / "docs" / "review.md").is_file()
+        else TEST_PATH
+    )
     result = run_review(
         ReviewInputs(
             repository_root=repository_root,
             base_root=base_root,
-            pr_description=description,
+            pr_description=(
+                f"{description}\nBenchmark evidence: 7 runs in {route_path}"
+            ),
         ),
         _config(),
         provider=provider,
@@ -382,16 +389,15 @@ final class DatasetServiceEnrichmentTest {
 }
 """
     source = visible_seven + ("    // bounded filler line\n" * 800) + hidden_eighth
-    base = tmp_path / "base"
     head = tmp_path / "head"
-    base.mkdir()
     head.mkdir()
-    _write(base, TEST_PATH, source)
     _write(head, TEST_PATH, source)
-    _write(head, "README.md", "Bounded review context.\n")
+    _write(head, "docs/review.md", "Bounded review context.\n")
     provider = _ConstraintAwareProvider()
 
-    result = _run(head, provider, base_root=base)
+    # The added file is explicitly issued, but its bounded prefix cannot stand
+    # in for complete-file cardinality evidence.
+    result = _run(head, provider)
 
     assert result.status is ReviewStatus.PARTIAL
     assert result.error_code == "EVIDENCE_ROUTING_INCOMPLETE"
@@ -427,7 +433,7 @@ def test_unavailable_exact_java_test_evidence_cannot_verify_exact_count(
     repository = tmp_path / "head"
     repository.mkdir()
     _write(repository, TEST_PATH, "")
-    _write(repository, "README.md", "Bounded review context.\n")
+    _write(repository, "docs/review.md", "Bounded review context.\n")
     provider = _ConstraintAwareProvider()
 
     result = _run(repository, provider)

@@ -20,11 +20,16 @@ PROVIDER_TEXT = "ATTACKER_PROVIDER_TEXT_MUST_NOT_LEAK"
 
 
 def _inputs(tmp_path: Path) -> ReviewInputs:
-    (tmp_path / "README.md").write_text("# Synthesis fixture\n", encoding="utf-8")
+    document = tmp_path / "docs" / "review.md"
+    document.parent.mkdir(parents=True)
+    document.write_text("Synthesis fixture.\n", encoding="utf-8")
     return ReviewInputs(
         repository_root=tmp_path,
         pr_title="Synthesis contract fixture",
-        pr_description=f"{FIRST_CLAIM}\n{SECOND_CLAIM}",
+        pr_description=(
+            f"{FIRST_CLAIM}\n{SECOND_CLAIM}\n"
+            "Benchmark evidence: 1 run in docs/review.md"
+        ),
     )
 
 

@@ -948,17 +948,15 @@ def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
 ) -> None:
     """An owned citation is insufficient when its material locality is unknown."""
 
-    base = tmp_path / "base"
     head = tmp_path / "head"
     oversized = (
         "// UNRELATED_PREFIX\n"
         + ("x" * 20_000)
         + "\nlong materialCountContract(); // MATERIAL_AT_END\n"
     )
-    _write(base, DAO, oversized)
     _write(head, DAO, oversized)
-    _write(head, "README.md", "Bounded review context.\n")
-    claim_text = "The unchanged DAO establishes the material count contract."
+    _write(head, "docs/review.md", "Bounded review context.\n")
+    claim_text = "The DAO establishes the material count contract."
     provider = _EvidenceAwareFakeProvider(
         claim_text=claim_text,
         claim_type=ClaimType.RESOURCE_REDUCTION,
@@ -966,12 +964,14 @@ def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
         hint=DAO,
         synthesis_mode="affirm_unlocalized_prefix",
     )
+    routed_description = (
+        f"{claim_text}\nBenchmark evidence: 1 run in docs/review.md"
+    )
 
     result = run_review(
         ReviewInputs(
             repository_root=head,
-            base_root=base,
-            pr_description=claim_text,
+            pr_description=routed_description,
         ),
         _review_config(),
         provider=provider,

@@ -164,13 +164,18 @@ class _MixedExtractionProvider:
 
 
 def _run(tmp_path: Path, provider: _MixedExtractionProvider):
-    (tmp_path / "README.md").write_text(
+    document = tmp_path / "docs" / "review.md"
+    document.parent.mkdir(parents=True)
+    document.write_text(
         "Bounded review context.\n", encoding="utf-8"
     )
     return run_review(
         ReviewInputs(
             repository_root=tmp_path,
-            pr_description="The rollup reads 4.0x fewer rows for the 90-day benchmark.",
+            pr_description=(
+                "The rollup reads 4.0x fewer rows for the 90-day benchmark; "
+                "see docs/review.md."
+            ),
         ),
         ReviewConfig(enabled=True, limits=ReviewLimits()),
         provider=provider,

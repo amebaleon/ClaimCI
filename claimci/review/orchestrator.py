@@ -32,7 +32,6 @@ from .models import (
     ReviewConfig,
     ReviewError,
     ReviewInventoryFailure,
-    ReviewMaterialKind,
     ReviewPreflight,
     ReviewStatus,
     ScientificClaim,
@@ -45,7 +44,6 @@ from .provider import (
     ReviewerProvider,
     StructuredRequest,
 )
-from .path_policy import classify_review_material
 from .request_budget import (
     allocate_synthesis_inputs,
     build_extraction_request_parts,
@@ -73,19 +71,6 @@ from .tools import (
 
 
 MAX_PROVIDER_JSON_DEPTH = 64
-_LEGACY_COMPATIBILITY_GATE2_REASONS = frozenset(
-    {
-        "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
-        "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
-        "PREFLIGHT_G2_EXTERNAL_EVIDENCE_ONLY",
-        "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED",
-        "PREFLIGHT_G2_NO_MATERIAL_CLAIM_SEED",
-        "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH",
-        "PREFLIGHT_G2_ONLY_DELETED_ROUTABLE_PATH",
-        "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
-        "PREFLIGHT_G2_UNSUPPORTED_MATERIAL_TYPE",
-    }
-)
 
 
 def OpenAIReviewerProvider(**kwargs: Any) -> ReviewerProvider:
@@ -695,49 +680,6 @@ def _record_call(
     )
 
 
-def _legacy_compatibility_fallback_allowed(
-    planned: ReviewPreflight,
-) -> bool:
-    """Allow only historical soft routing gaps without recomputing preflight."""
-
-    gate1, gate2, gate3 = planned.gates
-    scope = planned.scope
-    soft_reasons = {reason.code for reason in gate2.reasons}
-    locality_unavailable_paths = {
-        reason.path
-        for reason in gate2.reasons
-        if reason.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
-        and reason.path is not None
-    }
-    materialized_path_chars = (
-        dict(scope.materialized_path_chars) if scope is not None else {}
-    )
-    has_legacy_citable_artifact = bool(
-        scope
-        and any(
-            materialized_path_chars.get(path, 0) > 0
-            and path not in locality_unavailable_paths
-            and classify_review_material(path)
-            in {
-                ReviewMaterialKind.DOCUMENT,
-                ReviewMaterialKind.SOURCE,
-                ReviewMaterialKind.TEST,
-            }
-            for path in scope.selected_paths
-        )
-    )
-    return (
-        not planned.ready_for_provider
-        and scope is not None
-        and gate1.disposition is GateDisposition.PASS_COMPLETE
-        and gate2.disposition is GateDisposition.FAIL
-        and bool(soft_reasons)
-        and soft_reasons.issubset(_LEGACY_COMPATIBILITY_GATE2_REASONS)
-        and has_legacy_citable_artifact
-        and gate3.disposition is GateDisposition.NOT_EVALUATED
-    )
-
-
 def _record_runtime_gate3_omissions(
     preflight: ReviewPreflight | None,
     omissions: Sequence[tuple[str, str, int]],
@@ -886,34 +828,12 @@ def run_review(
         return finish(ReviewStatus.DISABLED)
     if not isinstance(inputs, ReviewInputs):
         raise ReviewError("inputs must be ReviewInputs")
-    declared = any(
-        value is not None
-        for value in (
-            inputs.requested_base,
-            inputs.comparison_base,
-            inputs.head,
-            inputs.inventory,
-            inputs.coordinates,
-            inputs.inventory_failure,
-        )
-    )
     from .preflight import (
         preflight_review,
         scope_source_bundle,
     )
 
-    if declared:
-        preflight = preflight_review(inputs, config)
-    else:
-        # Preserve only established soft legacy routing compatibility. Every
-        # hard result keeps the exact first-pass gates; preflight and inventory
-        # are never recomputed to seek a more permissive outcome.
-        planned_legacy = preflight_review(inputs, config)
-        preflight = (
-            None
-            if _legacy_compatibility_fallback_allowed(planned_legacy)
-            else planned_legacy
-        )
+    preflight = preflight_review(inputs, config)
     if preflight is not None and not preflight.ready_for_provider:
         failure = next(
             gate for gate in preflight.gates if gate.disposition.value == "fail"
