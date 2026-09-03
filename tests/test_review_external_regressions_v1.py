@@ -470,6 +470,8 @@ def test_provider_is_injected_only_after_pass_and_never_exceeds_two_calls(
 ) -> None:
     root = tmp_path / "head"
     root.mkdir()
+    base_root = tmp_path / "base"
+    base_root.mkdir()
     _write(root, "results.json", '{"accuracy": 0.95}\n')
     sha = "1" * 40
     inventory = ChangeInventory(
@@ -486,8 +488,8 @@ def test_provider_is_injected_only_after_pass_and_never_exceeds_two_calls(
     inputs = ReviewInputs(
         repository_root=root.resolve(),
         pr_title="Benchmark accuracy improves by 5% in results.json",
-        requested_base=_identity(SnapshotRole.REQUESTED_BASE, root, sha),
-        comparison_base=_identity(SnapshotRole.COMPARISON_BASE, root, sha),
+        requested_base=_identity(SnapshotRole.REQUESTED_BASE, base_root, sha),
+        comparison_base=_identity(SnapshotRole.COMPARISON_BASE, base_root, sha),
         head=_identity(SnapshotRole.HEAD, root, "2" * 40),
         inventory=inventory,
     )

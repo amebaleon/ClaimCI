@@ -89,17 +89,19 @@ def _declared_inputs(
     requested_sha: str = SHA,
     comparison_sha: str = SHA,
     head_sha: str = SHA,
+    base_root: Path | None = None,
 ) -> ReviewInputs:
     root = root.resolve()
+    resolved_base_root = root if base_root is None else base_root.resolve()
     return ReviewInputs(
         repository_root=root,
         pr_title=title,
         pr_description=description,
         requested_base=SnapshotIdentity(
-            SnapshotRole.REQUESTED_BASE, root, requested_sha
+            SnapshotRole.REQUESTED_BASE, resolved_base_root, requested_sha
         ),
         comparison_base=SnapshotIdentity(
-            SnapshotRole.COMPARISON_BASE, root, comparison_sha
+            SnapshotRole.COMPARISON_BASE, resolved_base_root, comparison_sha
         ),
         head=SnapshotIdentity(SnapshotRole.HEAD, root, head_sha),
         inventory=inventory,
@@ -115,9 +117,11 @@ def _ready_preflight(
 ) -> tuple[Any, ReviewInputs, ReviewConfig]:
     root = tmp_path / "repo"
     root.mkdir()
+    base_root = tmp_path / "base"
+    base_root.mkdir()
     (root / "results.json").write_text(text, encoding="utf-8")
     inventory = _inventory((ChangeEntry("results.json", ChangeStatus.ADDED),))
-    inputs = _declared_inputs(root, inventory)
+    inputs = _declared_inputs(root, inventory, base_root=base_root)
     monkeypatch.setattr(
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
@@ -2216,13 +2220,15 @@ def test_runtime_obeys_preflight_synthesis_allocation_with_many_exact_hints(
 ) -> None:
     root = (tmp_path / "repo").resolve()
     root.mkdir()
+    base_root = (tmp_path / "base").resolve()
+    base_root.mkdir()
     paths = tuple(f"benchmarks/result-{index:02}.json" for index in range(24))
     for path in paths:
         target = root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text('{"accuracy": 0.95}', encoding="utf-8")
     inventory = _inventory(tuple(ChangeEntry(path, ChangeStatus.ADDED) for path in paths))
-    inputs = _declared_inputs(root, inventory)
+    inputs = _declared_inputs(root, inventory, base_root=base_root)
     monkeypatch.setattr(
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
@@ -2304,9 +2310,11 @@ def test_runtime_allocates_all_provider_valid_missing_rows_with_explicit_omissio
 ) -> None:
     root = (tmp_path / "repo").resolve()
     root.mkdir()
+    base_root = (tmp_path / "base").resolve()
+    base_root.mkdir()
     (root / "results.json").write_text('{"accuracy": 0.95}', encoding="utf-8")
     inventory = _inventory((ChangeEntry("results.json", ChangeStatus.ADDED),))
-    inputs = _declared_inputs(root, inventory)
+    inputs = _declared_inputs(root, inventory, base_root=base_root)
     monkeypatch.setattr(
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
@@ -2401,6 +2409,8 @@ def test_declared_audit_plan_trim_is_counted_and_forces_partial(
 ) -> None:
     root = (tmp_path / "repo").resolve()
     root.mkdir()
+    base_root = (tmp_path / "base").resolve()
+    base_root.mkdir()
     (root / "research.yaml").write_text("metric: accuracy\n", encoding="utf-8")
     (root / "unissued-results.json").write_text("{}", encoding="utf-8")
     inventory = _inventory((ChangeEntry("research.yaml", ChangeStatus.ADDED),))
@@ -2408,6 +2418,7 @@ def test_declared_audit_plan_trim_is_counted_and_forces_partial(
         root,
         inventory,
         title="Benchmark accuracy improves by 5% in research.yaml",
+        base_root=base_root,
     )
     monkeypatch.setattr(
         "claimci.review.preflight.build_git_change_inventory",
