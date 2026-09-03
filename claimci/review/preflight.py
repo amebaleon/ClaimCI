@@ -385,6 +385,11 @@ def build_review_scope(
     metadata_records = tuple(records)
     initial_seeds, _ = _seeds(metadata_records, limits.max_claims)
     initial_references = _source_path_references(metadata_records)
+    initial_exact_paths = frozenset(
+        path
+        for source_references in initial_references.values()
+        for path in source_references.canonical
+    )
     classified = tuple(
         (entry, classify_review_material(entry.path)) for entry in inventory.entries
     )
@@ -509,17 +514,17 @@ def build_review_scope(
     exact_candidates = [
         item
         for item in candidates
-        if any(
-            _exact_mentions(item[0].path, seed, initial_references)
-            for seed in initial_seeds
-        )
+        if initial_seeds and item[0].path in initial_exact_paths
     ]
     exact_candidates.sort(
-        key=lambda item: _rank_key(
-            item[0].path,
-            item[1],
-            initial_seeds,
-            initial_references,
+        key=lambda item: (
+            -1,
+            *_rank_key(
+                item[0].path,
+                item[1],
+                initial_seeds,
+                initial_references,
+            )[1:],
         )
     )
     materialize(exact_candidates)

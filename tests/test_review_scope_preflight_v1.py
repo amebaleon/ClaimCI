@@ -309,10 +309,10 @@ def test_changed_document_seeds_rerank_the_remaining_fixed_budget(tmp_path: Path
     )
 
 
-def test_exact_mentioned_result_survives_document_flood_at_file_cap(
+def test_cross_metadata_exact_result_survives_document_flood_at_file_cap(
     tmp_path: Path,
 ) -> None:
-    """Exact changed result routes remain selectable when documents fill the cap."""
+    """PR title seeds and body paths jointly route exact changed results."""
 
     document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
     result_path = "results/exact.json"
@@ -340,7 +340,8 @@ def test_exact_mentioned_result_survives_document_flood_at_file_cap(
             _scope(
                 root,
                 inventory,
-                title="Benchmark accuracy improves by 5%; see results/exact.json.",
+                title="Benchmark accuracy improves by 5%.",
+                description="See results/exact.json.",
                 limits=ReviewLimits(max_files=24),
             )
         )
