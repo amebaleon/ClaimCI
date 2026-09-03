@@ -396,6 +396,7 @@ def build_review_scope(
     ]
 
     selected: list[str] = []
+    attempted: list[str] = []
     materialized_path_chars: dict[str, int] = {}
     issues: list[ScopeIssue] = []
     eligible_deleted = tuple(
@@ -418,6 +419,9 @@ def build_review_scope(
     def materialize(shortlist: list[tuple[ChangeEntry, ReviewMaterialKind]]) -> None:
         nonlocal materialized_chars, remaining_chars
         for entry, kind in shortlist:
+            if len(attempted) >= limits.max_files:
+                break
+            attempted.append(entry.path)
             if remaining_chars <= 0:
                 issues.append(
                     ScopeIssue(
@@ -502,8 +506,30 @@ def build_review_scope(
                     )
                 )
 
+    exact_candidates = [
+        item
+        for item in candidates
+        if any(
+            _exact_mentions(item[0].path, seed, initial_references)
+            for seed in initial_seeds
+        )
+    ]
+    exact_candidates.sort(
+        key=lambda item: _rank_key(
+            item[0].path,
+            item[1],
+            initial_seeds,
+            initial_references,
+        )
+    )
+    materialize(exact_candidates)
+
+    attempted_paths = set(attempted)
     documents = [
-        item for item in candidates if item[1] is ReviewMaterialKind.DOCUMENT
+        item
+        for item in candidates
+        if item[1] is ReviewMaterialKind.DOCUMENT
+        and item[0].path not in attempted_paths
     ]
     documents.sort(
         key=lambda item: _rank_key(
@@ -513,14 +539,14 @@ def build_review_scope(
             initial_references,
         )
     )
-    document_shortlist = documents[: limits.max_files]
-    materialize(document_shortlist)
+    materialize(documents)
 
     document_seed_records = tuple(records)
     planning_seeds, _ = _seeds(document_seed_records, limits.max_claims)
     planning_references = _source_path_references(document_seed_records)
+    attempted_paths = set(attempted)
     remaining_candidates = [
-        item for item in candidates if item[1] is not ReviewMaterialKind.DOCUMENT
+        item for item in candidates if item[0].path not in attempted_paths
     ]
     remaining_candidates.sort(
         key=lambda item: _rank_key(
@@ -530,13 +556,9 @@ def build_review_scope(
             planning_references,
         )
     )
-    remaining_slots = limits.max_files - len(document_shortlist)
-    material_shortlist = remaining_candidates[:remaining_slots]
-    materialize(material_shortlist)
+    materialize(remaining_candidates)
 
-    shortlisted_paths = {
-        entry.path for entry, _kind in document_shortlist + material_shortlist
-    }
+    shortlisted_paths = set(attempted)
     omitted = [
         entry.path
         for entry, _kind in candidates

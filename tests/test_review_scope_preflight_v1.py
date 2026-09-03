@@ -309,6 +309,66 @@ def test_changed_document_seeds_rerank_the_remaining_fixed_budget(tmp_path: Path
     )
 
 
+def test_exact_mentioned_result_survives_document_flood_at_file_cap(
+    tmp_path: Path,
+) -> None:
+    """Exact changed result routes remain selectable when documents fill the cap."""
+
+    document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
+    result_path = "results/exact.json"
+    entries = tuple(
+        (path, ChangeStatus.MODIFIED) for path in (*document_paths, result_path)
+    )
+    inventory = _inventory(*entries)
+    roots = (tmp_path / "first", tmp_path / "second")
+    scopes = []
+    for root, creation_order in zip(
+        roots,
+        (document_paths + (result_path,), tuple(reversed(document_paths + (result_path,)))),
+        strict=True,
+    ):
+        root.mkdir()
+        for path in creation_order:
+            _write(
+                root,
+                path,
+                '{"accuracy": 0.95}\n'
+                if path == result_path
+                else f"supporting note for {path}\n",
+            )
+        scopes.append(
+            _scope(
+                root,
+                inventory,
+                title="Benchmark accuracy improves by 5%; see results/exact.json.",
+                limits=ReviewLimits(max_files=24),
+            )
+        )
+
+    gates = tuple(
+        preflight_module._evaluate_material_gates(
+            scope,
+            ReviewConfig(enabled=True, limits=ReviewLimits(max_files=24)),
+            requested_sha=BASE,
+            comparison_sha=BASE,
+            head_sha=HEAD,
+        )
+        for scope in scopes
+    )
+
+    assert scopes[0].selected_paths == scopes[1].selected_paths
+    assert result_path in scopes[0].selected_paths
+    assert len(scopes[0].selected_paths) == 24
+    assert len(set(scopes[0].selected_paths) & set(document_paths)) == 23
+    assert gates[0].gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert gates[1].gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert all(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        for issue in scopes[0].issues
+        if issue.path not in scopes[0].selected_paths
+    )
+
+
 def test_path_prefix_is_not_an_exact_inventory_path_mention(tmp_path: Path) -> None:
     root = tmp_path / "head"
     root.mkdir()
