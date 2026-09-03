@@ -26,8 +26,9 @@ from .evidence import (
 )
 from .models import (
     ClaimType,
-    ChangeStatus,
     ChangeInventory,
+    ChangeInventorySource,
+    ChangeStatus,
     DeclaredReviewCoordinates,
     GateDisposition,
     MagnitudeKind,
@@ -988,6 +989,8 @@ def run_review(
     if not isinstance(inputs, ReviewInputs):
         raise ReviewError("inputs must be ReviewInputs")
     from .preflight import (
+        build_git_change_inventory,
+        build_review_scope,
         preflight_review,
         scope_source_bundle,
     )
@@ -1004,18 +1007,63 @@ def run_review(
         )
     if preflight is not None:
         assert preflight.scope is not None
-        preflight_sources = scope_source_bundle(preflight.scope)
+        planned_scope = preflight.scope
+        selected_material_paths = tuple(sorted(planned_scope.selected_paths))
+        comparison_base_root = (
+            inputs.comparison_base.root
+            if inputs.comparison_base is not None
+            else inputs.base_root
+        )
+        try:
+            materialized_scope_identities = _capture_material_scope_identities(
+                inputs.repository_root,
+                selected_material_paths,
+                comparison_base_root=comparison_base_root,
+            )
+            (
+                initial_capture_failure_paths,
+                _initial_head_failure_paths,
+            ) = _material_scope_capture_failure_paths(
+                materialized_scope_identities,
+                planned_scope.inventory,
+            )
+        except ReviewError:
+            initial_capture_failure_paths = tuple(selected_material_paths)
+        if initial_capture_failure_paths:
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_MATERIAL_SCOPE_UNAVAILABLE",
+                        "material_scope_capture_failure_count",
+                        len(initial_capture_failure_paths),
+                    ),
+                ),
+            )
+            return finish(
+                ReviewStatus.PARTIAL,
+                error_code="MATERIAL_SCOPE_CAPTURE_FAILED",
+                error_message=(
+                    f"{len(initial_capture_failure_paths)} selected material "
+                    "path(s) could not be bound after preflight materialization."
+                ),
+            )
+        preflight_sources = scope_source_bundle(planned_scope)
         evidence_limits = replace(
             config.limits,
             max_context_chars=max(
                 1,
                 sum(
                     chars
-                    for _path, chars in preflight.scope.materialized_path_chars
+                    for _path, chars in planned_scope.materialized_path_chars
                 ),
             ),
         )
     else:
+        planned_scope = None
+        selected_material_paths = ()
+        comparison_base_root = inputs.base_root
+        materialized_scope_identities = ()
         preflight_sources = None
         evidence_limits = config.limits
 
@@ -1144,28 +1192,58 @@ def run_review(
             for snapshot in deterministic_audits
             if (plan := plans_by_manifest.get(snapshot.manifest_path)) is not None
         )
-        extraction_parts = build_extraction_request_parts(
-            sources, config.limits.max_claims
-        )
-        extraction_chars = _request_chars(
-            extraction_parts.task,
-            extraction_parts.payload,
-            extraction_parts.schema,
-        )
-        if extraction_chars > config.limits.max_context_chars:
-            return finish(
-                ReviewStatus.UNAVAILABLE,
-                error_code="CONTEXT_LIMIT",
-                error_message="Extraction context exceeds the configured limit.",
-            )
-        selected_material_paths = tuple(sorted(sources.repository_paths))
-        comparison_base_root = (
-            inputs.comparison_base.root
-            if inputs.comparison_base is not None
-            else inputs.base_root
-        )
+        assert planned_scope is not None
+        scope_refresh_failed = False
         try:
-            frozen_material_identities = _capture_material_scope_identities(
+            if (
+                planned_scope.inventory.source
+                is ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+            ):
+                requested = inputs.requested_base
+                comparison = inputs.comparison_base
+                head = inputs.head
+                if requested is None or comparison is None or head is None:
+                    raise ReviewError("declared material coordinates are unavailable")
+                verified_inventory = build_git_change_inventory(
+                    requested,
+                    comparison,
+                    head,
+                    planned_scope.inventory.comparison_basis,
+                )
+                if verified_inventory != planned_scope.inventory:
+                    raise ReviewError("declared material inventory changed at runtime")
+            refreshed_scope = build_review_scope(
+                inputs,
+                config,
+                planned_scope.inventory,
+            )
+            if refreshed_scope != planned_scope:
+                raise ReviewError("selected material scope changed at runtime")
+        except ReviewError:
+            scope_refresh_failed = True
+        if scope_refresh_failed:
+            deterministic_audits = ()
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED",
+                        "material_scope_invalidated_count",
+                        len(selected_material_paths),
+                    ),
+                ),
+            )
+            return finish(
+                ReviewStatus.PARTIAL,
+                deterministic_audits=deterministic_audits,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "The exact selected material scope changed after its "
+                    "provider-free preflight; provider execution was skipped."
+                ),
+            )
+        try:
+            pre_provider_material_identities = _capture_material_scope_identities(
                 inputs.repository_root,
                 selected_material_paths,
                 comparison_base_root=comparison_base_root,
@@ -1174,8 +1252,8 @@ def run_review(
                 material_capture_failure_paths,
                 material_capture_head_failure_paths,
             ) = _material_scope_capture_failure_paths(
-                frozen_material_identities,
-                preflight.scope.inventory,
+                pre_provider_material_identities,
+                planned_scope.inventory,
             )
         except ReviewError:
             material_capture_failure_paths = tuple(selected_material_paths)
@@ -1204,6 +1282,61 @@ def run_review(
                     f"{len(material_capture_failure_paths)} selected material "
                     "path(s) could not be captured before provider execution."
                 ),
+            )
+        (
+            head_material_drifted_paths,
+            base_material_drifted_paths,
+        ) = _material_scope_drifted_paths(
+            materialized_scope_identities,
+            pre_provider_material_identities,
+        )
+        material_drifted_paths = tuple(
+            sorted(
+                set(head_material_drifted_paths)
+                | set(base_material_drifted_paths)
+            )
+        )
+        if material_drifted_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                head_material_drifted_paths,
+            )
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED",
+                        "material_scope_invalidated_count",
+                        len(material_drifted_paths),
+                    ),
+                ),
+            )
+            return finish(
+                ReviewStatus.PARTIAL,
+                deterministic_audits=deterministic_audits,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "Selected material changed after provider-free "
+                    "materialization; provider execution was skipped."
+                ),
+            )
+        frozen_material_identities = pre_provider_material_identities
+        sources = scope_source_bundle(refreshed_scope)
+        extraction_parts = build_extraction_request_parts(
+            sources, config.limits.max_claims
+        )
+        extraction_chars = _request_chars(
+            extraction_parts.task,
+            extraction_parts.payload,
+            extraction_parts.schema,
+        )
+        if extraction_chars > config.limits.max_context_chars:
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                error_code="CONTEXT_LIMIT",
+                error_message="Extraction context exceeds the configured limit.",
             )
         if provider is None:
             if config.provider != "openai":

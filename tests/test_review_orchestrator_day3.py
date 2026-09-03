@@ -2201,6 +2201,92 @@ def test_extraction_time_selected_material_drift_cannot_reach_evidence_or_synthe
 
 
 @pytest.mark.parametrize(
+    "mutation_root",
+    ("head", "comparison_base"),
+    ids=("head-content-mutation", "comparison-base-content-mutation"),
+)
+def test_preflight_material_mutation_cannot_be_blessed_by_first_runtime_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_root: str,
+) -> None:
+    """A post-materialization mutation must stop before provider construction."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    target = inputs.repository_root / "results.json"
+    original_bytes = target.read_bytes()
+    mutated_bytes = b'{"accuracy": 0.05}\n'
+    assert hashlib.sha256(mutated_bytes).hexdigest() != hashlib.sha256(
+        original_bytes
+    ).hexdigest()
+    if mutation_root == "comparison_base":
+        target = inputs.comparison_base.root / "results.json"
+        target.write_bytes(original_bytes)
+        inventory = replace(
+            inventory,
+            entries=(ChangeEntry("results.json", ChangeStatus.MODIFIED),),
+        )
+        inputs = replace(inputs, inventory=inventory)
+
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    # discover_manifests runs after the scope has been materialized and the
+    # bounded SourceBundle has been formed, but before the first runtime
+    # identity capture.  Mutating here catches implementations that treat
+    # that first runtime observation as a new trusted baseline.
+    real_discover = orchestrator.discover_manifests
+    mutation_observed = False
+
+    def mutate_after_materialization(*args: Any, **kwargs: Any) -> Any:
+        nonlocal mutation_observed
+        manifests = real_discover(*args, **kwargs)
+        target.write_bytes(mutated_bytes)
+        mutation_observed = True
+        return manifests
+
+    monkeypatch.setattr(
+        orchestrator, "discover_manifests", mutate_after_materialization
+    )
+
+    provider_constructions = 0
+    provider = FakeProvider()
+
+    def provider_factory(**_kwargs: Any) -> FakeProvider:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        return provider
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", provider_factory)
+
+    result = run_review(inputs, _config())
+
+    assert mutation_observed is True
+    assert target.read_bytes() == mutated_bytes
+    assert provider_constructions == 0
+    assert provider.calls == []
+    assert result.provider_calls == ()
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_INVALIDATED"
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.complete is False
+    assert result.preflight.gates[2].disposition.value == "pass_partial"
+    assert result.preflight.gates[2].metrics[
+        "material_scope_invalidated_count"
+    ] == 1
+    assert any(
+        reason.code == "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED"
+        for reason in result.preflight.gates[2].reasons
+    )
+    assert result.evidence.references == ()
+    assert result.interpretations == ()
+
+
+@pytest.mark.parametrize(
     "base_initial_state",
     ("present", "absent"),
     ids=("base-hash-drift", "base-absent-to-present"),
@@ -2430,6 +2516,7 @@ def test_unrelated_material_capture_failure_preserves_valid_audit_snapshot(
     )
     real_inspect = orchestrator.inspect_confined_regular_file
     inspected: list[str] = []
+    head_inspection_count = 0
 
     def fail_unrelated_head(
         root: Path,
@@ -2437,9 +2524,15 @@ def test_unrelated_material_capture_failure_preserves_valid_audit_snapshot(
         *,
         max_bytes: int,
     ) -> Any:
+        nonlocal head_inspection_count
         if root == inputs.repository_root and path == unrelated_path:
-            inspected.append(path)
-            raise PassiveFileError("unrelated capture unavailable", code="unavailable")
+            head_inspection_count += 1
+            if head_inspection_count == 2:
+                inspected.append(path)
+                raise PassiveFileError(
+                    "unrelated capture unavailable",
+                    code="unavailable",
+                )
         return real_inspect(root, path, max_bytes=max_bytes)
 
     provider_constructions = 0
