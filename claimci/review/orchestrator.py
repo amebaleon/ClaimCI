@@ -26,6 +26,7 @@ from .evidence import (
 )
 from .models import (
     ClaimType,
+    ChangeStatus,
     ChangeInventory,
     DeclaredReviewCoordinates,
     GateDisposition,
@@ -748,14 +749,6 @@ def _record_runtime_gate3_omissions(
     )
 
 
-class _MaterialScopeCaptureError(ReviewError):
-    """A frozen selected material path could not be inspected safely."""
-
-    def __init__(self, path: str) -> None:
-        super().__init__("selected material identity could not be captured")
-        self.path = path
-
-
 @dataclass(frozen=True)
 class _MaterialPathIdentity:
     """Content identity/state for one already-authorized repository path."""
@@ -768,8 +761,6 @@ class _MaterialPathIdentity:
 def _capture_material_path_identity(
     root: Path,
     path: str,
-    *,
-    required: bool,
 ) -> _MaterialPathIdentity:
     """Inspect one frozen path without discovering or retaining new material."""
 
@@ -780,12 +771,8 @@ def _capture_material_path_identity(
             max_bytes=MAX_SOURCE_FILE_BYTES,
         )
     except PassiveFileError as exc:
-        if required:
-            raise _MaterialScopeCaptureError(path) from exc
         return _MaterialPathIdentity(state=f"error:{exc.code}")
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        if required:
-            raise _MaterialScopeCaptureError(path) from exc
+    except (OSError, RuntimeError, TypeError, ValueError):
         return _MaterialPathIdentity(state="error:inspection")
     return _MaterialPathIdentity(
         state="present",
@@ -817,24 +804,55 @@ def _capture_material_scope_identities(
         tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
     ] = []
     for path in selected:
-        head_identity = _capture_material_path_identity(
-            head_root,
-            path,
-            required=True,
-        )
-        if head_identity.state != "present":
-            raise _MaterialScopeCaptureError(path)
+        head_identity = _capture_material_path_identity(head_root, path)
         base_identity = (
             None
             if comparison_base_root is None
-            else _capture_material_path_identity(
-                comparison_base_root,
-                path,
-                required=False,
-            )
+            else _capture_material_path_identity(comparison_base_root, path)
         )
         captured.append((path, head_identity, base_identity))
     return tuple(captured)
+
+
+def _material_scope_capture_failure_paths(
+    captured: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+    inventory: ChangeInventory,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Validate captured states against authoritative changed-path statuses."""
+
+    if not isinstance(inventory, ChangeInventory):
+        raise ReviewError("selected material inventory is invalid")
+    status_by_path = {entry.path: entry.status for entry in inventory.entries}
+    failures: list[str] = []
+    head_failures: list[str] = []
+
+    def fail(path: str, *, head: bool = False) -> None:
+        if path not in failures:
+            failures.append(path)
+        if head and path not in head_failures:
+            head_failures.append(path)
+
+    for path, head_identity, base_identity in captured:
+        status = status_by_path.get(path)
+        if status not in {ChangeStatus.ADDED, ChangeStatus.MODIFIED}:
+            fail(path, head=True)
+            continue
+        if head_identity.state != "present":
+            fail(path, head=True)
+        if status is ChangeStatus.MODIFIED:
+            if base_identity is None or base_identity.state != "present":
+                fail(path)
+        elif (
+            base_identity is not None
+            and base_identity.state != "error:unavailable"
+        ):
+            # An added path must remain absent from the comparison snapshot.
+            # Symlinks, oversized files, inspection errors, or present bytes are
+            # inconsistent with the authoritative inventory and fail closed.
+            fail(path)
+    return tuple(failures), tuple(head_failures)
 
 
 def _material_scope_drifted_paths(
@@ -844,26 +862,34 @@ def _material_scope_drifted_paths(
     after: Sequence[
         tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
     ],
-) -> tuple[str, ...]:
-    """Return changed frozen paths, preserving the original deterministic order."""
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return head and base drift separately in deterministic selected order."""
 
     before_by_path = {path: (head, base) for path, head, base in before}
     after_by_path = {path: (head, base) for path, head, base in after}
-    return tuple(
+    head_drifted = tuple(
         path
         for path, _head, _base in before
-        if before_by_path.get(path) != after_by_path.get(path)
+        if path not in after_by_path
+        or before_by_path[path][0] != after_by_path[path][0]
     )
+    base_drifted = tuple(
+        path
+        for path, _head, _base in before
+        if path not in after_by_path
+        or before_by_path[path][1] != after_by_path[path][1]
+    )
+    return head_drifted, base_drifted
 
 
 def _retain_audits_after_material_drift(
     snapshots: Sequence[DeterministicAuditSnapshot],
     plans: Sequence[ManifestAuditPlan],
-    drifted_paths: Sequence[str],
+    head_drifted_paths: Sequence[str],
 ) -> tuple[DeterministicAuditSnapshot, ...]:
-    """Retain only pre-provider Audit snapshots unrelated to invalid material."""
+    """Retain Audits whose authoritative head inputs remain unchanged."""
 
-    drifted = set(drifted_paths)
+    drifted = set(head_drifted_paths)
     invalidated_manifests = {
         plan.manifest_path
         for plan in plans
@@ -1144,23 +1170,39 @@ def run_review(
                 selected_material_paths,
                 comparison_base_root=comparison_base_root,
             )
+            (
+                material_capture_failure_paths,
+                material_capture_head_failure_paths,
+            ) = _material_scope_capture_failure_paths(
+                frozen_material_identities,
+                preflight.scope.inventory,
+            )
         except ReviewError:
+            material_capture_failure_paths = tuple(selected_material_paths)
+            material_capture_head_failure_paths = tuple(selected_material_paths)
+        if material_capture_failure_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                material_capture_head_failure_paths,
+            )
             preflight = _record_runtime_gate3_omissions(
                 preflight,
                 (
                     (
                         "PREFLIGHT_G3_MATERIAL_SCOPE_UNAVAILABLE",
                         "material_scope_capture_failure_count",
-                        1,
+                        len(material_capture_failure_paths),
                     ),
                 ),
             )
             return finish(
                 ReviewStatus.PARTIAL,
+                deterministic_audits=deterministic_audits,
                 error_code="MATERIAL_SCOPE_CAPTURE_FAILED",
                 error_message=(
-                    "A selected material identity could not be captured before "
-                    "provider execution."
+                    f"{len(material_capture_failure_paths)} selected material "
+                    "path(s) could not be captured before provider execution."
                 ),
             )
         if provider is None:
@@ -1257,19 +1299,27 @@ def run_review(
                 selected_material_paths,
                 comparison_base_root=comparison_base_root,
             )
-            material_drifted_paths = _material_scope_drifted_paths(
+            (
+                head_material_drifted_paths,
+                base_material_drifted_paths,
+            ) = _material_scope_drifted_paths(
                 frozen_material_identities,
                 post_material_identities,
             )
-        except _MaterialScopeCaptureError as exc:
-            material_drifted_paths = (exc.path,)
         except ReviewError:
-            material_drifted_paths = tuple(selected_material_paths)
+            head_material_drifted_paths = tuple(selected_material_paths)
+            base_material_drifted_paths = ()
+        material_drifted_paths = tuple(
+            sorted(
+                set(head_material_drifted_paths)
+                | set(base_material_drifted_paths)
+            )
+        )
         if material_drifted_paths:
             deterministic_audits = _retain_audits_after_material_drift(
                 deterministic_audits,
                 audit_plans,
-                material_drifted_paths,
+                head_material_drifted_paths,
             )
             preflight = _record_runtime_gate3_omissions(
                 preflight,

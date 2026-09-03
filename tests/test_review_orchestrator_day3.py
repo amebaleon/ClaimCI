@@ -2337,6 +2337,349 @@ def test_pre_provider_material_capture_failure_is_typed_and_zero_call(
     )
 
 
+def test_modified_base_capture_failure_stops_before_provider_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A modified path cannot proceed when its comparison-base bytes disappear."""
+
+    import claimci.review.orchestrator as orchestrator
+    import claimci.review.preflight as preflight_module
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    base_path = inputs.comparison_base.root / "results.json"
+    base_path.write_bytes((inputs.repository_root / "results.json").read_bytes())
+    inventory = replace(
+        inventory,
+        entries=(ChangeEntry("results.json", ChangeStatus.MODIFIED),),
+    )
+    inputs = replace(inputs, inventory=inventory)
+
+    def verify_inventory(*_args: Any, **_kwargs: Any) -> ChangeInventory:
+        return inventory
+
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        verify_inventory,
+    )
+    real_scope_source_bundle = preflight_module.scope_source_bundle
+    scope_bundle_calls = 0
+
+    def delete_base_after_preflight(scope: Any) -> Any:
+        nonlocal scope_bundle_calls
+        result = real_scope_source_bundle(scope)
+        scope_bundle_calls += 1
+        if scope_bundle_calls == 2:
+            base_path.unlink()
+        return result
+
+    monkeypatch.setattr(
+        "claimci.review.preflight.scope_source_bundle",
+        delete_base_after_preflight,
+    )
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("modified-base capture failure reached provider creation")
+
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(inputs, _config())
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_CAPTURE_FAILED"
+    assert result.provider_calls == ()
+    assert result.preflight is not None
+    assert result.preflight.gates[2].metrics[
+        "material_scope_capture_failure_count"
+    ] == 1
+
+
+def test_unrelated_material_capture_failure_preserves_valid_audit_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed non-Audit material path must not erase a valid Audit snapshot."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory, _manifest, _issued_paths = _declared_manifest_run_inputs(
+        tmp_path
+    )
+    unrelated_path = "metrics/unrelated.json"
+    unrelated = inputs.repository_root / Path(unrelated_path)
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text('{"accuracy": 0.91}\n', encoding="utf-8")
+    inventory = replace(
+        inventory,
+        declared_entry_count=len(inventory.entries) + 1,
+        entries=tuple(
+            sorted(
+                (*inventory.entries, ChangeEntry(unrelated_path, ChangeStatus.ADDED)),
+                key=lambda entry: (entry.path, entry.status.value),
+            )
+        ),
+    )
+    inputs = replace(inputs, inventory=inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    real_inspect = orchestrator.inspect_confined_regular_file
+    inspected: list[str] = []
+
+    def fail_unrelated_head(
+        root: Path,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> Any:
+        if root == inputs.repository_root and path == unrelated_path:
+            inspected.append(path)
+            raise PassiveFileError("unrelated capture unavailable", code="unavailable")
+        return real_inspect(root, path, max_bytes=max_bytes)
+
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("capture failure reached provider creation")
+
+    monkeypatch.setattr(orchestrator, "inspect_confined_regular_file", fail_unrelated_head)
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(inputs, _config())
+
+    assert inspected == [unrelated_path]
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_CAPTURE_FAILED"
+    assert result.provider_calls == ()
+    assert any(
+        snapshot.manifest_path == "research.yaml"
+        for snapshot in result.deterministic_audits
+    )
+
+
+def test_comparison_base_only_audit_material_drift_preserves_audit_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Comparison-base drift does not invalidate a head-only Audit snapshot."""
+
+    inputs, inventory, manifest, _issued_paths = _declared_manifest_run_inputs(
+        tmp_path
+    )
+    manifest_bytes = manifest.read_bytes()
+    base_manifest = inputs.comparison_base.root / "research.yaml"
+    base_manifest.write_bytes(manifest_bytes)
+    inventory = replace(
+        inventory,
+        entries=tuple(
+            sorted(
+                (
+                    ChangeEntry(
+                        entry.path,
+                        ChangeStatus.MODIFIED
+                        if entry.path == "research.yaml"
+                        else entry.status,
+                    )
+                    for entry in inventory.entries
+                ),
+                key=lambda entry: (entry.path, entry.status.value),
+            )
+        ),
+    )
+    inputs = replace(inputs, inventory=inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    def extraction(request: StructuredRequest) -> str:
+        base_manifest.write_bytes(manifest_bytes + b"\n# comparison-only drift\n")
+        return _extraction_output(request, title=inputs.pr_title)
+
+    provider = FakeProvider(extraction=extraction)
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_INVALIDATED"
+    assert [call.task for call in result.provider_calls] == ["extract_claims"]
+    assert any(
+        snapshot.manifest_path == "research.yaml"
+        for snapshot in result.deterministic_audits
+    )
+
+
+def test_material_capture_failure_collects_all_failing_selected_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identity capture reports every bounded failure, not only the first path."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    second_path = "metrics.json"
+    (inputs.repository_root / second_path).write_text(
+        '{"accuracy": 0.94}\n', encoding="utf-8"
+    )
+    inventory = replace(
+        inventory,
+        declared_entry_count=2,
+        entries=tuple(
+            sorted(
+                (
+                    ChangeEntry("results.json", ChangeStatus.ADDED),
+                    ChangeEntry(second_path, ChangeStatus.ADDED),
+                ),
+                key=lambda entry: (entry.path, entry.status.value),
+            )
+        ),
+    )
+    inputs = replace(inputs, inventory=inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    real_inspect = orchestrator.inspect_confined_regular_file
+    head_failures: list[str] = []
+    failing_paths = {"results.json", second_path}
+
+    def fail_all_selected_head(
+        root: Path,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> Any:
+        if root == inputs.repository_root and path in failing_paths:
+            head_failures.append(path)
+            raise PassiveFileError("selected capture unavailable", code="unavailable")
+        return real_inspect(root, path, max_bytes=max_bytes)
+
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("multi-path capture failure reached provider creation")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "inspect_confined_regular_file",
+        fail_all_selected_head,
+    )
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(inputs, _config())
+
+    assert head_failures == sorted(failing_paths)
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_CAPTURE_FAILED"
+    assert result.provider_calls == ()
+    assert result.preflight is not None
+    assert result.preflight.gates[2].metrics[
+        "material_scope_capture_failure_count"
+    ] == len(failing_paths)
+
+
+def test_post_provider_material_capture_failure_counts_all_failing_selected_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-provider identity invalidation reports every bounded head failure."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    second_path = "metrics.json"
+    (inputs.repository_root / second_path).write_text(
+        '{"accuracy": 0.94}\n', encoding="utf-8"
+    )
+    inventory = replace(
+        inventory,
+        declared_entry_count=2,
+        entries=tuple(
+            sorted(
+                (
+                    ChangeEntry("results.json", ChangeStatus.ADDED),
+                    ChangeEntry(second_path, ChangeStatus.ADDED),
+                ),
+                key=lambda entry: (entry.path, entry.status.value),
+            )
+        ),
+    )
+    inputs = replace(inputs, inventory=inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    real_inspect = orchestrator.inspect_confined_regular_file
+    failing_paths = {"results.json", second_path}
+    post_failures: list[str] = []
+    fail_after_extraction = False
+
+    def fail_after_extraction_inspect(
+        root: Path,
+        path: str,
+        *,
+        max_bytes: int,
+    ) -> Any:
+        if (
+            fail_after_extraction
+            and root == inputs.repository_root
+            and path in failing_paths
+        ):
+            post_failures.append(path)
+            raise PassiveFileError("selected capture unavailable", code="unavailable")
+        return real_inspect(root, path, max_bytes=max_bytes)
+
+    def extraction(request: StructuredRequest) -> str:
+        nonlocal fail_after_extraction
+        fail_after_extraction = True
+        return _extraction_output(request, title=inputs.pr_title)
+
+    discover_calls: list[object] = []
+    synthesis_calls: list[StructuredRequest] = []
+    original_discover = orchestrator.discover_evidence
+
+    def traced_discover(*args: Any, **kwargs: Any) -> EvidenceBundle:
+        discover_calls.append((args, kwargs))
+        return original_discover(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "inspect_confined_regular_file",
+        fail_after_extraction_inspect,
+    )
+    monkeypatch.setattr(orchestrator, "discover_evidence", traced_discover)
+    provider = FakeProvider(
+        extraction=extraction,
+        synthesis=lambda request: (
+            synthesis_calls.append(request) or _synthesis_output(request)
+        ),
+    )
+
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert post_failures == sorted(failing_paths)
+    assert [call.task for call in result.provider_calls] == ["extract_claims"]
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_INVALIDATED"
+    assert discover_calls == []
+    assert synthesis_calls == []
+    assert result.preflight is not None
+    assert result.preflight.gates[2].metrics[
+        "material_scope_invalidated_count"
+    ] == len(failing_paths)
+
+
 def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: Path) -> None:
     provider = FakeProvider(error_on="extract_claims")
 
