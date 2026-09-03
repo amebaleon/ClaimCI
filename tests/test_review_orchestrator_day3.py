@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
@@ -2183,11 +2183,157 @@ def test_extraction_time_selected_material_drift_cannot_reach_evidence_or_synthe
     assert [call.task for call in result.provider_calls] == ["extract_claims"]
     assert discover_calls == []
     assert synthesis_payloads == []
+    assert result.preflight.scope.complete is False
+    assert result.preflight.gates[2].disposition.value == "pass_partial"
+    assert result.preflight.gates[2].metrics[
+        "material_scope_invalidated_count"
+    ] == 1
+    assert any(
+        reason.code == "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED"
+        for reason in result.preflight.gates[2].reasons
+    )
     assert result.interpretations == ()
     assert result.evidence.references == ()
     assert all(
         reference.sha256 != mutated_sha
         for reference in result.evidence.references
+    )
+
+
+@pytest.mark.parametrize(
+    "base_initial_state",
+    ("present", "absent"),
+    ids=("base-hash-drift", "base-absent-to-present"),
+)
+def test_extraction_time_comparison_material_drift_cannot_change_locality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base_initial_state: str,
+) -> None:
+    """Changed-region locality remains bound to the pre-provider base bytes."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    head_path = inputs.repository_root / "results.json"
+    base_path = inputs.comparison_base.root / "results.json"
+    base_lines = [f"row-{index}\n" for index in range(5_000)]
+    head_lines = list(base_lines)
+    base_lines[400] = "accuracy: 0.90\n"
+    head_lines[400] = "accuracy: 0.95\n"
+    base_bytes = "".join(base_lines).encode("utf-8")
+    head_bytes = "".join(head_lines).encode("utf-8")
+    if base_initial_state == "present":
+        base_path.write_bytes(base_bytes)
+    head_path.write_bytes(head_bytes)
+    change_status = (
+        ChangeStatus.MODIFIED
+        if base_initial_state == "present"
+        else ChangeStatus.ADDED
+    )
+    inventory = replace(
+        inventory,
+        entries=(ChangeEntry("results.json", change_status),),
+    )
+    inputs = replace(inputs, inventory=inventory)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    mutated_base_sha = hashlib.sha256(head_bytes).hexdigest()
+
+    discover_calls: list[object] = []
+    synthesis_payloads: list[dict[str, Any]] = []
+    original_discover = orchestrator.discover_evidence
+
+    def traced_discover(*args: Any, **kwargs: Any) -> EvidenceBundle:
+        discover_calls.append((args, kwargs))
+        return original_discover(*args, **kwargs)
+
+    def extraction(request: StructuredRequest) -> str:
+        # This removes the trusted comparison change before evidence routing,
+        # so a fresh locality computation would incorrectly become unlocalized.
+        base_path.write_bytes(head_bytes)
+        payload = json.loads(_extraction_output(request, title=inputs.pr_title))
+        payload["claims"][0]["claimed_magnitude"] = None
+        payload["claims"][0]["evidence_hints"] = ["results.json"]
+        return json.dumps(payload)
+
+    def synthesis(request: StructuredRequest) -> str:
+        synthesis_payloads.append(request.payload)
+        return _synthesis_output(request)
+
+    monkeypatch.setattr(orchestrator, "discover_evidence", traced_discover)
+    provider = FakeProvider(extraction=extraction, synthesis=synthesis)
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.selected_paths == ("results.json",)
+    assert result.preflight.scope.materialized_path_chars == (("results.json", 16_000),)
+    assert hashlib.sha256(base_path.read_bytes()).hexdigest() == mutated_base_sha
+
+    # A comparison-root identity race must stop before changed-region locality
+    # is recomputed or the second provider call.  Current code instead reaches
+    # synthesis with an unlocalized prefix after the base becomes equal to head.
+    assert synthesis_payloads == []
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_INVALIDATED"
+    assert [call.task for call in result.provider_calls] == ["extract_claims"]
+    assert discover_calls == []
+    assert result.preflight.scope.complete is False
+    assert result.preflight.gates[2].disposition.value == "pass_partial"
+    assert result.preflight.gates[2].metrics[
+        "material_scope_invalidated_count"
+    ] == 1
+    assert any(
+        reason.code == "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED"
+        for reason in result.preflight.gates[2].reasons
+    )
+    assert result.interpretations == ()
+    assert result.evidence.references == ()
+
+
+def test_pre_provider_material_capture_failure_is_typed_and_zero_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selected material identity must be captured before provider creation."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+        raise PassiveFileError("capture unavailable", code="unavailable")
+
+    provider_constructions = 0
+
+    def forbidden_provider(**_kwargs: Any) -> Any:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        raise AssertionError("material capture failure reached provider creation")
+
+    monkeypatch.setattr(orchestrator, "inspect_confined_regular_file", unavailable)
+    monkeypatch.setattr(orchestrator, "OpenAIReviewerProvider", forbidden_provider)
+
+    result = run_review(inputs, _config())
+
+    assert provider_constructions == 0
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_CAPTURE_FAILED"
+    assert result.provider_calls == ()
+    assert result.preflight is not None
+    assert result.preflight.gates[2].disposition.value == "pass_partial"
+    assert result.preflight.gates[2].metrics[
+        "material_scope_capture_failure_count"
+    ] == 1
+    assert any(
+        reason.code == "PREFLIGHT_G3_MATERIAL_SCOPE_UNAVAILABLE"
+        for reason in result.preflight.gates[2].reasons
     )
 
 

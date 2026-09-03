@@ -11,6 +11,10 @@ from decimal import Decimal, DecimalException
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from claimci.passive_files import (
+    PassiveFileError,
+    inspect_confined_regular_file,
+)
 from claimci.parsing import unique_json_object
 
 from .evidence import (
@@ -55,6 +59,7 @@ from .request_budget import (
     synthesis_schema as shared_synthesis_schema,
 )
 from .sources import (
+    MAX_SOURCE_FILE_BYTES,
     collect_review_sources,
     validate_claim_candidates_best_effort,
 )
@@ -743,6 +748,134 @@ def _record_runtime_gate3_omissions(
     )
 
 
+class _MaterialScopeCaptureError(ReviewError):
+    """A frozen selected material path could not be inspected safely."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__("selected material identity could not be captured")
+        self.path = path
+
+
+@dataclass(frozen=True)
+class _MaterialPathIdentity:
+    """Content identity/state for one already-authorized repository path."""
+
+    state: str
+    size: int | None = None
+    sha256: str | None = None
+
+
+def _capture_material_path_identity(
+    root: Path,
+    path: str,
+    *,
+    required: bool,
+) -> _MaterialPathIdentity:
+    """Inspect one frozen path without discovering or retaining new material."""
+
+    try:
+        inspection = inspect_confined_regular_file(
+            root,
+            path,
+            max_bytes=MAX_SOURCE_FILE_BYTES,
+        )
+    except PassiveFileError as exc:
+        if required:
+            raise _MaterialScopeCaptureError(path) from exc
+        return _MaterialPathIdentity(state=f"error:{exc.code}")
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        if required:
+            raise _MaterialScopeCaptureError(path) from exc
+        return _MaterialPathIdentity(state="error:inspection")
+    return _MaterialPathIdentity(
+        state="present",
+        size=inspection.size,
+        sha256=inspection.sha256,
+    )
+
+
+def _capture_material_scope_identities(
+    head_root: Path,
+    selected_paths: Sequence[str],
+    *,
+    comparison_base_root: Path | None,
+) -> tuple[
+    tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None], ...
+]:
+    """Capture identities for only the deterministic, bounded selected list."""
+
+    if not isinstance(selected_paths, Sequence) or isinstance(
+        selected_paths, (str, bytes)
+    ):
+        raise ReviewError("selected material paths must be a sequence")
+    selected = tuple(selected_paths)
+    if any(not isinstance(path, str) or not path for path in selected):
+        raise ReviewError("selected material path is invalid")
+    if len(selected) > 24 or len(set(selected)) != len(selected):
+        raise ReviewError("selected material paths exceed the fixed review bound")
+    captured: list[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ] = []
+    for path in selected:
+        head_identity = _capture_material_path_identity(
+            head_root,
+            path,
+            required=True,
+        )
+        if head_identity.state != "present":
+            raise _MaterialScopeCaptureError(path)
+        base_identity = (
+            None
+            if comparison_base_root is None
+            else _capture_material_path_identity(
+                comparison_base_root,
+                path,
+                required=False,
+            )
+        )
+        captured.append((path, head_identity, base_identity))
+    return tuple(captured)
+
+
+def _material_scope_drifted_paths(
+    before: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+    after: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+) -> tuple[str, ...]:
+    """Return changed frozen paths, preserving the original deterministic order."""
+
+    before_by_path = {path: (head, base) for path, head, base in before}
+    after_by_path = {path: (head, base) for path, head, base in after}
+    return tuple(
+        path
+        for path, _head, _base in before
+        if before_by_path.get(path) != after_by_path.get(path)
+    )
+
+
+def _retain_audits_after_material_drift(
+    snapshots: Sequence[DeterministicAuditSnapshot],
+    plans: Sequence[ManifestAuditPlan],
+    drifted_paths: Sequence[str],
+) -> tuple[DeterministicAuditSnapshot, ...]:
+    """Retain only pre-provider Audit snapshots unrelated to invalid material."""
+
+    drifted = set(drifted_paths)
+    invalidated_manifests = {
+        plan.manifest_path
+        for plan in plans
+        if drifted.intersection(plan.paths)
+    }
+    return tuple(
+        snapshot
+        for snapshot in snapshots
+        if snapshot.manifest_path not in invalidated_manifests
+    )
+
+
 def _sources_after_manifest_reservation(
     sources: SourceBundle,
     audit_plans: Sequence[ManifestAuditPlan],
@@ -999,6 +1132,37 @@ def run_review(
                 error_code="CONTEXT_LIMIT",
                 error_message="Extraction context exceeds the configured limit.",
             )
+        selected_material_paths = tuple(sorted(sources.repository_paths))
+        comparison_base_root = (
+            inputs.comparison_base.root
+            if inputs.comparison_base is not None
+            else inputs.base_root
+        )
+        try:
+            frozen_material_identities = _capture_material_scope_identities(
+                inputs.repository_root,
+                selected_material_paths,
+                comparison_base_root=comparison_base_root,
+            )
+        except ReviewError:
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_MATERIAL_SCOPE_UNAVAILABLE",
+                        "material_scope_capture_failure_count",
+                        1,
+                    ),
+                ),
+            )
+            return finish(
+                ReviewStatus.PARTIAL,
+                error_code="MATERIAL_SCOPE_CAPTURE_FAILED",
+                error_message=(
+                    "A selected material identity could not be captured before "
+                    "provider execution."
+                ),
+            )
         if provider is None:
             if config.provider != "openai":
                 return finish(
@@ -1085,6 +1249,47 @@ def run_review(
                     f"{invalidated_audit_plan_count} exact deterministic Audit "
                     "input bundle(s) changed or became unavailable after the "
                     "pre-provider snapshot; synthesis was skipped."
+                ),
+            )
+        try:
+            post_material_identities = _capture_material_scope_identities(
+                inputs.repository_root,
+                selected_material_paths,
+                comparison_base_root=comparison_base_root,
+            )
+            material_drifted_paths = _material_scope_drifted_paths(
+                frozen_material_identities,
+                post_material_identities,
+            )
+        except _MaterialScopeCaptureError as exc:
+            material_drifted_paths = (exc.path,)
+        except ReviewError:
+            material_drifted_paths = tuple(selected_material_paths)
+        if material_drifted_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                material_drifted_paths,
+            )
+            preflight = _record_runtime_gate3_omissions(
+                preflight,
+                (
+                    (
+                        "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED",
+                        "material_scope_invalidated_count",
+                        len(material_drifted_paths),
+                    ),
+                ),
+            )
+            return finish(
+                ReviewStatus.PARTIAL,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "A selected material identity changed or became unavailable "
+                    "after extraction; evidence discovery and synthesis were "
+                    "skipped."
                 ),
             )
         claim_validation = validate_claim_candidates_best_effort(
