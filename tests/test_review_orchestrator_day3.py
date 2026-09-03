@@ -103,7 +103,7 @@ def _inputs(tmp_path: Path, *, title: str = TITLE) -> ReviewInputs:
     document.write_text("context", encoding="utf-8")
     result = repository / "results" / "accuracy.json"
     result.parent.mkdir(parents=True)
-    result.write_text('{"accuracy": 0.95}\n', encoding="utf-8")
+    result.write_text('{"accuracy": 0.95}\n', encoding="utf-8", newline="\n")
     return ReviewInputs(
         repository_root=repository,
         pr_title=title,
@@ -1572,7 +1572,7 @@ def test_context_limit_allocates_oversized_synthesis_inputs_before_second_call(
         16_000,
         16_000,
         16_000,
-        20,
+        19,
     ]
 
 
@@ -1670,7 +1670,9 @@ def test_file_limit_is_global_across_sources_evidence_and_manifests(
 
     result_path = repository / "results" / "accuracy.json"
     result_path.parent.mkdir()
-    result_path.write_text('{"accuracy": 0.95}\n', encoding="utf-8")
+    result_path.write_text(
+        '{"accuracy": 0.95}\n', encoding="utf-8", newline="\n"
+    )
     title = (
         "Candidate improves accuracy; see notes/note-00.md and "
         "results/accuracy.json"

@@ -635,6 +635,35 @@ def _sparse_patterns(paths: Sequence[str]) -> bytes:
     return ("\n".join(patterns) + "\n").encode("utf-8")
 
 
+def _stabilize_disposable_index(root: Path, empty_hooks: Path) -> None:
+    encoded_path = _run_git(
+        root,
+        ("rev-parse", "--path-format=absolute", "--git-path", "index"),
+        empty_hooks=empty_hooks,
+        output_limit=4_096,
+    )
+    try:
+        index_path = Path(encoded_path.decode("utf-8", errors="strict").strip())
+        metadata = index_path.lstat()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("disposable snapshot index is unavailable") from exc
+    if (
+        not index_path.is_absolute()
+        or index_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+    ):
+        raise ValueError("disposable snapshot index is unavailable")
+    stabilized_time = max(metadata.st_mtime_ns, time.time_ns()) + 1_000_000_000
+    try:
+        timestamps = (metadata.st_atime_ns, stabilized_time)
+        if os.utime in os.supports_follow_symlinks:
+            os.utime(index_path, ns=timestamps, follow_symlinks=False)
+        else:
+            os.utime(index_path, ns=timestamps)
+    except (NotImplementedError, OSError) as exc:
+        raise ValueError("disposable snapshot index is unavailable") from exc
+
+
 def _add_sparse_worktree(
     clone: Path,
     root: Path,
@@ -658,6 +687,7 @@ def _add_sparse_worktree(
         ("checkout", "--detach", sha),
         empty_hooks=empty_hooks,
     )
+    _stabilize_disposable_index(root, empty_hooks)
 
 
 def _set_sparse_worktree_paths(
@@ -673,6 +703,7 @@ def _set_sparse_worktree_paths(
         empty_hooks=empty_hooks,
         input_bytes=_sparse_patterns(paths),
     )
+    _stabilize_disposable_index(root, empty_hooks)
 
 
 def _reject_unsafe_source_config(source: Path, empty_hooks: Path) -> None:

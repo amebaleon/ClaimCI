@@ -8,6 +8,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -152,7 +153,23 @@ def _write(root: Path, relative: str, text: str) -> None:
 def _commit(root: Path, message: str) -> str:
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", message)
-    return _git(root, "rev-parse", "HEAD")
+    sha = _git(root, "rev-parse", "HEAD")
+    _stabilize_index_metadata(root)
+    return sha
+
+
+def _stabilize_index_metadata(root: Path) -> None:
+    index = Path(
+        _git(root, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    )
+    metadata = index.stat()
+    os.utime(
+        index,
+        ns=(
+            metadata.st_atime_ns,
+            max(metadata.st_mtime_ns, time.time_ns()) + 1_000_000,
+        ),
+    )
 
 
 def _new_repo(root: Path) -> None:
@@ -163,6 +180,8 @@ def _new_repo(root: Path) -> None:
 
 
 def _identity(role: SnapshotRole, root: Path, sha: str) -> SnapshotIdentity:
+    if (root / ".git").exists():
+        _stabilize_index_metadata(root)
     return SnapshotIdentity(role, root.resolve(), sha)
 
 

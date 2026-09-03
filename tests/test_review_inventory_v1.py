@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
+import struct
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -260,7 +265,23 @@ def _write(root: Path, relative: str, text: str) -> None:
 def _commit(root: Path, message: str) -> str:
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", message)
-    return _git(root, "rev-parse", "HEAD")
+    sha = _git(root, "rev-parse", "HEAD")
+    _stabilize_index_metadata(root)
+    return sha
+
+
+def _stabilize_index_metadata(root: Path) -> None:
+    index = Path(
+        _git(root, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    )
+    metadata = index.stat()
+    os.utime(
+        index,
+        ns=(
+            metadata.st_atime_ns,
+            max(metadata.st_mtime_ns, time.time_ns()) + 1_000_000,
+        ),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -302,6 +323,7 @@ def divergent_git_graph(tmp_path_factory: pytest.TempPathFactory) -> dict[str, o
     ):
         root = (snapshots / name).resolve()
         _git(repository, "worktree", "add", "-q", "--detach", str(root), sha)
+        _stabilize_index_metadata(root)
         roots[name] = root
 
     return {
@@ -433,6 +455,8 @@ def test_git_inventory_rejects_dirty_snapshot(
     finally:
         if dirty_kind == "tracked":
             _write(head_root, "modified.txt", "new\n")
+            _git(head_root, "update-index", "--refresh")
+            _stabilize_index_metadata(head_root)
         else:
             (head_root / "untracked.txt").unlink()
 
@@ -699,9 +723,10 @@ def _filter_sentinel_repository(tmp_path: Path) -> tuple[Path, str]:
 
 
 def _command_argv(*values: str) -> str:
-    if os.name == "nt":
-        return subprocess.list2cmdline(values)
-    return shlex.join(values)
+    return shlex.join(
+        value.replace("\\", "/") if os.name == "nt" else value
+        for value in values
+    )
 
 
 def _remove_disposable_tree(path: Path) -> None:
@@ -746,6 +771,169 @@ def test_git_cleanliness_never_invokes_configured_clean_or_process_filter(
         _same_snapshot_inventory(root, sha)
     assert not marker.exists()
     assert not any("status" in argv for argv in calls)
+    assert not any("--modified" in argv for argv in calls)
+
+
+@pytest.mark.parametrize(
+    "index_flag",
+    ["--assume-unchanged", "--skip-worktree", "--fsmonitor-valid"],
+)
+@pytest.mark.parametrize("dirty_kind", ["modified", "deleted"])
+def test_git_cleanliness_rejects_index_bits_that_hide_dirty_files(
+    tmp_path: Path, index_flag: str, dirty_kind: str
+) -> None:
+    root, sha = _filter_sentinel_repository(tmp_path)
+    _git(root, "update-index", index_flag, "--", "filtered.txt")
+    if dirty_kind == "modified":
+        _write(root, "filtered.txt", "dirty\n")
+    else:
+        (root / "filtered.txt").unlink()
+
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+
+
+def test_git_cleanliness_accepts_git_managed_sparse_omissions(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "sparse").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    _write(root, "visible.txt", "visible\n")
+    _write(root, "omitted.txt", "omitted\n")
+    sha = _commit(root, "snapshot")
+
+    _git(root, "sparse-checkout", "set", "--no-cone", "visible.txt")
+    assert not (root / "omitted.txt").exists()
+    assert "S omitted.txt" in _git(root, "ls-files", "-v")
+
+    assert _same_snapshot_inventory(root, sha).entries == ()
+
+
+def test_git_cleanliness_rejects_unproved_sparse_omission(
+    tmp_path: Path,
+) -> None:
+    root, sha = _filter_sentinel_repository(tmp_path)
+    _git(root, "config", "core.sparseCheckout", "true")
+    _git(root, "update-index", "--skip-worktree", "--", "filtered.txt")
+    (root / "filtered.txt").unlink()
+
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+
+
+def test_git_cleanliness_rejects_equal_index_and_entry_timestamps(
+    tmp_path: Path,
+) -> None:
+    root, sha = _filter_sentinel_repository(tmp_path)
+    index = Path(
+        _git(root, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    )
+    file_modified_time = (root / "filtered.txt").stat().st_mtime_ns
+    index_metadata = index.stat()
+    os.utime(
+        index,
+        ns=(index_metadata.st_atime_ns, file_modified_time),
+    )
+
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+
+
+def test_git_cleanliness_rejects_split_index(tmp_path: Path) -> None:
+    root, sha = _filter_sentinel_repository(tmp_path)
+    _git(root, "update-index", "--split-index")
+
+    assert _git(root, "rev-parse", "--shared-index-path")
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+
+
+def test_git_cleanliness_split_index_never_invokes_configured_hook(
+    tmp_path: Path,
+) -> None:
+    root, sha = _filter_sentinel_repository(tmp_path)
+    _git(root, "update-index", "--split-index")
+    marker = (tmp_path / "post-index-change-ran.txt").resolve()
+    hooks = (tmp_path / "target-hooks").resolve()
+    hooks.mkdir()
+    hook = hooks / "post-index-change"
+    hook.write_text(
+        f"#!/bin/sh\nprintf invoked > {shlex.quote(marker.as_posix())}\nexit 0\n",
+        encoding="utf-8",
+    )
+    os.chmod(hook, 0o700)
+    _git(root, "config", "core.hooksPath", str(hooks))
+
+    assert _git(root, "rev-parse", "--shared-index-path")
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+    assert not marker.exists()
+
+
+def test_git_cleanliness_split_index_never_invokes_git_2_55_config_hook(
+    tmp_path: Path,
+) -> None:
+    root, sha = _filter_sentinel_repository(tmp_path)
+    _git(root, "update-index", "--split-index")
+    marker = (tmp_path / "configured-post-index-change-ran.txt").resolve()
+    helper = (tmp_path / "configured-hook.py").resolve()
+    helper.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('invoked', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _git(root, "config", "hook.claimci-sentinel.event", "post-index-change")
+    _git(
+        root,
+        "config",
+        "hook.claimci-sentinel.command",
+        _command_argv(sys.executable, str(helper), str(marker)),
+    )
+
+    assert _git(root, "rev-parse", "--shared-index-path")
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+    assert not marker.exists()
+
+
+def test_git_cleanliness_rejects_ignored_untracked_material(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "ignored-untracked").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    _write(root, ".gitignore", "ignored.txt\n")
+    sha = _commit(root, "snapshot")
+    _write(root, "ignored.txt", "generated\n")
+
+    assert _git(root, "status", "--porcelain=v1") == ""
+    assert _git(root, "ls-files", "--others") == "ignored.txt"
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
+
+
+def test_git_cleanliness_rejects_experimental_sparse_index(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "sparse-index").resolve()
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "tests@claimci.invalid")
+    _git(root, "config", "user.name", "ClaimCI Tests")
+    _write(root, "visible/selected.txt", "selected\n")
+    _write(root, "hidden/omitted.txt", "omitted\n")
+    sha = _commit(root, "snapshot")
+    _git(root, "sparse-checkout", "set", "--cone", "--sparse-index", "visible")
+
+    assert "040000" in _git(root, "ls-files", "--stage", "--sparse")
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
 
 
 def test_git_cleanliness_does_not_traverse_dirty_submodule_worktree(
@@ -794,6 +982,10 @@ def test_git_cleanliness_does_not_traverse_dirty_submodule_worktree(
     inventory = _same_snapshot_inventory(root, sha)
     assert inventory.entries == ()
     assert not marker.exists()
+
+    _remove_disposable_tree(submodule_root)
+    with pytest.raises((TypeError, ValueError), match="dirty"):
+        _same_snapshot_inventory(root, sha)
 
 
 def test_git_inventory_ignores_malicious_replace_refs(
@@ -902,6 +1094,27 @@ def test_git_runner_rejects_reader_that_remains_alive_after_join(
         release.set()
 
 
+def test_git_executable_resolution_excludes_process_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    trusted = shutil.which("git")
+    assert trusted is not None
+    trusted_path = Path(trusted).resolve(strict=True)
+    root = (tmp_path / "untrusted-current-directory").resolve()
+    root.mkdir()
+    fake = root / ("git.exe" if os.name == "nt" else "git")
+    fake.write_text("untrusted executable", encoding="utf-8")
+    os.chmod(fake, 0o700)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((".", str(root), str(trusted_path.parent)))
+    )
+
+    assert inventory_module._resolve_git_executable() == trusted_path
+
+
 def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -952,6 +1165,7 @@ def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal
     base = _commit(root, "base gitlinks")
     base_root = (tmp_path / "base-snapshot").resolve()
     _git(root, "worktree", "add", "-q", "--detach", str(base_root), base)
+    _stabilize_index_metadata(base_root)
 
     _git(root / "deps" / "modified", "checkout", "-q", gitlink_v2)
     _remove_disposable_tree(root / "deps" / "deleted")
@@ -965,7 +1179,24 @@ def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal
         "deps/added",
     )
     _git(root / "deps" / "added", "checkout", "-q", gitlink_v2)
+    _git(
+        root,
+        "add",
+        "-f",
+        "--",
+        "deps/added",
+        "deps/deleted",
+        "deps/modified",
+    )
     head = _commit(root, "head gitlinks")
+    assert _git(root, "rev-parse", f"{head}:deps/added") == gitlink_v2
+    with pytest.raises(subprocess.CalledProcessError):
+        _git(root, "rev-parse", f"{head}:deps/deleted")
+    assert _git(root, "rev-parse", f"{head}:deps/modified") == gitlink_v2
+
+    # Snapshot verification must use the superproject's gitlink metadata;
+    # changing a nested checkout's HEAD must not affect parent cleanliness.
+    _git(root / "deps" / "modified", "checkout", "-q", gitlink_v1)
 
     marker = tmp_path / "gitlink-worktree-executed.txt"
     filter_helper = tmp_path / "gitlink-filter.py"
@@ -977,7 +1208,10 @@ def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal
         encoding="utf-8",
     )
     filter_command = _command_argv(sys.executable, str(filter_helper), str(marker))
-    nested_roots = tuple((root / relative).resolve() for relative in ("deps/added", "deps/modified"))
+    nested_roots = tuple(
+        (root / relative).resolve()
+        for relative in ("deps/added", "deps/modified")
+    )
     for nested_root in nested_roots:
         _git(nested_root, "config", "filter.danger.clean", filter_command)
         _write(nested_root, ".gitattributes", "tracked.txt filter=danger\n")
@@ -1014,3 +1248,159 @@ def test_git_inventory_retains_added_modified_deleted_gitlinks_without_traversal
     )
     assert not marker.exists()
     assert not set(git_cwds).intersection(nested_roots)
+
+
+def _encoded_index(
+    entries: tuple[tuple[bytes, int], ...] = (),
+    *,
+    version: int = 2,
+    extensions: tuple[tuple[bytes, bytes], ...] = (),
+) -> bytes:
+    payload = bytearray(struct.pack(">4sII", b"DIRC", version, len(entries)))
+    previous = b""
+    for path, mode in entries:
+        entry_start = len(payload)
+        payload.extend(struct.pack(">10I", 0, 0, 0, 0, 0, 0, mode, 0, 0, 0))
+        payload.extend(b"\0" * 20)
+        payload.extend(struct.pack(">H", min(len(path), 0xFFF)))
+        if version == 4:
+            shared = 0
+            while (
+                shared < min(len(previous), len(path))
+                and previous[shared] == path[shared]
+            ):
+                shared += 1
+            remove = len(previous) - shared
+            assert remove < 0x80
+            payload.append(remove)
+            payload.extend(path[shared:] + b"\0")
+        else:
+            payload.extend(path + b"\0")
+            payload.extend(b"\0" * ((-(len(payload) - entry_start)) % 8))
+        previous = path
+    for signature, extension_payload in extensions:
+        payload.extend(signature)
+        payload.extend(struct.pack(">I", len(extension_payload)))
+        payload.extend(extension_payload)
+    return bytes(payload) + hashlib.sha1(payload).digest()
+
+
+def test_index_parser_rejects_fsmonitor_extension(tmp_path: Path) -> None:
+    import claimci.review.inventory as inventory_module
+
+    encoded = _encoded_index(extensions=((b"FSMN", b""),))
+    with pytest.raises(inventory_module._GitCommandError, match="unsupported"):
+        inventory_module._parse_index(tmp_path / "index", encoded, 0, "sha1")
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ((b"z.txt", 0o100644), (b"a.txt", 0o100644)),
+        ((b"same.txt", 0o100644), (b"same.txt", 0o100644)),
+        ((b"module", 0o160000), (b"module/tracked.txt", 0o100644)),
+    ],
+)
+def test_index_parser_rejects_invalid_entry_topology(
+    tmp_path: Path, entries: tuple[tuple[bytes, int], ...]
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    encoded = _encoded_index(entries)
+    with pytest.raises(inventory_module._GitCommandError, match="malformed"):
+        inventory_module._parse_index(tmp_path / "index", encoded, 0, "sha1")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        b".git/config",
+        b"dir/.GIT/hooks",
+        b"aux.txt",
+        b"AUX .txt",
+        b"COM1 .log",
+        b"name:stream",
+        b"trail. ",
+    ],
+)
+def test_index_parser_rejects_nonportable_git_paths(
+    tmp_path: Path, path: bytes
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    encoded = _encoded_index(((path, 0o100644),))
+    with pytest.raises(inventory_module._GitCommandError, match="malformed"):
+        inventory_module._parse_index(tmp_path / "index", encoded, 0, "sha1")
+
+
+def test_index_v4_remove_count_rejects_uintmax_overflow() -> None:
+    import claimci.review.inventory as inventory_module
+
+    with pytest.raises(inventory_module._GitCommandError, match="malformed"):
+        inventory_module._decode_v4_remove_count(b"\xff" * 9 + b"\x7f", 0, 10)
+
+
+def test_index_v4_rejects_cumulative_decoded_path_expansion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    monkeypatch.setattr(
+        inventory_module, "_MAX_DECODED_INDEX_PATH_BYTES", 32, raising=False
+    )
+    encoded = _encoded_index(
+        (
+            (b"a" * 30, 0o100644),
+            (b"a" * 29 + b"b", 0o100644),
+        ),
+        version=4,
+    )
+
+    with pytest.raises(inventory_module._GitCommandError, match="decoded path"):
+        inventory_module._parse_index(tmp_path / "index", encoded, 0, "sha1")
+
+
+def test_untracked_scan_does_not_expand_deep_sparse_index_ancestors(
+    tmp_path: Path,
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    class DeepIndexPath(str):
+        def split(self, *args: object, **kwargs: object) -> list[str]:
+            raise AssertionError("scanner expanded every indexed ancestor")
+
+    entry = inventory_module._IndexEntryMetadata(
+        path=DeepIndexPath("a/" * 2_040 + "tracked.txt"),
+        mode=0o100644,
+        skip_worktree=True,
+        ctime_seconds=0,
+        ctime_nanoseconds=0,
+        mtime_seconds=0,
+        mtime_nanoseconds=0,
+        device=0,
+        inode=0,
+        uid=0,
+        gid=0,
+        size=0,
+    )
+
+    inventory_module._verify_no_untracked_material(
+        tmp_path.resolve(), (entry,), index_modified_time_ns=1
+    )
+
+
+def test_tracked_lstat_rejects_reparse_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claimci.review.inventory as inventory_module
+
+    reparse_directory = SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_file_attributes=0x400,
+    )
+    monkeypatch.setattr(inventory_module.os, "lstat", lambda _path: reparse_directory)
+
+    with pytest.raises(inventory_module._GitCommandError, match="unavailable"):
+        inventory_module._tracked_lstat(
+            tmp_path.resolve(), "redirect/tracked.txt", {tmp_path.resolve()}
+        )

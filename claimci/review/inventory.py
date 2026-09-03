@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-import shutil
+import stat
+import struct
 import subprocess
+import tempfile
 import threading
 import time
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import (
@@ -28,6 +33,22 @@ MAX_CHANGESET_METADATA_BYTES = 1024 * 1024
 MAX_SELECTED_MATERIAL_BYTES = 16 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 10.0
 _MAX_GIT_ERROR_BYTES = 4_096
+_MAX_SNAPSHOT_INDEX_BYTES = MAX_SELECTED_MATERIAL_BYTES
+_MAX_DECODED_INDEX_PATH_BYTES = _MAX_SNAPSHOT_INDEX_BYTES
+_MAX_SNAPSHOT_INDEX_ENTRIES = 262_144
+_MAX_WORKTREE_METADATA_ENTRIES = 262_144
+_UINTMAX_MAX = (1 << 64) - 1
+_WINDOWS_REPARSE_POINT = 0x400
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "aux",
+        "con",
+        "nul",
+        "prn",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
 
 
 class InventoryVerificationError(ReviewError):
@@ -48,14 +69,59 @@ class _GitOutputLimitError(Exception):
     """A Git invocation exceeded its bounded retained output."""
 
 
-def _git_environment() -> dict[str, str]:
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _untrusted_execution_roots(root: Path) -> tuple[Path, ...]:
+    try:
+        roots = {root.resolve(strict=True), Path.cwd().resolve(strict=True)}
+    except OSError as exc:
+        raise _GitCommandError("git execution roots unavailable") from exc
+    return tuple(roots)
+
+
+def _trusted_path_directories(root: Path) -> tuple[Path, ...]:
+    search_path = os.environ.get("PATH")
+    if not search_path:
+        raise _GitCommandError("git unavailable")
+    excluded = _untrusted_execution_roots(root)
+    directories: list[Path] = []
+    seen: set[Path] = set()
+    for raw_directory in search_path.split(os.pathsep):
+        if not raw_directory:
+            continue
+        directory = Path(raw_directory)
+        if not directory.is_absolute():
+            continue
+        try:
+            directory = directory.resolve(strict=True)
+        except OSError:
+            continue
+        if (
+            not directory.is_dir()
+            or directory in seen
+            or any(_path_is_within(directory, item) for item in excluded)
+        ):
+            continue
+        seen.add(directory)
+        directories.append(directory)
+    if not directories:
+        raise _GitCommandError("trusted executable search path unavailable")
+    return tuple(directories)
+
+
+def _git_environment(root: Path) -> dict[str, str]:
     environment = {
         name: value
         for name in (
             "SYSTEMROOT",
             "WINDIR",
             "COMSPEC",
-            "PATH",
             "PATHEXT",
             "TEMP",
             "TMP",
@@ -76,6 +142,9 @@ def _git_environment() -> dict[str, str]:
             "PAGER": "cat",
             "LC_ALL": "C",
             "LANG": "C",
+            "PATH": os.pathsep.join(
+                str(directory) for directory in _trusted_path_directories(root)
+            ),
         }
     )
     return environment
@@ -101,12 +170,35 @@ def _drain_bounded(
         stream.close()  # type: ignore[attr-defined]
 
 
-def _run_git(root: Path, arguments: tuple[str, ...], *, stdout_limit: int) -> bytes:
-    executable = shutil.which("git")
-    if executable is None:
-        raise _GitCommandError("git unavailable")
+def _resolve_git_executable(root: Path | None = None) -> Path:
+    execution_root = Path.cwd() if root is None else root
+    excluded = _untrusted_execution_roots(execution_root)
+    names = ("git.exe",) if os.name == "nt" else ("git",)
+    for directory in _trusted_path_directories(execution_root):
+        for name in names:
+            try:
+                candidate = (directory / name).resolve(strict=True)
+            except OSError:
+                continue
+            if (
+                candidate.is_file()
+                and os.access(candidate, os.X_OK)
+                and not any(_path_is_within(candidate, item) for item in excluded)
+            ):
+                return candidate
+    raise _GitCommandError("git unavailable")
+
+
+def _run_git(
+    root: Path,
+    arguments: tuple[str, ...],
+    *,
+    stdout_limit: int,
+    stdin_bytes: bytes | None = None,
+) -> bytes:
+    executable = _resolve_git_executable(root)
     argv = (
-        str(Path(executable).resolve()),
+        str(executable),
         "-c",
         "core.quotepath=false",
         "-c",
@@ -115,18 +207,31 @@ def _run_git(root: Path, arguments: tuple[str, ...], *, stdout_limit: int) -> by
         "core.untrackedCache=false",
         *arguments,
     )
+    environment = _git_environment(root)
+    input_stream = None
     try:
+        if stdin_bytes is not None:
+            if len(stdin_bytes) > _MAX_SNAPSHOT_INDEX_BYTES:
+                raise _GitOutputLimitError("git input exceeded bound")
+            input_stream = tempfile.TemporaryFile()
+            input_stream.write(stdin_bytes)
+            input_stream.seek(0)
         process = subprocess.Popen(
             argv,
             cwd=str(root),
-            stdin=subprocess.DEVNULL,
+            stdin=input_stream if input_stream is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=environment,
             shell=False,
         )
+    except _GitOutputLimitError:
+        raise
     except (OSError, ValueError) as exc:
         raise _GitCommandError("git unavailable") from exc
+    finally:
+        if input_stream is not None:
+            input_stream.close()
     if process.stdout is None or process.stderr is None:
         process.kill()
         raise _GitCommandError("git pipes unavailable")
@@ -179,6 +284,472 @@ def _run_git(root: Path, arguments: tuple[str, ...], *, stdout_limit: int) -> by
     return bytes(stdout)
 
 
+@dataclass(frozen=True)
+class _IndexEntryMetadata:
+    path: str
+    mode: int
+    skip_worktree: bool
+    ctime_seconds: int
+    ctime_nanoseconds: int
+    mtime_seconds: int
+    mtime_nanoseconds: int
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    size: int
+
+
+@dataclass(frozen=True)
+class _IndexSnapshot:
+    path: Path
+    encoded: bytes
+    modified_time_ns: int
+    entries: tuple[_IndexEntryMetadata, ...]
+
+
+def _read_index_file(path: Path) -> tuple[bytes, int]:
+    descriptor = -1
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if path.is_symlink():
+            raise OSError("index path is a symlink")
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > _MAX_SNAPSHOT_INDEX_BYTES
+        ):
+            raise OSError("index file is invalid or oversized")
+        encoded = bytearray()
+        while len(encoded) <= _MAX_SNAPSHOT_INDEX_BYTES:
+            remaining = _MAX_SNAPSHOT_INDEX_BYTES + 1 - len(encoded)
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            encoded.extend(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise _GitCommandError("snapshot index metadata unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        len(encoded) > _MAX_SNAPSHOT_INDEX_BYTES
+        or len(encoded) != before.st_size
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise _GitCommandError("snapshot index changed during verification")
+    return bytes(encoded), before.st_mtime_ns
+
+
+def _decode_v4_remove_count(encoded: bytes, offset: int, end: int) -> tuple[int, int]:
+    if offset >= end:
+        raise _GitCommandError("snapshot index metadata malformed")
+    current = encoded[offset]
+    offset += 1
+    value = current & 0x7F
+    while current & 0x80:
+        value += 1
+        if offset >= end or value > (_UINTMAX_MAX >> 7):
+            raise _GitCommandError("snapshot index metadata malformed")
+        current = encoded[offset]
+        offset += 1
+        value = (value << 7) | (current & 0x7F)
+    return value, offset
+
+
+def _validate_index_path(path: str) -> None:
+    for component in path.split("/"):
+        folded = component.casefold()
+        device_name = folded.split(".", 1)[0].rstrip(" ")
+        if (
+            folded == ".git"
+            or component.endswith((".", " "))
+            or ":" in component
+            or device_name in _WINDOWS_RESERVED_NAMES
+        ):
+            raise _GitCommandError("snapshot index metadata malformed")
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    return bool(
+        getattr(metadata, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+    )
+
+
+def _has_indexed_descendant(indexed_paths: tuple[str, ...], path: str) -> bool:
+    prefix = f"{path}/"
+    position = bisect_left(indexed_paths, prefix)
+    return position < len(indexed_paths) and indexed_paths[position].startswith(prefix)
+
+
+def _parse_index(
+    path: Path,
+    encoded: bytes,
+    modified_time_ns: int,
+    object_format: str,
+) -> _IndexSnapshot:
+    hash_name, hash_bytes = ("sha1", 20) if object_format == "sha1" else ("sha256", 32)
+    if len(encoded) < 12 + hash_bytes:
+        raise _GitCommandError("snapshot index metadata malformed")
+    payload = encoded[:-hash_bytes]
+    if hashlib.new(hash_name, payload).digest() != encoded[-hash_bytes:]:
+        raise _GitCommandError("snapshot index checksum mismatch")
+    signature, version, entry_count = struct.unpack(">4sII", payload[:12])
+    if (
+        signature != b"DIRC"
+        or version not in {2, 3, 4}
+        or entry_count > _MAX_SNAPSHOT_INDEX_ENTRIES
+    ):
+        raise _GitCommandError("snapshot index metadata unsupported")
+
+    offset = 12
+    previous_path = b""
+    decoded_path_bytes = 0
+    gitlink_paths: list[str] = []
+    entries: list[_IndexEntryMetadata] = []
+    deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+    for _ in range(entry_count):
+        if time.monotonic() >= deadline:
+            raise _GitCommandError("snapshot index metadata scan exceeded its bound")
+        entry_start = offset
+        fixed_size = 40 + hash_bytes + 2
+        if offset + fixed_size > len(payload):
+            raise _GitCommandError("snapshot index metadata malformed")
+        values = struct.unpack(">10I", payload[offset : offset + 40])
+        offset += 40 + hash_bytes
+        flags = struct.unpack(">H", payload[offset : offset + 2])[0]
+        offset += 2
+        extended_flags = 0
+        if flags & 0x4000:
+            if version < 3 or offset + 2 > len(payload):
+                raise _GitCommandError("snapshot index metadata malformed")
+            extended_flags = struct.unpack(">H", payload[offset : offset + 2])[0]
+            offset += 2
+        if (
+            flags & 0x8000
+            or flags & 0x3000
+            or extended_flags & ~0x4000
+        ):
+            raise _GitCommandError("snapshot index contains unsafe validity bits")
+
+        if version == 4:
+            remove_count, offset = _decode_v4_remove_count(
+                payload, offset, len(payload)
+            )
+            terminator = payload.find(b"\0", offset)
+            if terminator < 0 or remove_count > len(previous_path):
+                raise _GitCommandError("snapshot index metadata malformed")
+            raw_path = previous_path[: len(previous_path) - remove_count] + payload[
+                offset:terminator
+            ]
+            offset = terminator + 1
+        else:
+            terminator = payload.find(b"\0", offset)
+            if terminator < 0:
+                raise _GitCommandError("snapshot index metadata malformed")
+            raw_path = payload[offset:terminator]
+            offset = terminator + 1
+            padding = (-(offset - entry_start)) % 8
+            if offset + padding > len(payload) or any(
+                payload[offset : offset + padding]
+            ):
+                raise _GitCommandError("snapshot index metadata malformed")
+            offset += padding
+        declared_path_bytes = flags & 0x0FFF
+        if declared_path_bytes < 0x0FFF and declared_path_bytes != len(raw_path):
+            raise _GitCommandError("snapshot index metadata malformed")
+        if previous_path and raw_path <= previous_path:
+            raise _GitCommandError("snapshot index metadata malformed")
+        decoded_path_bytes += len(raw_path)
+        if decoded_path_bytes > _MAX_DECODED_INDEX_PATH_BYTES:
+            raise _GitCommandError("snapshot index decoded path bound exceeded")
+        previous_path = raw_path
+        try:
+            decoded_path = raw_path.decode("utf-8", errors="strict")
+            _validate_index_path(decoded_path)
+            validated_path = ChangeEntry(decoded_path, ChangeStatus.MODIFIED).path
+        except (UnicodeDecodeError, ReviewError) as exc:
+            raise _GitCommandError("snapshot index metadata malformed") from exc
+        mode = values[6]
+        if mode not in {0o100644, 0o100755, 0o120000, 0o160000}:
+            raise _GitCommandError("snapshot index mode unsupported")
+        if mode == 0o160000:
+            gitlink_paths.append(validated_path)
+        entries.append(
+            _IndexEntryMetadata(
+                path=validated_path,
+                mode=mode,
+                skip_worktree=bool(extended_flags & 0x4000),
+                ctime_seconds=values[0],
+                ctime_nanoseconds=values[1],
+                mtime_seconds=values[2],
+                mtime_nanoseconds=values[3],
+                device=values[4],
+                inode=values[5],
+                uid=values[7],
+                gid=values[8],
+                size=values[9],
+            )
+        )
+
+    indexed_paths = tuple(entry.path for entry in entries)
+    for gitlink_path in gitlink_paths:
+        if time.monotonic() >= deadline:
+            raise _GitCommandError("snapshot index metadata scan exceeded its bound")
+        if _has_indexed_descendant(indexed_paths, gitlink_path):
+            raise _GitCommandError("snapshot index metadata malformed")
+    while offset < len(payload):
+        if offset + 8 > len(payload):
+            raise _GitCommandError("snapshot index extension metadata malformed")
+        extension = payload[offset : offset + 4]
+        extension_size = struct.unpack(">I", payload[offset + 4 : offset + 8])[0]
+        offset += 8
+        if (
+            not extension
+            or not 65 <= extension[0] <= 90
+            or extension == b"FSMN"
+            or offset + extension_size > len(payload)
+        ):
+            raise _GitCommandError("snapshot index extension unsupported")
+        offset += extension_size
+    return _IndexSnapshot(path, encoded, modified_time_ns, tuple(entries))
+
+
+def _snapshot_index_metadata(root: Path) -> _IndexSnapshot:
+    try:
+        encoded_index_path = _run_git(
+            root,
+            ("rev-parse", "--path-format=absolute", "--git-path", "index"),
+            stdout_limit=4_096,
+        )
+        encoded_object_format = _run_git(
+            root,
+            ("rev-parse", "--show-object-format"),
+            stdout_limit=16,
+        )
+        encoded_shared_index_path = _run_git(
+            root,
+            ("rev-parse", "--shared-index-path"),
+            stdout_limit=4_096,
+        )
+        index_text = encoded_index_path.decode("utf-8", errors="strict").strip()
+        object_format = encoded_object_format.decode("ascii", errors="strict").strip()
+    except (_GitCommandError, _GitOutputLimitError, UnicodeDecodeError) as exc:
+        raise _GitCommandError("snapshot index metadata unavailable") from exc
+    index_path = Path(index_text)
+    if not index_text or not index_path.is_absolute() or object_format not in {
+        "sha1",
+        "sha256",
+    }:
+        raise _GitCommandError("snapshot index metadata unavailable")
+    encoded, modified_time_ns = _read_index_file(index_path)
+    if encoded_shared_index_path.strip():
+        raise _GitCommandError("snapshot split index unsupported")
+    parsed = _parse_index(
+        index_path,
+        encoded,
+        modified_time_ns,
+        object_format,
+    )
+    return _IndexSnapshot(
+        index_path,
+        encoded,
+        modified_time_ns,
+        parsed.entries,
+    )
+
+
+def _tracked_lstat(root: Path, path: str, directories: set[Path]) -> os.stat_result:
+    current = root
+    components = path.split("/")
+    try:
+        for component in components[:-1]:
+            current /= component
+            if current in directories:
+                continue
+            metadata = os.lstat(current)
+            if not stat.S_ISDIR(metadata.st_mode) or _is_reparse_point(metadata):
+                raise OSError("tracked path has a non-directory parent")
+            directories.add(current)
+        return os.lstat(current / components[-1])
+    except OSError as exc:
+        raise _GitCommandError("snapshot tracked path metadata unavailable") from exc
+
+
+def _verify_index_entry_metadata(
+    entry: _IndexEntryMetadata,
+    metadata: os.stat_result,
+    index_modified_time_ns: int,
+) -> None:
+    if entry.mode == 0o160000:
+        if not stat.S_ISDIR(metadata.st_mode) or _is_reparse_point(metadata):
+            raise _GitCommandError("snapshot gitlink mount is dirty")
+        return
+    expected_type = stat.S_ISLNK if entry.mode == 0o120000 else stat.S_ISREG
+    if not expected_type(metadata.st_mode):
+        raise _GitCommandError("snapshot tracked path type is dirty")
+    index_size = metadata.st_size if metadata.st_size <= 0xFFFFFFFF else 0
+    if index_size != entry.size:
+        raise _GitCommandError("snapshot tracked path size is dirty")
+    identity_mismatch = (
+        divmod(metadata.st_mtime_ns, 1_000_000_000)
+        != (entry.mtime_seconds, entry.mtime_nanoseconds)
+        or divmod(metadata.st_ctime_ns, 1_000_000_000)
+        != (entry.ctime_seconds, entry.ctime_nanoseconds)
+    )
+    actual_identity = (
+        metadata.st_dev & 0xFFFFFFFF,
+        metadata.st_ino & 0xFFFFFFFF,
+        metadata.st_uid & 0xFFFFFFFF,
+        metadata.st_gid & 0xFFFFFFFF,
+    )
+    expected_identity = (entry.device, entry.inode, entry.uid, entry.gid)
+    if os.name == "nt":
+        identity_mismatch = identity_mismatch or any(
+            expected and actual != expected
+            for actual, expected in zip(actual_identity, expected_identity, strict=True)
+        )
+    else:
+        identity_mismatch = identity_mismatch or actual_identity != expected_identity
+    if identity_mismatch:
+        raise _GitCommandError("snapshot tracked path stat metadata is dirty")
+    if os.name != "nt" and entry.mode in {0o100644, 0o100755}:
+        if bool(metadata.st_mode & stat.S_IXUSR) != (entry.mode == 0o100755):
+            raise _GitCommandError("snapshot tracked path mode is dirty")
+    entry_modified_time_ns = (
+        entry.mtime_seconds * 1_000_000_000 + entry.mtime_nanoseconds
+    )
+    if entry_modified_time_ns >= index_modified_time_ns:
+        raise _GitCommandError("snapshot tracked path metadata is racy")
+
+
+def _verify_index_entry_stat(
+    root: Path,
+    entry: _IndexEntryMetadata,
+    index_modified_time_ns: int,
+    directories: set[Path],
+) -> None:
+    metadata = _tracked_lstat(root, entry.path, directories)
+    _verify_index_entry_metadata(entry, metadata, index_modified_time_ns)
+
+
+def _verify_sparse_omissions(
+    root: Path, entries: tuple[_IndexEntryMetadata, ...]
+) -> None:
+    sparse_paths = tuple(
+        entry.path for entry in entries if entry.skip_worktree
+    )
+    if not sparse_paths:
+        return
+    encoded_paths = b"".join(
+        path.encode("utf-8") + b"\0" for path in sparse_paths
+    )
+    try:
+        matched = _run_git(
+            root,
+            ("sparse-checkout", "check-rules", "-z"),
+            stdout_limit=len(encoded_paths),
+            stdin_bytes=encoded_paths,
+        )
+    except (_GitCommandError, _GitOutputLimitError) as exc:
+        raise _GitCommandError(
+            "snapshot sparse omissions are not authorized"
+        ) from exc
+    if matched:
+        raise _GitCommandError("snapshot sparse omissions are inconsistent")
+
+
+def _verify_no_untracked_material(
+    root: Path,
+    entries: tuple[_IndexEntryMetadata, ...],
+    index_modified_time_ns: int,
+) -> None:
+    entries_by_path = {entry.path: entry for entry in entries}
+    indexed_paths = tuple(entries_by_path)
+    pending: list[tuple[str, Path, bool]] = [("", root, False)]
+    deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+    observed = 0
+    observed_indexed_paths: set[str] = set()
+    try:
+        while pending:
+            relative_parent, directory, wholly_untracked = pending.pop()
+            with os.scandir(directory) as children:
+                for child in children:
+                    observed += 1
+                    if (
+                        observed > _MAX_WORKTREE_METADATA_ENTRIES
+                        or time.monotonic() >= deadline
+                    ):
+                        raise OSError("worktree metadata scan exceeded its bound")
+                    relative = (
+                        child.name
+                        if not relative_parent
+                        else f"{relative_parent}/{child.name}"
+                    )
+                    if not relative_parent and child.name == ".git":
+                        continue
+                    child_metadata = child.stat(follow_symlinks=False)
+                    is_directory = stat.S_ISDIR(
+                        child_metadata.st_mode
+                    ) and not _is_reparse_point(child_metadata)
+                    entry = entries_by_path.get(relative)
+                    if entry is not None:
+                        _verify_index_entry_metadata(
+                            entry,
+                            child_metadata,
+                            index_modified_time_ns,
+                        )
+                        observed_indexed_paths.add(relative)
+                        continue
+                    if wholly_untracked:
+                        if not is_directory:
+                            raise _GitCommandError("snapshot worktree is dirty")
+                        pending.append((relative, Path(child.path), True))
+                    elif _has_indexed_descendant(indexed_paths, relative):
+                        if not is_directory:
+                            raise _GitCommandError("snapshot worktree is dirty")
+                        pending.append((relative, Path(child.path), False))
+                    elif not is_directory:
+                        raise _GitCommandError("snapshot worktree is dirty")
+                    else:
+                        pending.append((relative, Path(child.path), True))
+    except OSError as exc:
+        raise _GitCommandError("snapshot worktree metadata unavailable") from exc
+    required_paths = {
+        entry.path for entry in entries if not entry.skip_worktree
+    }
+    if not required_paths.issubset(observed_indexed_paths):
+        raise _GitCommandError("snapshot tracked path metadata unavailable")
+
+
+def _verify_tracked_worktree(root: Path) -> _IndexSnapshot:
+    snapshot = _snapshot_index_metadata(root)
+    _verify_sparse_omissions(root, snapshot.entries)
+    directories = {root}
+    deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+    for entry in snapshot.entries:
+        if entry.skip_worktree:
+            continue
+        if time.monotonic() >= deadline:
+            raise _GitCommandError("snapshot tracked metadata scan exceeded its bound")
+        _verify_index_entry_stat(
+            root,
+            entry,
+            snapshot.modified_time_ns,
+            directories,
+        )
+    _verify_no_untracked_material(
+        root,
+        snapshot.entries,
+        snapshot.modified_time_ns,
+    )
+    return snapshot
+
+
 def _verify_snapshot(identity: SnapshotIdentity) -> None:
     try:
         resolved_head = _run_git(
@@ -205,9 +776,27 @@ def _verify_snapshot(identity: SnapshotIdentity) -> None:
         )
 
     try:
+        index_snapshot = _verify_tracked_worktree(identity.root)
+    except (_GitCommandError, _GitOutputLimitError) as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "snapshot worktree is dirty or unavailable",
+        ) from exc
+
+    try:
         _run_git(
             identity.root,
-            ("diff-index", "--cached", "--quiet", "HEAD", "--"),
+            (
+                "diff-index",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "HEAD",
+                "--",
+            ),
             stdout_limit=0,
         )
     except (_GitCommandError, _GitOutputLimitError) as exc:
@@ -215,30 +804,17 @@ def _verify_snapshot(identity: SnapshotIdentity) -> None:
             "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
             "snapshot index is dirty or unavailable",
         ) from exc
-
     try:
-        worktree_changes = _run_git(
-            identity.root,
-            (
-                "ls-files",
-                "--modified",
-                "--deleted",
-                "--others",
-                "--directory",
-                "--no-empty-directory",
-                "-z",
-            ),
-            stdout_limit=1,
-        )
-    except (_GitCommandError, _GitOutputLimitError) as exc:
+        current_index, _modified_time_ns = _read_index_file(index_snapshot.path)
+    except _GitCommandError as exc:
         raise InventoryVerificationError(
             "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
-            "snapshot worktree is dirty or unavailable",
+            "snapshot index changed or became unavailable",
         ) from exc
-    if worktree_changes:
+    if current_index != index_snapshot.encoded:
         raise InventoryVerificationError(
             "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
-            "snapshot worktree is dirty",
+            "snapshot index changed during verification",
         )
 
 
