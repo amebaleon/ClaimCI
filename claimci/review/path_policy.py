@@ -14,6 +14,16 @@ _SUBMISSION_SHELL_TOKENS = frozenset(
 )
 _CONFIG_SUFFIXES = frozenset({".cfg", ".conf", ".ini", ".toml", ".yaml", ".yml"})
 _RESULT_SUFFIXES = frozenset({".csv", ".json", ".jsonl", ".tsv"})
+_GENERIC_EVIDENCE_SUFFIXES = frozenset(
+    {".sql", *_CONFIG_SUFFIXES, *_RESULT_SUFFIXES}
+)
+_BENCHMARK_SUFFIXES = frozenset(
+    {".txt", *_GENERIC_EVIDENCE_SUFFIXES, *SOURCE_SUFFIXES}
+)
+_MANIFEST_SUFFIXES = frozenset(
+    {".in", ".lock", ".txt", *_CONFIG_SUFFIXES, *_RESULT_SUFFIXES}
+)
+_CONFIG_MATERIAL_SUFFIXES = frozenset({".json", *_CONFIG_SUFFIXES})
 
 
 def is_source_file(path: str) -> bool:
@@ -52,6 +62,8 @@ def classify_review_material(path: str) -> ReviewMaterialKind:
     suffix = relative.suffix.casefold()
     tokens = _name_tokens(relative)
 
+    if name in {"research.yaml", "research.yml"}:
+        return ReviewMaterialKind.MANIFEST
     if suffix in {".sh", ".bash"}:
         if tokens & _SUBMISSION_SHELL_TOKENS:
             return ReviewMaterialKind.SUBMISSION_CONFIG
@@ -60,28 +72,47 @@ def classify_review_material(path: str) -> ReviewMaterialKind:
         return ReviewMaterialKind.DOCUMENT
     if is_test_source_file(portable):
         return ReviewMaterialKind.TEST
-    if any(part in {"benchmark", "benchmarks", "bench"} for part in lowered_parts) or (
-        tokens & {"benchmark", "bench"}
-    ):
+    if (
+        any(part in {"benchmark", "benchmarks", "bench"} for part in lowered_parts)
+        or tokens & {"benchmark", "bench"}
+    ) and suffix in _BENCHMARK_SUFFIXES:
         return ReviewMaterialKind.BENCHMARK
     if (
-        any(
-            part in {"result", "results", "output", "outputs", "metrics"}
-            for part in lowered_parts
+        (
+            any(
+                part in {"result", "results", "output", "outputs", "metrics"}
+                for part in lowered_parts
+            )
+            or tokens & {"result", "results", "metric", "metrics", "score", "scores"}
         )
         and suffix in _RESULT_SUFFIXES
-    ) or tokens & {"result", "results", "metric", "metrics", "score", "scores"}:
+    ):
         return ReviewMaterialKind.RESULT
     if (
-        any(part in {"manifest", "manifests"} for part in lowered_parts)
-        or tokens & {"manifest", "requirements", "lockfile"}
-        or suffix == ".lock"
-    ):
+        (
+            any(part in {"manifest", "manifests"} for part in lowered_parts)
+            or tokens & {"manifest", "requirements", "lockfile"}
+        )
+        and suffix in _MANIFEST_SUFFIXES
+    ) or suffix == ".lock":
         return ReviewMaterialKind.MANIFEST
-    if suffix in _CONFIG_SUFFIXES or any(
-        part in {"config", "configs", "configuration"} for part in lowered_parts
+    if suffix in _CONFIG_SUFFIXES or (
+        (
+            any(part in {"config", "configs", "configuration"} for part in lowered_parts)
+            or tokens & {"config", "configs", "configuration"}
+        )
+        and suffix in _CONFIG_MATERIAL_SUFFIXES
     ):
         return ReviewMaterialKind.CONFIG
     if is_source_file(portable):
         return ReviewMaterialKind.SOURCE
     return ReviewMaterialKind.OTHER
+
+
+def is_supported_review_evidence_path(path: str) -> bool:
+    """Return whether a path has an approved passive review representation."""
+
+    if classify_review_material(path) is not ReviewMaterialKind.OTHER:
+        return True
+    suffix = PurePosixPath(path.replace("\\", "/")).suffix.casefold()
+    return suffix in _GENERIC_EVIDENCE_SUFFIXES

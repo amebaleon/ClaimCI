@@ -72,6 +72,14 @@ class ReviewStatus(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class ProviderLifecycle(str, Enum):
+    """Provider-attempt state kept separate from completed call records."""
+
+    NOT_ATTEMPTED = "not_attempted"
+    RESPONSE_RECEIVED = "response_received"
+    FAILED_BEFORE_RESPONSE = "failed_before_response"
+
+
 class GateDisposition(str, Enum):
     PASS_COMPLETE = "pass_complete"
     PASS_PARTIAL = "pass_partial"
@@ -185,6 +193,45 @@ class SnapshotIdentity:
         if resolved != self.root or not resolved.is_dir():
             raise ReviewError("snapshot root must be a resolved regular directory")
         _full_git_object_id(self.sha, "snapshot sha")
+
+
+@dataclass(frozen=True)
+class ExactMaterialOmission:
+    """Content-free exact-Git fact for material intentionally left sparse."""
+
+    role: SnapshotRole
+    source: SnapshotIdentity
+    path: str
+    object_id: str
+    observed: int
+    limit: int
+    code: str
+
+    def __post_init__(self) -> None:
+        allowed = {
+            SnapshotRole.HEAD: "PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+            SnapshotRole.COMPARISON_BASE: (
+                "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE"
+            ),
+        }
+        if self.role not in allowed or self.code != allowed[self.role]:
+            raise ReviewError("exact material omission role and code are invalid")
+        if (
+            not isinstance(self.source, SnapshotIdentity)
+            or self.source.role is not self.role
+        ):
+            raise ReviewError("exact material omission source is invalid")
+        object.__setattr__(self, "path", _portable_inventory_path(self.path))
+        _full_git_object_id(self.object_id, "exact material omission object ID")
+        if (
+            isinstance(self.observed, bool)
+            or not isinstance(self.observed, int)
+            or isinstance(self.limit, bool)
+            or not isinstance(self.limit, int)
+            or self.limit < 0
+            or self.observed <= self.limit
+        ):
+            raise ReviewError("exact material omission size bound is invalid")
 
 
 @dataclass(frozen=True)
@@ -614,6 +661,7 @@ class ReviewScope:
     issues: tuple[ScopeIssue, ...]
     materialized_chars: int = 0
     materialized_path_chars: tuple[tuple[str, int], ...] = ()
+    atomic_path_groups: tuple[tuple[str, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if self.mode not in {"declared_changed_v1", "legacy_pairwise_v1"}:
@@ -684,6 +732,22 @@ class ReviewScope:
             != len(self.materialized_path_chars)
         ):
             raise ReviewError("review scope materialized_path_chars is invalid")
+        if (
+            not isinstance(self.atomic_path_groups, tuple)
+            or any(
+                not isinstance(group, tuple)
+                or not group
+                or len(set(group)) != len(group)
+                or group[0] not in selected
+                or any(
+                    _portable_inventory_path(path) != path
+                    for path in group
+                )
+                for group in self.atomic_path_groups
+            )
+            or len(set(self.atomic_path_groups)) != len(self.atomic_path_groups)
+        ):
+            raise ReviewError("review scope atomic_path_groups is invalid")
 
 
 @dataclass(frozen=True)

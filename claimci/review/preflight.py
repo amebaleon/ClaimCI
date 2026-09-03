@@ -18,6 +18,7 @@ from .models import (
     ChangeStatus,
     ComparisonBasis,
     DeclaredReviewCoordinates,
+    ExactMaterialOmission,
     GateDisposition,
     MaterialClaimSeed,
     PreflightGateResult,
@@ -36,11 +37,16 @@ from .models import (
     SourceRecord,
 )
 from .path_policy import classify_review_material
-from .evidence import changed_region_excerpt
+from .evidence import changed_region_excerpt, changed_region_excerpt_from_text
 from .inventory import (
     MAX_CHANGESET_METADATA_BYTES,
     InventoryVerificationError,
     build_git_change_inventory,
+    exact_git_material_omission_matches,
+    git_blob_descriptor,
+    git_blob_object_id,
+    read_git_blob,
+    read_git_material_blob,
 )
 from .request_budget import (
     build_extraction_request_parts,
@@ -61,6 +67,11 @@ from .sources import (
     _record,
     source_bundle_from_scope,
 )
+from .tools import (
+    MAX_MANIFEST_AUDITS,
+    declared_manifest_artifact_paths,
+    manifest_candidate_order_key,
+)
 
 
 class _ScopeInputs(Protocol):
@@ -73,6 +84,29 @@ class _ScopeInputs(Protocol):
     inventory: ChangeInventory | None
     coordinates: DeclaredReviewCoordinates | None
     inventory_failure: ReviewInventoryFailure | None
+    exact_material_omissions: tuple[ExactMaterialOmission, ...]
+
+
+@dataclass(frozen=True)
+class ReviewScopeHydrationPlan:
+    """Exact bounded paths a sparse caller must hydrate before preflight."""
+
+    changed_paths: tuple[str, ...]
+    supplement_paths: tuple[str, ...]
+    attempted_present_paths: tuple[str, ...] = ()
+    omissions: tuple[ExactMaterialOmission, ...] = ()
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *self.changed_paths,
+                    *self.supplement_paths,
+                    *self.attempted_present_paths,
+                )
+            )
+        )
 
 
 _CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -128,6 +162,11 @@ _PATH_REFERENCE_PATTERN = re.compile(
     r"|"
     r"([A-Za-z0-9_.+-]+(?:[\\/][A-Za-z0-9_.+-]+)+)"
     r")"
+    r"(?![A-Za-z0-9_+\\/-])"
+)
+_ROOT_BASENAME_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.+\\/-])"
+    r"([A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)+)"
     r"(?![A-Za-z0-9_+\\/-])"
 )
 _STOP_TERMS = frozenset(
@@ -195,6 +234,32 @@ _CATEGORY_KINDS: dict[str, frozenset[ReviewMaterialKind]] = {
     ),
 }
 
+_TOKEN_ROUTE_CATEGORIES = frozenset(
+    {"benchmark", "comparative_causal", "quantitative"}
+)
+_TOKEN_ROUTABLE_KINDS = frozenset(
+    {
+        ReviewMaterialKind.SOURCE,
+        ReviewMaterialKind.TEST,
+        ReviewMaterialKind.CONFIG,
+        ReviewMaterialKind.RESULT,
+        ReviewMaterialKind.MANIFEST,
+        ReviewMaterialKind.BENCHMARK,
+        ReviewMaterialKind.SUBMISSION_CONFIG,
+    }
+)
+_EXACT_SUPPLEMENT_KINDS = frozenset(
+    {
+        ReviewMaterialKind.SOURCE,
+        ReviewMaterialKind.TEST,
+        ReviewMaterialKind.CONFIG,
+        ReviewMaterialKind.RESULT,
+        ReviewMaterialKind.MANIFEST,
+        ReviewMaterialKind.BENCHMARK,
+        ReviewMaterialKind.SUBMISSION_CONFIG,
+    }
+)
+
 _KIND_PRIORITY = {
     ReviewMaterialKind.DOCUMENT: 0,
     ReviewMaterialKind.BENCHMARK: 1,
@@ -221,7 +286,12 @@ def _tokens(value: str) -> frozenset[str]:
 
 
 def _path_tokens(path: str) -> frozenset[str]:
-    return _tokens(" ".join(PurePosixPath(path).parts))
+    portable = " ".join(PurePosixPath(path).parts)
+    # Keep the existing compound tokens while also exposing bounded filename
+    # stems such as ``accuracy`` from ``src/accuracy.py``. This remains exact
+    # lexical routing; it does not perform fuzzy or substring matching.
+    separated = re.sub(r"[^a-z0-9]+", " ", portable.casefold())
+    return _tokens(portable) | _tokens(separated)
 
 
 @dataclass(frozen=True)
@@ -230,7 +300,12 @@ class _PathReferences:
     unsafe_count: int
 
 
-def _path_references(value: str) -> _PathReferences:
+def _path_references(
+    value: str,
+    *,
+    root_inventory_paths: frozenset[str] = frozenset(),
+    allow_unindexed_root_basenames: bool = False,
+) -> _PathReferences:
     canonical: set[str] = set()
     unsafe_count = 0
     for match in _PATH_REFERENCE_PATTERN.finditer(value):
@@ -248,10 +323,19 @@ def _path_references(value: str) -> _PathReferences:
         ):
             unsafe_count += 1
             continue
-        if PurePosixPath(candidate).as_posix() == candidate:
+        if len(candidate) <= 4_096 and PurePosixPath(candidate).as_posix() == candidate:
             canonical.add(candidate)
         else:
             unsafe_count += 1
+    # The general parser deliberately requires a path separator. Repository-
+    # root basenames are recognized only by exact membership in the trusted
+    # inventory, so dotted prose cannot create an out-of-scope path candidate.
+    for match in _ROOT_BASENAME_REFERENCE_PATTERN.finditer(value):
+        candidate = match.group(1)
+        if len(candidate) > 4_096:
+            unsafe_count += 1
+        elif allow_unindexed_root_basenames or candidate in root_inventory_paths:
+            canonical.add(candidate)
     return _PathReferences(frozenset(canonical), unsafe_count)
 
 
@@ -280,8 +364,25 @@ def _seeds(
 
 def _source_path_references(
     records: tuple[SourceRecord, ...],
+    *,
+    inventory_paths: tuple[str, ...] = (),
+    allow_unindexed_root_basenames: bool = False,
 ) -> dict[str, _PathReferences]:
-    return {record.source_id: _path_references(record.text) for record in records}
+    root_inventory_paths = frozenset(
+        path
+        for path in inventory_paths
+        if "/" not in path
+        and "\\" not in path
+        and PurePosixPath(path).name == path
+    )
+    return {
+        record.source_id: _path_references(
+            record.text,
+            root_inventory_paths=root_inventory_paths,
+            allow_unindexed_root_basenames=allow_unindexed_root_basenames,
+        )
+        for record in records
+    }
 
 
 def _exact_mentions(
@@ -297,6 +398,44 @@ def _kind_agrees(kind: ReviewMaterialKind, seed: MaterialClaimSeed) -> bool:
     return kind in _CATEGORY_KINDS.get(seed.category, frozenset())
 
 
+def _route_agrees(
+    path: str,
+    kind: ReviewMaterialKind,
+    seed: MaterialClaimSeed,
+) -> bool:
+    """Match one safe changed artifact without turning kind alone into ownership."""
+
+    if _kind_agrees(kind, seed):
+        return True
+    if (
+        kind is ReviewMaterialKind.MANIFEST
+        and PurePosixPath(path).name.casefold()
+        in {"research.yaml", "research.yml"}
+    ):
+        # The existing evidence router gives the native research manifest an
+        # intrinsic route for scientific claim types.
+        return True
+    return (
+        seed.category in _TOKEN_ROUTE_CATEGORIES
+        and kind in _TOKEN_ROUTABLE_KINDS
+        and bool(_path_tokens(path).intersection(seed.route_terms))
+    )
+
+
+def _seed_routes_to_path(
+    path: str,
+    kind: ReviewMaterialKind,
+    seed: MaterialClaimSeed,
+    references: dict[str, _PathReferences],
+) -> bool:
+    """Route seeds only through the frozen supporting-material allowlist."""
+
+    return (
+        kind in _TOKEN_ROUTABLE_KINDS
+        and _exact_mentions(path, seed, references)
+    ) or _route_agrees(path, kind, seed)
+
+
 def _rank_key(
     path: str,
     kind: ReviewMaterialKind,
@@ -304,7 +443,7 @@ def _rank_key(
     references: dict[str, _PathReferences],
 ) -> tuple[int, int, int, int, str]:
     exact = any(_exact_mentions(path, seed, references) for seed in seeds)
-    category = any(_kind_agrees(kind, seed) for seed in seeds)
+    category = any(_route_agrees(path, kind, seed) for seed in seeds)
     path_terms = _path_tokens(path)
     overlap = max(
         (len(path_terms.intersection(seed.route_terms)) for seed in seeds),
@@ -330,32 +469,287 @@ def _locality_base_root(inputs: _ScopeInputs) -> Path | None:
     return base_root if isinstance(base_root, Path) else None
 
 
-def _has_changed_region_locality(
+def _changed_region_materialization(
     inputs: _ScopeInputs,
     path: str,
     head_text: str,
     *,
     char_limit: int,
-) -> bool:
+) -> tuple[str, int, int] | None:
+    """Return the exact bounded changed-region representation, when localizable."""
+
     return changed_region_excerpt(
         _locality_base_root(inputs),
         path,
         head_text,
         char_limit=char_limit,
-    ) is not None
+    )
 
 
-def build_review_scope(
+def _read_exact_git_material(identity: SnapshotIdentity, path: str) -> bytes:
+    """Read one selected material blob or raise the matching passive error."""
+
+    try:
+        descriptor = git_blob_descriptor(identity, path)
+        if descriptor is None:
+            raise PassiveFileError(
+                "selected Git material is unavailable",
+                code="not_regular",
+            )
+        if descriptor[0] > MAX_SOURCE_FILE_BYTES:
+            raise PassiveFileError(
+                "selected Git material exceeds its fixed bound",
+                code="too_large",
+            )
+        content = read_git_material_blob(
+            identity,
+            path,
+            max_bytes=MAX_SOURCE_FILE_BYTES,
+        )
+    except InventoryVerificationError as exc:
+        raise PassiveFileError(
+            "selected Git material is unavailable",
+            code="unavailable",
+        ) from exc
+    if content is None:
+        raise PassiveFileError(
+            "selected Git material is unavailable",
+            code="unavailable",
+        )
+    return content
+
+
+def _bound_exact_material_omission(
+    inputs: _ScopeInputs,
+    inventory: ChangeInventory,
+    entry: ChangeEntry,
+) -> ScopeIssue | None:
+    """Validate one sparse omission against the disposable exact Git tree."""
+
+    omissions = getattr(inputs, "exact_material_omissions", ())
+    omission = next(
+        (
+            item
+            for item in omissions
+            if isinstance(item, ExactMaterialOmission) and item.path == entry.path
+        ),
+        None,
+    )
+    if (
+        omission is None
+        or inventory.source is not ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+        or omission.limit != MAX_SOURCE_FILE_BYTES
+    ):
+        return None
+    status = next(
+        (
+            candidate.status
+            for candidate in inventory.entries
+            if candidate.path == entry.path
+        ),
+        None,
+    )
+    if omission.role is SnapshotRole.COMPARISON_BASE:
+        identity = getattr(inputs, "comparison_base", None)
+        expected_sha = inventory.comparison_base_sha
+        if status is not ChangeStatus.MODIFIED:
+            return None
+    else:
+        identity = getattr(inputs, "head", None)
+        expected_sha = inventory.head_sha
+        if status is ChangeStatus.DELETED:
+            return None
+    if (
+        not isinstance(identity, SnapshotIdentity)
+        or identity.role is not omission.role
+        or identity.sha != expected_sha
+    ):
+        return None
+    if not exact_git_material_omission_matches(omission, identity):
+        return None
+    return ScopeIssue(
+        code=omission.code,
+        path=omission.path,
+        observed=omission.observed,
+        limit=omission.limit,
+    )
+
+
+def _git_changed_region_materialization(
+    comparison: SnapshotIdentity,
+    path: str,
+    head_text: str,
+    *,
+    char_limit: int,
+) -> tuple[str, int, int] | None:
+    """Derive changed locality from exact Git blobs without a worktree read."""
+
+    try:
+        descriptor = git_blob_descriptor(comparison, path)
+        if descriptor is None:
+            base_text = None
+        else:
+            if descriptor[0] > MAX_SOURCE_FILE_BYTES:
+                return None
+            encoded = read_git_material_blob(
+                comparison,
+                path,
+                max_bytes=MAX_SOURCE_FILE_BYTES,
+            )
+            if encoded is None:
+                return None
+            base_text = encoded.decode("utf-8", errors="strict")
+            base_text = base_text.replace("\r\n", "\n").replace("\r", "\n")
+    except (InventoryVerificationError, UnicodeError):
+        return None
+    return changed_region_excerpt_from_text(
+        head_text,
+        base_text,
+        char_limit=char_limit,
+    )
+
+
+def _git_supplement_is_exact(
+    inputs: _ScopeInputs,
+    inventory: ChangeInventory,
+    path: str,
+) -> bool:
+    """Validate one supplemental path against exact head/comparison metadata."""
+
+    if inventory.source is not ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH:
+        return False
+    head = getattr(inputs, "head", None)
+    comparison = getattr(inputs, "comparison_base", None)
+    if not isinstance(head, SnapshotIdentity) or not isinstance(
+        comparison, SnapshotIdentity
+    ):
+        return False
+    status = next(
+        (entry.status for entry in inventory.entries if entry.path == path),
+        None,
+    )
+    omission = next(
+        (
+            item
+            for item in getattr(inputs, "exact_material_omissions", ())
+            if isinstance(item, ExactMaterialOmission)
+            and item.path == path
+            and item.role is SnapshotRole.HEAD
+            and item.code == "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"
+            and item.limit == MAX_SOURCE_FILE_BYTES
+        ),
+        None,
+    )
+    if status is None and omission is not None:
+        if not exact_git_material_omission_matches(omission, head):
+            return False
+        try:
+            comparison_object_id = git_blob_object_id(comparison, path)
+        except InventoryVerificationError:
+            return False
+        return comparison_object_id == omission.object_id
+    try:
+        head_blob = git_blob_descriptor(head, path)
+        comparison_blob = git_blob_descriptor(comparison, path)
+    except InventoryVerificationError:
+        return False
+    if head_blob is None:
+        return False
+    if status is ChangeStatus.ADDED:
+        return comparison_blob is None
+    if status is ChangeStatus.MODIFIED:
+        return comparison_blob is not None
+    if status is ChangeStatus.DELETED:
+        return False
+    return comparison_blob == head_blob
+
+
+def _git_audit_dependency_is_exactly_absent(
+    inputs: _ScopeInputs,
+    inventory: ChangeInventory,
+    path: str,
+) -> bool:
+    """Bind one declared Audit input to absence at the exact head snapshot."""
+
+    if inventory.source is not ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH:
+        return False
+    head = getattr(inputs, "head", None)
+    comparison = getattr(inputs, "comparison_base", None)
+    if not isinstance(head, SnapshotIdentity) or not isinstance(
+        comparison, SnapshotIdentity
+    ):
+        return False
+    status = next(
+        (entry.status for entry in inventory.entries if entry.path == path),
+        None,
+    )
+    if status in {ChangeStatus.ADDED, ChangeStatus.MODIFIED}:
+        return False
+    try:
+        head_blob = git_blob_descriptor(head, path)
+        comparison_blob = git_blob_descriptor(comparison, path)
+    except InventoryVerificationError:
+        return False
+    if head_blob is not None:
+        return False
+    if status is ChangeStatus.DELETED:
+        return comparison_blob is not None
+    return comparison_blob is None
+
+
+def _exact_manifest_dependency_map(
+    inputs: _ScopeInputs,
+    manifest_paths: tuple[str, ...],
+    *,
+    max_bytes: int,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Read selected manifests from exact Git objects and return lexical paths."""
+
+    head = getattr(inputs, "head", None)
+    if not isinstance(head, SnapshotIdentity):
+        return ()
+    manifests: list[tuple[str, tuple[str, ...]]] = []
+    for manifest_path in manifest_paths:
+        try:
+            encoded = read_git_blob(head, manifest_path, max_bytes=max_bytes)
+            if encoded is None:
+                continue
+            text = encoded.decode("utf-8", errors="strict")
+        except (InventoryVerificationError, UnicodeError):
+            continue
+        declared = declared_manifest_artifact_paths(manifest_path, text)
+        if declared is not None:
+            manifests.append((manifest_path, tuple(sorted(set(declared)))))
+    return tuple(manifests)
+
+
+def _build_review_scope(
     inputs: _ScopeInputs,
     config: ReviewConfig,
     inventory: ChangeInventory,
-) -> ReviewScope:
+    *,
+    supplement_plan_only: bool,
+    exact_git_material: bool,
+) -> ReviewScope | ReviewScopeHydrationPlan:
     """Plan and validate only a bounded subset of a declared change inventory."""
 
     if not isinstance(config, ReviewConfig):
         raise ReviewError("config must be ReviewConfig")
     if not isinstance(inventory, ChangeInventory):
         raise ReviewError("inventory must be ChangeInventory")
+    exact_head: SnapshotIdentity | None = None
+    exact_comparison: SnapshotIdentity | None = None
+    if exact_git_material:
+        exact_head = getattr(inputs, "head", None)
+        exact_comparison = getattr(inputs, "comparison_base", None)
+        if (
+            inventory.source is not ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+            or not isinstance(exact_head, SnapshotIdentity)
+            or not isinstance(exact_comparison, SnapshotIdentity)
+            or exact_head.sha != inventory.head_sha
+            or exact_comparison.sha != inventory.comparison_base_sha
+        ):
+            raise ReviewError("exact Git material coordinates are invalid")
     try:
         requested_root = Path(inputs.repository_root)
         if requested_root.is_symlink():
@@ -383,8 +777,21 @@ def build_review_scope(
             remaining_chars -= len(text)
 
     metadata_records = tuple(records)
+    inventory_paths = tuple(entry.path for entry in inventory.entries)
+    inventory_path_set = set(inventory_paths)
+    inventory_status_by_path = {
+        entry.path: entry.status for entry in inventory.entries
+    }
+    changed_head_paths = {
+        entry.path
+        for entry in inventory.entries
+        if entry.status is not ChangeStatus.DELETED
+    }
     initial_seeds, _ = _seeds(metadata_records, limits.max_claims)
-    initial_references = _source_path_references(metadata_records)
+    initial_references = _source_path_references(
+        metadata_records,
+        inventory_paths=inventory_paths,
+    )
     initial_exact_paths = frozenset(
         path
         for source_references in initial_references.values()
@@ -402,6 +809,8 @@ def build_review_scope(
 
     selected: list[str] = []
     attempted: list[str] = []
+    attempted_present_paths: list[str] = []
+    exact_omissions: list[ExactMaterialOmission] = []
     materialized_path_chars: dict[str, int] = {}
     issues: list[ScopeIssue] = []
     eligible_deleted = tuple(
@@ -427,6 +836,93 @@ def build_review_scope(
             if len(attempted) >= limits.max_files:
                 break
             attempted.append(entry.path)
+            bound_omission = _bound_exact_material_omission(
+                inputs,
+                inventory,
+                entry,
+            )
+            if bound_omission is not None:
+                issues.append(bound_omission)
+                continue
+            comparison = getattr(inputs, "comparison_base", None)
+            if (
+                inventory_status_by_path.get(entry.path)
+                is ChangeStatus.MODIFIED
+                and inventory.source
+                is ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+                and isinstance(comparison, SnapshotIdentity)
+            ):
+                try:
+                    comparison_descriptor = git_blob_descriptor(
+                        comparison,
+                        entry.path,
+                    )
+                except InventoryVerificationError:
+                    comparison_descriptor = None
+                if (
+                    comparison_descriptor is not None
+                    and comparison_descriptor[0] > MAX_SOURCE_FILE_BYTES
+                ):
+                    if exact_git_material:
+                        exact_omissions.append(
+                            ExactMaterialOmission(
+                                role=SnapshotRole.COMPARISON_BASE,
+                                source=comparison,
+                                path=entry.path,
+                                object_id=comparison_descriptor[1],
+                                observed=comparison_descriptor[0],
+                                limit=MAX_SOURCE_FILE_BYTES,
+                                code=(
+                                    "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE"
+                                ),
+                            )
+                        )
+                    issues.append(
+                        ScopeIssue(
+                            code=(
+                                "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE"
+                            ),
+                            path=entry.path,
+                            observed=comparison_descriptor[0],
+                            limit=MAX_SOURCE_FILE_BYTES,
+                        )
+                    )
+                    continue
+            head = getattr(inputs, "head", None)
+            if (
+                inventory.source
+                is ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
+                and isinstance(head, SnapshotIdentity)
+            ):
+                try:
+                    head_descriptor = git_blob_descriptor(head, entry.path)
+                except InventoryVerificationError:
+                    head_descriptor = None
+                if (
+                    head_descriptor is not None
+                    and head_descriptor[0] > MAX_SOURCE_FILE_BYTES
+                ):
+                    if exact_git_material:
+                        exact_omissions.append(
+                            ExactMaterialOmission(
+                                role=SnapshotRole.HEAD,
+                                source=head,
+                                path=entry.path,
+                                object_id=head_descriptor[1],
+                                observed=head_descriptor[0],
+                                limit=MAX_SOURCE_FILE_BYTES,
+                                code="PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+                            )
+                        )
+                    issues.append(
+                        ScopeIssue(
+                            code="PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+                            path=entry.path,
+                            observed=head_descriptor[0],
+                            limit=MAX_SOURCE_FILE_BYTES,
+                        )
+                    )
+                    continue
             if remaining_chars <= 0:
                 issues.append(
                     ScopeIssue(
@@ -438,12 +934,18 @@ def build_review_scope(
                 )
                 continue
             try:
-                capture = capture_confined_regular_file(
-                    root,
-                    entry.path,
-                    max_bytes=MAX_SOURCE_FILE_BYTES,
+                encoded = (
+                    _read_exact_git_material(exact_head, entry.path)
+                    if exact_head is not None
+                    else capture_confined_regular_file(
+                        root,
+                        entry.path,
+                        max_bytes=MAX_SOURCE_FILE_BYTES,
+                    ).content
                 )
-                decoded = capture.content.decode("utf-8", errors="strict")
+                if exact_head is not None:
+                    attempted_present_paths.append(entry.path)
+                decoded = encoded.decode("utf-8", errors="strict")
             except PassiveFileError as exc:
                 code = {
                     "outside": "PREFLIGHT_G1_MATERIAL_PATH_OUTSIDE_ROOT",
@@ -480,17 +982,28 @@ def build_review_scope(
             excerpt_limit = min(limits.max_file_chars, remaining_chars)
             text = normalized[:excerpt_limit]
             if len(normalized) > len(text):
-                region_localized = _has_changed_region_locality(
-                    inputs,
-                    entry.path,
-                    normalized,
-                    char_limit=excerpt_limit,
+                changed_region = (
+                    _git_changed_region_materialization(
+                        exact_comparison,
+                        entry.path,
+                        normalized,
+                        char_limit=excerpt_limit,
+                    )
+                    if exact_comparison is not None
+                    else _changed_region_materialization(
+                        inputs,
+                        entry.path,
+                        normalized,
+                        char_limit=excerpt_limit,
+                    )
                 )
+                if changed_region is not None:
+                    text = changed_region[0]
                 issues.append(
                     ScopeIssue(
                         code=(
                             "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
-                            if region_localized
+                            if changed_region is not None
                             else "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
                         ),
                         path=entry.path,
@@ -502,7 +1015,10 @@ def build_review_scope(
             materialized_path_chars[entry.path] = len(text)
             materialized_chars += len(text)
             remaining_chars -= len(text)
-            if kind is ReviewMaterialKind.DOCUMENT:
+            if (
+                kind is ReviewMaterialKind.DOCUMENT
+                and entry.path in changed_head_paths
+            ):
                 records.append(
                     _record(
                         SourceKind.REPOSITORY_FILE,
@@ -548,7 +1064,10 @@ def build_review_scope(
 
     document_seed_records = tuple(records)
     planning_seeds, _ = _seeds(document_seed_records, limits.max_claims)
-    planning_references = _source_path_references(document_seed_records)
+    planning_references = _source_path_references(
+        document_seed_records,
+        inventory_paths=inventory_paths,
+    )
     attempted_paths = set(attempted)
     remaining_candidates = [
         item for item in candidates if item[0].path not in attempted_paths
@@ -563,11 +1082,11 @@ def build_review_scope(
     )
     materialize(remaining_candidates)
 
-    shortlisted_paths = set(attempted)
+    changed_attempted_paths = set(attempted)
     omitted = [
         entry.path
         for entry, _kind in candidates
-        if entry.path not in shortlisted_paths
+        if entry.path not in changed_attempted_paths
     ]
     for path in omitted:
         issues.append(
@@ -579,6 +1098,297 @@ def build_review_scope(
             )
         )
 
+    changed_records = tuple(records)
+    changed_references = _source_path_references(
+        changed_records,
+        inventory_paths=inventory_paths,
+        allow_unindexed_root_basenames=True,
+    )
+    exact_literal_paths = tuple(
+        sorted(
+            {
+                path
+                for source_references in changed_references.values()
+                for path in source_references.canonical
+                if path not in inventory_path_set
+                and classify_review_material(path) in _EXACT_SUPPLEMENT_KINDS
+            }
+        )
+    )
+    if len(exact_literal_paths) > MAX_REPOSITORY_PATHS:
+        issues.append(
+            ScopeIssue(
+                code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+                observed=len(exact_literal_paths),
+                limit=MAX_REPOSITORY_PATHS,
+            )
+        )
+        exact_literal_paths = exact_literal_paths[:MAX_REPOSITORY_PATHS]
+
+    selected_changed_manifests = tuple(
+        path
+        for path in selected
+        if path in changed_head_paths
+        and PurePosixPath(path).name.casefold() in {"research.yaml", "research.yml"}
+    )
+    selected_before_supplements = set(selected)
+    supplement_paths: list[str] = []
+    audit_absent_paths: list[str] = []
+    supplement_probe_limit = max(0, limits.max_files - len(attempted))
+    supplement_probe_count = 0
+    intrinsic_manifests = ("research.yaml", "research.yml")
+    initial_supplement_candidates = tuple(
+        dict.fromkeys((*exact_literal_paths, *intrinsic_manifests))
+    )
+    for path in initial_supplement_candidates:
+        if path in supplement_paths or path in selected:
+            continue
+        if supplement_probe_count >= supplement_probe_limit:
+            if path in exact_literal_paths:
+                issues.append(
+                    ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path)
+                )
+            elif path in intrinsic_manifests:
+                # Do not probe or read beyond the fixed file-attempt budget.
+                # Conservatively preserve the possible loss of a root Audit
+                # manifest as explicit incompleteness.
+                issues.append(
+                    ScopeIssue(
+                        code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+                        observed=1,
+                        limit=0,
+                    )
+                )
+            continue
+        supplement_probe_count += 1
+        status = next(
+            (entry.status for entry in inventory.entries if entry.path == path),
+            None,
+        )
+        if status in {ChangeStatus.ADDED, ChangeStatus.MODIFIED}:
+            continue
+        if not _git_supplement_is_exact(inputs, inventory, path):
+            if path in exact_literal_paths:
+                issues.append(
+                    ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path)
+                )
+            continue
+        supplement_paths.append(path)
+
+    manifest_byte_limit = min(
+        MAX_CHANGESET_METADATA_BYTES,
+        limits.max_file_chars * 4,
+    )
+    manifest_candidates = tuple(
+        sorted(
+            dict.fromkeys(
+                (
+                    *selected_changed_manifests,
+                    *(
+                        path
+                        for path in supplement_paths
+                        if PurePosixPath(path).name.casefold()
+                        in {"research.yaml", "research.yml"}
+                    ),
+                )
+            ),
+            key=manifest_candidate_order_key,
+        )
+    )
+    manifest_limit = min(MAX_MANIFEST_AUDITS, limits.max_files)
+    omitted_manifest_candidates = manifest_candidates[manifest_limit:]
+    if omitted_manifest_candidates:
+        issues.append(
+            ScopeIssue(
+                code="PREFLIGHT_G3_AUDIT_PLAN_OMITTED",
+                observed=len(omitted_manifest_candidates),
+                limit=manifest_limit,
+            )
+        )
+    manifest_dependency_map = _exact_manifest_dependency_map(
+        inputs,
+        manifest_candidates[:manifest_limit],
+        max_bytes=manifest_byte_limit,
+    )
+    exact_literal_manifest_paths = {
+        path
+        for path in exact_literal_paths
+        if PurePosixPath(path).name.casefold() in {"research.yaml", "research.yml"}
+    }
+    active_manifest_dependency_map = tuple(
+        (manifest, dependencies)
+        for manifest, dependencies in manifest_dependency_map
+        if manifest in selected_changed_manifests
+        or manifest in exact_literal_manifest_paths
+        or any(path in inventory_path_set for path in (manifest, *dependencies))
+    )
+    active_manifest_paths = {
+        manifest for manifest, _dependencies in active_manifest_dependency_map
+    }
+    supplement_paths = [
+        path
+        for path in supplement_paths
+        if path not in intrinsic_manifests
+        or path in active_manifest_paths
+        or path in exact_literal_manifest_paths
+    ]
+    manifest_dependency_paths = tuple(
+        sorted(
+            {
+                dependency
+                for _manifest, dependencies in active_manifest_dependency_map
+                for dependency in dependencies
+            }
+        )
+    )
+    for path in manifest_dependency_paths:
+        if path in supplement_paths or path in selected:
+            continue
+        if path in attempted:
+            # A failed changed-candidate capture consumes its one bounded
+            # attempt. Manifest closure must not turn that omission into a
+            # race-dependent retry.
+            issues.append(
+                ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path)
+            )
+            continue
+        if supplement_probe_count >= supplement_probe_limit:
+            issues.append(
+                ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path)
+            )
+            continue
+        supplement_probe_count += 1
+        if not _git_supplement_is_exact(inputs, inventory, path):
+            if _git_audit_dependency_is_exactly_absent(inputs, inventory, path):
+                audit_absent_paths.append(path)
+                continue
+            issues.append(
+                ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path)
+            )
+            continue
+        supplement_paths.append(path)
+
+    materialize(
+        [
+            (
+                ChangeEntry(path=path, status=ChangeStatus.MODIFIED),
+                classify_review_material(path),
+            )
+            for path in supplement_paths
+        ]
+    )
+    if supplement_plan_only:
+        return ReviewScopeHydrationPlan(
+            changed_paths=tuple(
+                path
+                for path in attempted_present_paths
+                if path in changed_head_paths
+            ),
+            supplement_paths=tuple(
+                path
+                for path in attempted_present_paths
+                if path not in changed_head_paths
+            ),
+            attempted_present_paths=tuple(attempted_present_paths),
+            omissions=tuple(exact_omissions),
+        )
+    selected_set_after_supplements = set(selected) | set(audit_absent_paths)
+    for path in manifest_dependency_paths:
+        if path not in selected_set_after_supplements:
+            issues.append(ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path))
+
+    # Deterministic Audit inputs are one atomic scope unit. A partial manifest
+    # closure is not provider-authorized; remove the manifest and let other
+    # independently selected evidence paths continue under explicit PARTIAL
+    # accounting.
+    atomic_path_groups: list[tuple[str, ...]] = []
+    remaining_manifest_groups = list(active_manifest_dependency_map)
+    rejected_manifest_groups: list[tuple[str, tuple[str, ...]]] = []
+    while remaining_manifest_groups:
+        selected_set_after_supplements = set(selected) | set(audit_absent_paths)
+        incomplete_manifests = {
+            manifest
+            for manifest, dependencies in remaining_manifest_groups
+            if not set((manifest, *dependencies)).issubset(
+                selected_set_after_supplements
+            )
+        }
+        if not incomplete_manifests:
+            break
+        rejected_manifest_groups.extend(
+            item
+            for item in remaining_manifest_groups
+            if item[0] in incomplete_manifests
+        )
+        for manifest in tuple(selected):
+            if manifest not in incomplete_manifests:
+                continue
+            selected.remove(manifest)
+            removed_chars = materialized_path_chars.pop(manifest, 0)
+            materialized_chars -= removed_chars
+            remaining_chars += removed_chars
+            records[:] = [source for source in records if source.path != manifest]
+            issues[:] = [
+                issue
+                for issue in issues
+                if not (
+                    issue.path == manifest
+                    and issue.code
+                    in {
+                        "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+                        "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT",
+                    }
+                )
+            ]
+            issues.append(
+                ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=manifest)
+            )
+        remaining_manifest_groups = [
+            item
+            for item in remaining_manifest_groups
+            if item[0] not in incomplete_manifests
+        ]
+    for manifest, dependencies in remaining_manifest_groups:
+        group = tuple(dict.fromkeys((manifest, *dependencies)))
+        if set(group).issubset(set(selected) | set(audit_absent_paths)):
+            atomic_path_groups.append(group)
+
+    complete_group_paths = {
+        path for group in atomic_path_groups for path in group
+    }
+    rejected_dependency_paths = {
+        path
+        for _manifest, dependencies in rejected_manifest_groups
+        for path in dependencies
+    }
+    orphaned_manifest_supplements = tuple(
+        path
+        for path in selected
+        if path in rejected_dependency_paths
+        and path not in selected_before_supplements
+        and path not in exact_literal_paths
+        and path not in complete_group_paths
+    )
+    for path in orphaned_manifest_supplements:
+        selected.remove(path)
+        removed_chars = materialized_path_chars.pop(path, 0)
+        materialized_chars -= removed_chars
+        remaining_chars += removed_chars
+        records[:] = [source for source in records if source.path != path]
+        issues[:] = [
+            issue
+            for issue in issues
+            if not (
+                issue.path == path
+                and issue.code
+                in {
+                    "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+                    "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT",
+                }
+            )
+        ]
+        issues.append(ScopeIssue(code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path=path))
+
     all_records = tuple(records)
     seeds, seed_candidate_count = _seeds(all_records, limits.max_claims)
     if seed_candidate_count > len(seeds):
@@ -589,7 +1399,10 @@ def build_review_scope(
                 limit=limits.max_claims,
             )
         )
-    references = _source_path_references(all_records)
+    references = _source_path_references(
+        all_records,
+        inventory_paths=tuple(dict.fromkeys((*inventory_paths, *selected))),
+    )
     citable_paths = _citable_materialized_paths(
         tuple(selected),
         tuple(materialized_path_chars.items()),
@@ -601,7 +1414,7 @@ def build_review_scope(
     unrouted_seed_count = 0
     for seed in seeds:
         if any(
-            _exact_mentions(path, seed, references) or _kind_agrees(kind, seed)
+            _seed_routes_to_path(path, kind, seed, references)
             for path, kind in selected_kinds.items()
         ):
             continue
@@ -666,6 +1479,9 @@ def build_review_scope(
         issues.append(ScopeIssue(code="PREFLIGHT_G2_EXTERNAL_EVIDENCE_ONLY"))
     unique_issues = tuple(sorted(set(issues), key=_issue_sort_key))
     selected_paths = tuple(selected)
+    issued_changed_paths = tuple(
+        path for path in selected_paths if path in changed_head_paths
+    )
     return ReviewScope(
         mode=(
             "declared_changed_v1"
@@ -674,7 +1490,7 @@ def build_review_scope(
         ),
         inventory=inventory,
         issued_paths=selected_paths,
-        issued_changed_paths=selected_paths,
+        issued_changed_paths=issued_changed_paths,
         selected_paths=selected_paths,
         sources=all_records,
         seeds=seeds,
@@ -682,7 +1498,52 @@ def build_review_scope(
         issues=unique_issues,
         materialized_chars=materialized_chars,
         materialized_path_chars=tuple(sorted(materialized_path_chars.items())),
+        atomic_path_groups=tuple(atomic_path_groups),
     )
+
+
+def build_review_scope(
+    inputs: _ScopeInputs,
+    config: ReviewConfig,
+    inventory: ChangeInventory,
+) -> ReviewScope:
+    """Plan and validate only a bounded subset of a declared change inventory."""
+
+    scope = _build_review_scope(
+        inputs,
+        config,
+        inventory,
+        supplement_plan_only=False,
+        exact_git_material=False,
+    )
+    if not isinstance(scope, ReviewScope):
+        raise ReviewError("review scope planning returned an invalid result")
+    return scope
+
+
+def plan_review_supplement_paths(
+    inputs: _ScopeInputs,
+    config: ReviewConfig,
+    inventory: ChangeInventory,
+) -> ReviewScopeHydrationPlan:
+    """Return exact bounded blobs and omissions needed by sparse preflight.
+
+    This provider-free seam runs the same material ranking, exact-literal parsing,
+    manifest closure, and bounded capture algorithm as ``build_review_scope``
+    against exact Git objects. Callers can hydrate only the returned present blobs,
+    bind the returned oversized omissions, and then run the ordinary preflight.
+    """
+
+    paths = _build_review_scope(
+        inputs,
+        config,
+        inventory,
+        supplement_plan_only=True,
+        exact_git_material=True,
+    )
+    if not isinstance(paths, ReviewScopeHydrationPlan):
+        raise ReviewError("review supplement planning returned an invalid result")
+    return paths
 
 
 def scope_source_bundle(scope: ReviewScope) -> SourceBundle:
@@ -1282,7 +2143,10 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
         ),
         default=len(scope.seeds),
     )
-    references = _source_path_references(scope.sources)
+    references = _source_path_references(
+        scope.sources,
+        inventory_paths=scope.issued_paths,
+    )
     selected_kinds = {
         path: classify_review_material(path)
         for path in _citable_materialized_paths(
@@ -1295,7 +2159,7 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
         1
         for seed in scope.seeds
         if any(
-            _exact_mentions(path, seed, references) or _kind_agrees(kind, seed)
+            _seed_routes_to_path(path, kind, seed, references)
             for path, kind in selected_kinds.items()
         )
     )
@@ -1336,7 +2200,10 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
 
 
 def _routed_seeds(scope: ReviewScope) -> tuple[MaterialClaimSeed, ...]:
-    references = _source_path_references(scope.sources)
+    references = _source_path_references(
+        scope.sources,
+        inventory_paths=scope.issued_paths,
+    )
     selected_kinds = {
         path: classify_review_material(path)
         for path in _citable_materialized_paths(
@@ -1349,7 +2216,7 @@ def _routed_seeds(scope: ReviewScope) -> tuple[MaterialClaimSeed, ...]:
         seed
         for seed in scope.seeds
         if any(
-            _exact_mentions(path, seed, references) or _kind_agrees(kind, seed)
+            _seed_routes_to_path(path, kind, seed, references)
             for path, kind in selected_kinds.items()
         )
     )
@@ -1391,7 +2258,17 @@ def _trim_scope_for_gate3(
             break
         removable = None
         for path in reversed(current.selected_paths):
-            retained = tuple(item for item in current.selected_paths if item != path)
+            removal = {path}
+            expanded = True
+            while expanded:
+                expanded = False
+                for group in current.atomic_path_groups:
+                    if removal.intersection(group) and not set(group).issubset(removal):
+                        removal.update(group)
+                        expanded = True
+            retained = tuple(
+                item for item in current.selected_paths if item not in removal
+            )
             retained_set = set(retained)
             candidate = replace(
                 current,
@@ -1406,21 +2283,33 @@ def _trim_scope_for_gate3(
                     if source.path is None or source.path in retained_set
                 ),
                 materialized_chars=current.materialized_chars
-                - dict(current.materialized_path_chars).get(path, 0),
+                - sum(
+                    chars
+                    for candidate_path, chars in current.materialized_path_chars
+                    if candidate_path in removal
+                ),
                 materialized_path_chars=tuple(
                     item for item in current.materialized_path_chars if item[0] in retained_set
+                ),
+                atomic_path_groups=tuple(
+                    group
+                    for group in current.atomic_path_groups
+                    if not removal.intersection(group)
+                ),
+                issues=tuple(
+                    issue for issue in current.issues if issue.path not in removal
                 ),
             )
             if _scope_routes_required_seeds(
                 candidate,
                 required_seeds,
             ):
-                removable = (path, candidate)
+                removable = (tuple(item for item in current.selected_paths if item in removal), candidate)
                 break
         if removable is None:
             break
-        path, current = removable
-        trimmed.append(path)
+        removed, current = removable
+        trimmed.extend(path for path in removed if path not in trimmed)
     if not trimmed:
         return current
     issues = (*current.issues,) + tuple(
@@ -1463,6 +2352,7 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
         for issue in scope.issues
         if issue.code
         in {
+            "PREFLIGHT_G3_AUDIT_PLAN_OMITTED",
             "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT",
             "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT",
         }
@@ -1559,6 +2449,11 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
         if hard_failure
         else (GateDisposition.PASS_PARTIAL if reasons else GateDisposition.PASS_COMPLETE)
     )
+    omitted_audit_plan_count = sum(
+        issue.observed or 1
+        for issue in reasons
+        if issue.code == "PREFLIGHT_G3_AUDIT_PLAN_OMITTED"
+    )
     return _gate_result(
         3,
         disposition,
@@ -1567,6 +2462,11 @@ def _gate3(scope: ReviewScope, config: ReviewConfig) -> PreflightGateResult:
             "extraction_context_chars": extraction_chars,
             "extraction_fixed_overhead_chars": extraction_fixed_chars,
             "max_context_chars": limits.max_context_chars,
+            **(
+                {"omitted_audit_plan_count": omitted_audit_plan_count}
+                if omitted_audit_plan_count
+                else {}
+            ),
             "selected_file_count": len(scope.selected_paths),
             "selected_source_chars": scope.materialized_chars,
             "synthesis_fixed_overhead_chars": synthesis_fixed_chars,
@@ -1624,6 +2524,19 @@ def _evaluate_material_gates(
             comparison_basis=inventory.comparison_basis,
         )
     scope = _trim_scope_for_gate3(scope, config)
+    gate2 = _gate2(scope)
+    if gate2.disposition is GateDisposition.FAIL:
+        return ReviewPreflight(
+            schema_version=1,
+            requested_base_sha=requested_sha,
+            comparison_base_sha=comparison_sha,
+            head_sha=head_sha,
+            gates=(gate1, gate2, _upstream_gate(3)),
+            ready_for_provider=False,
+            review_status_ceiling=ReviewStatus.UNAVAILABLE,
+            scope=scope,
+            comparison_basis=inventory.comparison_basis,
+        )
     gate3 = _gate3(scope, config)
     gates = (gate1, gate2, gate3)
     ready = gate3.disposition in {
@@ -1653,8 +2566,43 @@ def _evaluate_material_gates(
     )
 
 
-def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPreflight:
-    """Evaluate all free gates before any provider module can be imported."""
+def _inventory_mismatch_issues(
+    expected: ChangeInventory,
+    verified: ChangeInventory,
+) -> tuple[ScopeIssue, ...]:
+    """Describe an exact inventory mismatch without retaining Git diagnostics."""
+
+    reasons: list[ScopeIssue] = []
+    if (
+        verified.requested_base_sha != expected.requested_base_sha
+        or verified.head_sha != expected.head_sha
+    ):
+        reasons.append(ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH"))
+    if (
+        verified.comparison_base_sha != expected.comparison_base_sha
+        or verified.comparison_basis is not expected.comparison_basis
+    ):
+        reasons.append(ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_MISMATCH"))
+    if len(verified.entries) != len(expected.entries):
+        reasons.append(
+            ScopeIssue(
+                code="PREFLIGHT_G1_CHANGED_FILE_COUNT_MISMATCH",
+                observed=len(expected.entries),
+                limit=len(verified.entries),
+            )
+        )
+    elif verified.entries != expected.entries:
+        reasons.append(ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"))
+    if not reasons:
+        reasons.append(ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"))
+    return tuple(reasons)
+
+
+def _plan_preflight_review(
+    inputs: _ScopeInputs,
+    config: ReviewConfig,
+) -> ReviewPreflight:
+    """Evaluate the raw deterministic gates before exact material binding."""
 
     if not isinstance(config, ReviewConfig):
         raise ReviewError("config must be ReviewConfig")
@@ -1772,39 +2720,10 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
             comparison_basis=comparison_basis,
         )
     if verified != inventory:
-        reasons: list[ScopeIssue] = []
-        if (
-            verified.requested_base_sha != inventory.requested_base_sha
-            or verified.head_sha != inventory.head_sha
-        ):
-            reasons.append(ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_SHA_MISMATCH"))
-        if (
-            verified.comparison_base_sha != inventory.comparison_base_sha
-            or verified.comparison_basis is not inventory.comparison_basis
-        ):
-            reasons.append(
-                ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_MISMATCH")
-            )
-        if len(verified.entries) != len(inventory.entries):
-            reasons.append(
-                ScopeIssue(
-                    code="PREFLIGHT_G1_CHANGED_FILE_COUNT_MISMATCH",
-                    observed=len(inventory.entries),
-                    limit=len(verified.entries),
-                )
-            )
-        elif verified.entries != inventory.entries:
-            reasons.append(
-                ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED")
-            )
-        if not reasons:
-            reasons.append(
-                ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED")
-            )
         gate1 = _gate_result(
             1,
             GateDisposition.FAIL,
-            tuple(reasons),
+            _inventory_mismatch_issues(inventory, verified),
             {},
         )
         return ReviewPreflight(
@@ -1827,10 +2746,102 @@ def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPrefli
     )
 
 
+def revalidate_preflight_coordinates(
+    inputs: _ScopeInputs,
+    preflight: ReviewPreflight,
+) -> ReviewPreflight:
+    """Recheck declared Git coordinates without rematerializing scope content."""
+
+    if not isinstance(preflight, ReviewPreflight):
+        raise ReviewError("preflight result is invalid")
+    declared = any(
+        getattr(inputs, field, None) is not None
+        for field in (
+            "requested_base",
+            "comparison_base",
+            "head",
+            "inventory",
+            "coordinates",
+            "inventory_failure",
+        )
+    )
+    if not declared:
+        return preflight
+    if preflight.gates[0].disposition is GateDisposition.FAIL:
+        return replace(preflight, scope=None)
+
+    requested = getattr(inputs, "requested_base", None)
+    comparison = getattr(inputs, "comparison_base", None)
+    head = getattr(inputs, "head", None)
+    expected = getattr(inputs, "inventory", None)
+    if not (
+        isinstance(requested, SnapshotIdentity)
+        and isinstance(comparison, SnapshotIdentity)
+        and isinstance(head, SnapshotIdentity)
+        and isinstance(expected, ChangeInventory)
+    ):
+        reasons = (ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"),)
+    else:
+        try:
+            verified = build_git_change_inventory(
+                requested,
+                comparison,
+                head,
+                expected.comparison_basis,
+            )
+        except InventoryVerificationError as exc:
+            reasons = (ScopeIssue(code=exc.code),)
+        except ReviewError:
+            reasons = (
+                ScopeIssue(code="PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"),
+            )
+        else:
+            if verified == expected:
+                return preflight
+            reasons = _inventory_mismatch_issues(expected, verified)
+
+    return ReviewPreflight(
+        schema_version=preflight.schema_version,
+        requested_base_sha=preflight.requested_base_sha,
+        comparison_base_sha=preflight.comparison_base_sha,
+        head_sha=preflight.head_sha,
+        gates=(
+            _gate_result(1, GateDisposition.FAIL, reasons, {}),
+            _upstream_gate(2),
+            _upstream_gate(3),
+        ),
+        ready_for_provider=False,
+        review_status_ceiling=ReviewStatus.UNAVAILABLE,
+        scope=None,
+        comparison_basis=preflight.comparison_basis,
+    )
+
+
+def preflight_review(inputs: _ScopeInputs, config: ReviewConfig) -> ReviewPreflight:
+    """Run the public, provider-free, exact-byte-bound preflight contract."""
+
+    if not isinstance(config, ReviewConfig):
+        raise ReviewError("config must be ReviewConfig")
+    # Import lazily so the planner remains usable by the orchestrator without a
+    # module cycle. ``preflight_only`` returns before provider construction.
+    from .orchestrator import ReviewInputs, run_review
+
+    if not isinstance(inputs, ReviewInputs):
+        raise ReviewError("inputs must be ReviewInputs")
+    effective_config = config if config.enabled else replace(config, enabled=True)
+    review = run_review(inputs, effective_config, preflight_only=True)
+    if review.preflight is None:
+        raise ReviewError("provider-free preflight did not return a gate record")
+    return review.preflight
+
+
 __all__ = [
+    "_plan_preflight_review",
     "build_review_scope",
     "classify_review_material",
     "legacy_preflight_failure",
+    "plan_review_supplement_paths",
     "preflight_review",
+    "revalidate_preflight_coordinates",
     "scope_source_bundle",
 ]

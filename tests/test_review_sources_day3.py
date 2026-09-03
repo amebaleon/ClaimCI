@@ -72,6 +72,10 @@ def _candidate(
         ("scripts/install.sh", ReviewMaterialKind.OTHER),
         ("benchmarks/install.sh", ReviewMaterialKind.OTHER),
         ("benchmarks/helpers.bash", ReviewMaterialKind.OTHER),
+        ("score.pem", ReviewMaterialKind.OTHER),
+        ("benchmark/private.pem", ReviewMaterialKind.OTHER),
+        ("config/credentials.txt", ReviewMaterialKind.OTHER),
+        ("artifacts/manifest.pem", ReviewMaterialKind.OTHER),
         ("assets/logo.png", ReviewMaterialKind.OTHER),
     ],
 )

@@ -20,7 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from .evidence import EvidenceBundle
-from .models import ChangeStatus, ProviderUsage, ReviewMaterialKind
+from .models import (
+    ChangeStatus,
+    ProviderLifecycle,
+    ProviderUsage,
+    ReviewMaterialKind,
+)
 from .orchestrator import ClaimInterpretation, ResearchReview
 from .path_policy import classify_review_material
 
@@ -124,7 +129,19 @@ def _json_safe(value: Any, *, depth: int = 0, active: set[int] | None = None) ->
         return f"<{type(value).__name__}>"
 
 
-def _usage_dict(usage: ProviderUsage, *, provider_call_count: int) -> dict[str, Any]:
+def _usage_dict(
+    usage: ProviderUsage,
+    *,
+    provider_call_count: int,
+    provider_lifecycle: ProviderLifecycle,
+) -> dict[str, Any]:
+    if provider_lifecycle is ProviderLifecycle.FAILED_BEFORE_RESPONSE:
+        return {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "estimated_cost_usd": None,
+        }
     if provider_call_count == 0:
         return {
             "input_tokens": 0,
@@ -299,11 +316,18 @@ def _review_payload(review: ResearchReview) -> dict[str, Any]:
             )
         ],
         "provider": {
+            "lifecycle": review.provider_lifecycle.value,
+            "attempted_call_count": review.provider_attempt_count,
+            "completed_response_count": len(calls),
             "calls": [
                 _json_safe(item)
                 for item in calls
             ],
-            "usage": _usage_dict(review.usage, provider_call_count=len(calls)),
+            "usage": _usage_dict(
+                review.usage,
+                provider_call_count=len(calls),
+                provider_lifecycle=review.provider_lifecycle,
+            ),
         },
         "error": (
             None
@@ -555,6 +579,7 @@ def render_review_markdown(review: ResearchReview) -> str:
     usage = _usage_dict(
         review.usage,
         provider_call_count=len(review.provider_calls),
+        provider_lifecycle=review.provider_lifecycle,
     )
     lines = [
         "## ClaimCI Research Review (Advisory)",
@@ -596,6 +621,9 @@ def render_review_markdown(review: ResearchReview) -> str:
         "",
         "### Evidence and provider usage",
         "",
+        f"- Provider lifecycle: {_markdown_text(review.provider_lifecycle.value)}.",
+        f"- Provider attempts: {review.provider_attempt_count}; completed "
+        f"response records: {len(review.provider_calls)}.",
         f"- Evidence references: {len(review.evidence.references)}; "
         f"bounded characters: {review.evidence.total_chars}.",
         "- Routing incomplete: "
@@ -616,7 +644,7 @@ def render_review_markdown(review: ResearchReview) -> str:
         )
     lines.extend(
         (
-        f"- Provider calls: {len(review.provider_calls)}; input tokens: "
+        f"- Completed provider responses: {len(review.provider_calls)}; input tokens: "
         f"{_markdown_text(usage['input_tokens'] if usage['input_tokens'] is not None else 'unavailable')}; "
         f"output tokens: {_markdown_text(usage['output_tokens'] if usage['output_tokens'] is not None else 'unavailable')}; "
         f"total tokens: {_markdown_text(usage['total_tokens'] if usage['total_tokens'] is not None else 'unavailable')}; "

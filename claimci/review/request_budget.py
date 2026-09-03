@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from enum import Enum
+from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any
 
@@ -34,6 +35,11 @@ REVIEW_SYSTEM_POLICY = (
 )
 
 MAX_SYNTHESIS_AUDIT_CHARS = 8_000
+# A standalone Java ``@Test`` line consumes at least one source byte. Counts
+# above the existing 16 MiB inspected-file ceiling cannot be established by
+# complete bounded Java evidence and therefore must not become mandatory
+# whole-file cardinality constraints.
+MAX_DETERMINISTIC_JAVA_TEST_COUNT = 16 * 1024 * 1024
 
 # The accepted extraction-to-synthesis normalization surfaces have one shared
 # per-claim growth bound.  A finite magnitude float can grow by at most 14 JSON
@@ -458,10 +464,12 @@ def allocate_synthesis_inputs(
 ) -> SynthesisInputAllocation:
     """Pack actual synthesis inputs without ever exceeding the logical cap.
 
-    Claims are mandatory because synthesis must cover each accepted claim. Distinct
-    citable references retain their producer order. Constraints, complete audit
-    snapshots, and missing-evidence rows are then admitted only when the shared
-    serializer proves that the resulting request remains bounded.
+    Claims are mandatory because synthesis must cover each accepted claim.
+    Deterministic interpretation constraints and all of their required citations
+    are admitted atomically before optional evidence. Distinct citable references
+    retain their producer order. Complete audit snapshots and missing-evidence rows
+    are then admitted only when the shared serializer proves that the resulting
+    request remains bounded.
     """
 
     if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 1:
@@ -475,21 +483,58 @@ def allocate_synthesis_inputs(
     if set(evidence_ids_by_claim_id) != set(claim_ids):
         raise ReviewError("synthesis allocation ownership is incomplete")
 
+    evidence_by_id: dict[str, object] = {}
+    evidence_order: list[str] = []
+    for reference in evidence:
+        evidence_id = _field(reference, "evidence_id")
+        if (
+            not isinstance(evidence_id, str)
+            or not evidence_id
+            or evidence_id in evidence_by_id
+        ):
+            raise ReviewError("synthesis allocation evidence IDs are invalid")
+        evidence_by_id[evidence_id] = reference
+        evidence_order.append(evidence_id)
+
+    owned_ids: dict[str, tuple[str, ...]] = {}
+    for claim_id in claim_ids:
+        raw_ids = evidence_ids_by_claim_id[claim_id]
+        if not isinstance(raw_ids, Sequence) or isinstance(raw_ids, (str, bytes)):
+            raise ReviewError("synthesis allocation ownership is invalid")
+        normalized = tuple(raw_ids)
+        if (
+            len(set(normalized)) != len(normalized)
+            or any(
+                not isinstance(evidence_id, str)
+                or evidence_id not in evidence_by_id
+                for evidence_id in normalized
+            )
+        ):
+            raise ReviewError("synthesis allocation ownership is invalid")
+        owned_ids[claim_id] = normalized
+
     retained_evidence: list[object] = []
     retained_ids: set[str] = set()
     retained_constraints: dict[str, Mapping[str, Any]] = {}
     retained_missing: list[object] = []
     retained_audits: list[object] = []
 
-    def owners() -> dict[str, list[str]]:
+    def owners(selected_ids: set[str]) -> dict[str, list[str]]:
         return {
             claim_id: [
                 evidence_id
-                for evidence_id in evidence_ids_by_claim_id[claim_id]
-                if evidence_id in retained_ids
+                for evidence_id in owned_ids[claim_id]
+                if evidence_id in selected_ids
             ]
             for claim_id in claim_ids
         }
+
+    def selected_evidence(selected_ids: set[str]) -> tuple[object, ...]:
+        return tuple(
+            evidence_by_id[evidence_id]
+            for evidence_id in evidence_order
+            if evidence_id in selected_ids
+        )
 
     def parts(
         *,
@@ -497,11 +542,13 @@ def allocate_synthesis_inputs(
         candidate_constraints: Mapping[str, Mapping[str, Any]] | None = None,
         candidate_missing: Sequence[object] | None = None,
         candidate_audits: Sequence[object] | None = None,
+        candidate_ids: set[str] | None = None,
     ) -> RequestParts:
+        selected_ids = retained_ids if candidate_ids is None else candidate_ids
         return build_synthesis_request_parts(
             claims,
             retained_evidence if candidate_evidence is None else candidate_evidence,
-            owners(),
+            owners(selected_ids),
             (
                 retained_constraints
                 if candidate_constraints is None
@@ -525,44 +572,54 @@ def allocate_synthesis_inputs(
     if not fits(base):
         raise ReviewError("mandatory synthesis input exceeds the configured limit")
 
-    omitted_evidence = 0
-    for reference in evidence:
-        evidence_id = _field(reference, "evidence_id")
-        if (
-            not isinstance(evidence_id, str)
-            or not evidence_id
-            or evidence_id in retained_ids
-        ):
-            raise ReviewError("synthesis allocation evidence IDs are invalid")
-        candidate_ids = {*retained_ids, evidence_id}
-        prior_ids = retained_ids
-        retained_ids = candidate_ids
-        candidate_evidence = (*retained_evidence, reference)
-        candidate = parts(candidate_evidence=candidate_evidence)
-        if fits(candidate):
-            retained_evidence.append(reference)
-        else:
-            retained_ids = prior_ids
-            omitted_evidence += 1
-
     omitted_constraints = 0
     for claim_id in sorted(interpretation_constraints_by_claim_id):
         constraint = interpretation_constraints_by_claim_id[claim_id]
+        if claim_id not in owned_ids or not isinstance(constraint, Mapping):
+            raise ReviewError("synthesis allocation constraint is invalid")
         required = constraint.get("required_citations", ())
+        if not isinstance(required, Sequence) or isinstance(required, (str, bytes)):
+            raise ReviewError("synthesis allocation constraint citations are invalid")
+        required_ids = tuple(required)
         if (
-            claim_id not in claim_ids
-            or not isinstance(required, Sequence)
-            or isinstance(required, (str, bytes))
-            or any(item not in retained_ids for item in required)
+            len(set(required_ids)) != len(required_ids)
+            or any(
+                not isinstance(evidence_id, str)
+                or evidence_id not in evidence_by_id
+                or evidence_id not in owned_ids[claim_id]
+                for evidence_id in required_ids
+            )
         ):
-            omitted_constraints += 1
-            continue
+            raise ReviewError("synthesis allocation constraint citations are invalid")
+        candidate_ids = {*retained_ids, *required_ids}
+        candidate_evidence = selected_evidence(candidate_ids)
         candidate_constraints = {**retained_constraints, claim_id: constraint}
-        candidate = parts(candidate_constraints=candidate_constraints)
+        candidate = parts(
+            candidate_evidence=candidate_evidence,
+            candidate_constraints=candidate_constraints,
+            candidate_ids=candidate_ids,
+        )
         if fits(candidate):
+            retained_ids = candidate_ids
+            retained_evidence = list(candidate_evidence)
             retained_constraints[claim_id] = constraint
         else:
             omitted_constraints += 1
+
+    for evidence_id in evidence_order:
+        if evidence_id in retained_ids:
+            continue
+        candidate_ids = {*retained_ids, evidence_id}
+        candidate_evidence = selected_evidence(candidate_ids)
+        candidate = parts(
+            candidate_evidence=candidate_evidence,
+            candidate_ids=candidate_ids,
+        )
+        if fits(candidate):
+            retained_ids = candidate_ids
+            retained_evidence = list(candidate_evidence)
+
+    omitted_evidence = len(evidence_order) - len(retained_ids)
 
     omitted_audits = 0
     for audit in deterministic_audits:
@@ -710,12 +767,14 @@ def bound_synthesis_audits(
 def worst_valid_synthesis_request_chars(
     scope: ReviewScope, limits: ReviewLimits
 ) -> int:
-    """Reserve the runtime allocator envelope or its mandatory producer base.
+    """Reserve the runtime envelope plus every mandatory constraint input.
 
-    Optional evidence, gaps, constraints, and Audit snapshots are admitted by
+    Optional evidence, gaps, and Audit snapshots are admitted by
     :func:`allocate_synthesis_inputs` only while the exact logical request stays
-    within ``max_context_chars``. The only possible larger input is therefore
-    the mandatory all-claim payload/schema, which cannot be omitted.
+    within ``max_context_chars``. Deterministic interpretation constraints are
+    different: runtime must skip synthesis rather than omit one. Reserve the
+    worst valid Java-cardinality/unlocalized constraint shape, including every
+    required citation, before authorizing extraction call 1.
     """
 
     if not isinstance(scope, ReviewScope) or not isinstance(limits, ReviewLimits):
@@ -725,29 +784,314 @@ def worst_valid_synthesis_request_chars(
         limits.max_output_chars,
         scope.sources,
     )
-    owners = {claim["claim_id"]: [] for claim in claims}
-    mandatory = build_synthesis_request_parts(
-        claims,
-        (),
-        owners,
-        {},
-        (),
-        (),
-    )
-    mandatory_chars = logical_request_chars(
-        mandatory.task,
-        mandatory.payload,
-        mandatory.schema,
-    )
-    mandatory_chars += (
+    claim_ids = tuple(claim["claim_id"] for claim in claims)
+    normalization_reserve = (
         limits.max_claims * _MAX_CLAIM_NORMALIZATION_GROWTH_CHARS
     )
-    return max(mandatory_chars, limits.max_context_chars)
+
+    def request_chars(
+        evidence: Sequence[object],
+        owners: Mapping[str, Sequence[str]],
+        constraints: Mapping[str, Mapping[str, Any]],
+    ) -> int:
+        parts = build_synthesis_request_parts(
+            claims,
+            evidence,
+            owners,
+            constraints,
+            (),
+            (),
+        )
+        return (
+            logical_request_chars(parts.task, parts.payload, parts.schema)
+            + normalization_reserve
+        )
+
+    empty_owners = {claim_id: () for claim_id in claim_ids}
+    mandatory_chars = request_chars((), empty_owners, {})
+
+    selected = set(scope.selected_paths)
+    source_by_path = {
+        source.path: source
+        for source in scope.sources
+        if source.path is not None and source.path in selected
+    }
+    path_char_limits = dict(scope.materialized_path_chars)
+    locality_unavailable = {
+        issue.path
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+        and issue.path is not None
+    }
+    truncated = locality_unavailable | {
+        issue.path
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+        and issue.path is not None
+    }
+
+    java_candidates: list[tuple[str, str | None]] = []
+    for path in scope.selected_paths:
+        if PurePosixPath(path).suffix.casefold() != ".java":
+            continue
+        source = source_by_path.get(path)
+        allocated = path_char_limits.get(path, 0)
+        complete_text = (
+            source.text
+            if source is not None
+            and path not in truncated
+            and allocated > 0
+            and len(source.text) <= allocated
+            else (
+                # Exact-hint evidence paths need not be extraction sources. In
+                # that case reserve the JSON worst case for every already-bound
+                # materialized character (a control character becomes ``\uXXXX``).
+                "\0" * allocated
+                if source is None and path not in truncated and allocated > 0
+                else None
+            )
+        )
+        java_candidates.append((path, complete_text))
+
+    # Provider-valid claims can all own the same unlocalized reference set.
+    # These IDs are deterministic-width stand-ins for the real SHA-derived IDs.
+    unlocalized_ids = tuple(
+        f"evidence-{index:016x}"
+        for index, _path in enumerate(sorted(locality_unavailable & selected))
+    )
+
+    complete_java = sorted(
+        (candidate for candidate in java_candidates if candidate[1] is not None),
+        key=lambda candidate: (
+            serialized_chars(
+                {"path": candidate[0], "excerpt": candidate[1]}
+            ),
+            candidate[0],
+        ),
+        reverse=True,
+    )
+    maximum_claimed_count = MAX_DETERMINISTIC_JAVA_TEST_COUNT
+    maximum_observed_count = MAX_DETERMINISTIC_JAVA_TEST_COUNT
+    maximum_line = maximum_observed_count + 1
+
+    def corroborated_constraint(evidence_id: str) -> dict[str, Any]:
+        return {
+            "kind": "java_test_cardinality",
+            "state": "corroborated",
+            "claimed_count": maximum_claimed_count,
+            "observed_count": maximum_observed_count,
+            "evidence_id": evidence_id,
+            "required_interpretation": (
+                "The complete source contains "
+                f"{maximum_observed_count} standalone @Test annotation lines, "
+                "matching the claimed count of "
+                f"{maximum_claimed_count} test cases; this is source support, "
+                "not evidence that the tests were executed."
+            ),
+            "required_citations": [evidence_id],
+        }
+
+    def contradicted_constraint(evidence_id: str) -> dict[str, Any]:
+        observed_count = maximum_observed_count - 1
+        return {
+            "kind": "java_test_cardinality",
+            "state": "contradicted",
+            "claimed_count": maximum_claimed_count,
+            "observed_count": observed_count,
+            "evidence_id": evidence_id,
+            "required_interpretation": (
+                "The complete source contains "
+                f"{observed_count} standalone @Test annotation lines, "
+                "contradicting the claimed count of "
+                f"{maximum_claimed_count} test cases."
+            ),
+            "required_citations": [evidence_id],
+        }
+
+    incomplete_constraint = {
+        "kind": "java_test_cardinality",
+        "state": "incomplete",
+        "claimed_count": maximum_claimed_count,
+        "observed_count": None,
+        "evidence_id": None,
+        "required_interpretation": (
+            "ClaimCI cannot verify the exact whole-file test count because "
+            "complete claim-owned Java test evidence was not available in the "
+            "analyzed snapshot."
+        ),
+        "required_citations": [],
+    }
+    out_of_bounds_constraint = {
+        "kind": "java_test_cardinality",
+        "state": "out_of_bounds",
+        "claimed_count": None,
+        "observed_count": None,
+        "evidence_id": None,
+        "limit": MAX_DETERMINISTIC_JAVA_TEST_COUNT,
+        "required_interpretation": (
+            "ClaimCI cannot verify the claimed whole-file test count because it "
+            "exceeds the maximum count representable by a complete file within "
+            "the bounded inspection size."
+        ),
+        "required_citations": [],
+    }
+    unlocalized_constraint = (
+        {
+            "kind": "unlocalized_evidence",
+            "state": "incomplete",
+            "evidence_ids": list(unlocalized_ids),
+            "required_interpretation": (
+                "ClaimCI cannot verify this claim from the exact source/test "
+                "evidence because the available bounded excerpts could not be "
+                "localized to the material region."
+            ),
+            "required_citations": [],
+        }
+        if unlocalized_ids
+        else None
+    )
+
+    def constraint_footprint(constraint: Mapping[str, Any]) -> int:
+        """Compare exact payload plus constraint-specific schema growth."""
+
+        required_citations = list(constraint["required_citations"])
+        citations: dict[str, Any] = {
+            "type": "array",
+            "minItems": len(required_citations),
+            "maxItems": len(required_citations),
+            "items": {"type": "string"},
+        }
+        if required_citations:
+            citations["items"]["enum"] = required_citations
+        return serialized_chars(constraint) + serialized_chars(
+            {
+                "interpretation": {
+                    "type": "string",
+                    "enum": [constraint["required_interpretation"]],
+                },
+                "citations": citations,
+            }
+        )
+
+    no_reference_candidates: list[Mapping[str, Any]] = []
+    if java_candidates:
+        no_reference_candidates.extend(
+            (incomplete_constraint, out_of_bounds_constraint)
+        )
+    if unlocalized_constraint is not None:
+        no_reference_candidates.append(unlocalized_constraint)
+    largest_no_reference_constraint = (
+        max(no_reference_candidates, key=constraint_footprint)
+        if no_reference_candidates
+        else None
+    )
+
+    def constrained_request_chars(
+        selected_complete: Sequence[tuple[str, str]],
+        owner_count: int,
+    ) -> int:
+        evidence_ids = {
+            path: f"evidence-{index:016x}"
+            for index, (path, _text) in enumerate(selected_complete)
+        }
+        required_evidence_ids = tuple(evidence_ids.values())
+        owned_claim_ids = claim_ids[:owner_count]
+        owners: dict[str, tuple[str, ...]] = {
+            claim_id: (
+                required_evidence_ids if index < owner_count else ()
+            )
+            for index, claim_id in enumerate(claim_ids)
+        }
+        constraints: dict[str, Mapping[str, Any]] = {}
+        for index, evidence_id in enumerate(required_evidence_ids):
+            complete_candidates = (
+                corroborated_constraint(evidence_id),
+                contradicted_constraint(evidence_id),
+            )
+            constraints[claim_ids[index]] = max(
+                complete_candidates,
+                key=constraint_footprint,
+            )
+
+        if required_evidence_ids:
+            shared_complete_candidates = (
+                corroborated_constraint(required_evidence_ids[0]),
+                contradicted_constraint(required_evidence_ids[0]),
+                incomplete_constraint,
+                out_of_bounds_constraint,
+            )
+            largest_owned_constraint = max(
+                shared_complete_candidates,
+                key=constraint_footprint,
+            )
+            for claim_id in claim_ids[len(required_evidence_ids) : owner_count]:
+                constraints[claim_id] = largest_owned_constraint
+
+        if unlocalized_constraint is not None:
+            for claim_id in claim_ids[owner_count:]:
+                constraints[claim_id] = unlocalized_constraint
+
+        evidence = tuple(
+            {
+                "evidence_id": evidence_ids[path],
+                # Every changed Java TEST reference is routed to every
+                # implementation claim.  Required citations therefore expand
+                # both the evidence rows and schema ownership as a full matrix.
+                "claim_ids": list(owned_claim_ids),
+                "kind": "test",
+                "path": path,
+                "start_line": 1,
+                "end_line": maximum_line,
+                "sha256": "f" * 64,
+                "size": maximum_observed_count,
+                "excerpt": text,
+                "provenance": "supporting_artifact",
+                "excerpt_complete": True,
+                "excerpt_locality": "complete_file",
+            }
+            for path, text in selected_complete
+        )
+        return request_chars(evidence, owners, constraints)
+
+    # With no required citation selected, any claim can independently carry
+    # the largest no-reference runtime constraint.  This includes mixed
+    # incomplete, out-of-bounds, and unlocalized alternatives by exact
+    # payload-plus-schema dominance.
+    constraint_reserve = mandatory_chars
+    if largest_no_reference_constraint is not None:
+        constraint_reserve = request_chars(
+            (),
+            empty_owners,
+            {
+                claim_id: largest_no_reference_constraint
+                for claim_id in claim_ids
+            },
+        )
+
+    # For each reachable number of distinct required Java references, model
+    # every possible count of implementation claims that route to all of them.
+    # The remaining claims may carry unlocalized constraints with no citable
+    # ownership.  This covers the allocator's incremental constraint states as
+    # well as the final full claim-by-reference ownership matrix.
+    maximum_required_references = min(len(complete_java), len(claim_ids))
+    for reference_count in range(1, maximum_required_references + 1):
+        selected_complete = complete_java[:reference_count]
+        for owner_count in range(reference_count, len(claim_ids) + 1):
+            constraint_reserve = max(
+                constraint_reserve,
+                constrained_request_chars(selected_complete, owner_count),
+            )
+    return max(
+        mandatory_chars,
+        constraint_reserve,
+        limits.max_context_chars,
+    )
 
 
 __all__ = [
     "EXTRACTION_CONTRACT",
     "MAX_SYNTHESIS_AUDIT_CHARS",
+    "MAX_DETERMINISTIC_JAVA_TEST_COUNT",
     "REVIEW_SYSTEM_POLICY",
     "RequestParts",
     "SYNTHESIS_CONTRACT",

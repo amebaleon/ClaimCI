@@ -21,7 +21,10 @@ from claimci.review.evidence import (
     EvidenceProvenance,
     discover_evidence,
 )
-from claimci.review.inventory import build_git_change_inventory
+from claimci.review.inventory import (
+    build_git_change_inventory,
+    exact_git_material_omission_matches,
+)
 from claimci.review.models import (
     ChangeEntry,
     ChangeInventory,
@@ -29,10 +32,13 @@ from claimci.review.models import (
     ChangeStatus,
     ClaimType,
     ComparisonBasis,
+    ExactMaterialOmission,
     GateDisposition,
     ProviderUsage,
     ReviewConfig,
+    ReviewLimits,
     ReviewMaterialKind,
+    ReviewStatus,
     ScientificClaim,
     SnapshotIdentity,
     SnapshotRole,
@@ -47,6 +53,8 @@ from scripts.replay_review_preflight import (
     CandidateInputLayout,
     FrozenCandidate,
     _digest_metadata_tree,
+    _reject_unsafe_source_config,
+    _review_config,
     _source_identity,
     load_frozen_manifests,
     replay_candidate,
@@ -404,7 +412,7 @@ class _TwoCallProvider:
         self.calls: list[StructuredRequest] = []
 
     def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
-        assert self.events == ["preflight_pass"]
+        assert self.events == ["preflight_pass", "preflight_pass"]
         self.events.append("extract")
         self.calls.append(request)
         source = request.payload["sources"][0]
@@ -438,7 +446,7 @@ class _TwoCallProvider:
         )
 
     def synthesize_review(self, request: StructuredRequest) -> ProviderResponse:
-        assert self.events == ["preflight_pass", "extract"]
+        assert self.events == ["preflight_pass", "preflight_pass", "extract"]
         self.events.append("synthesize")
         self.calls.append(request)
         claim_id = request.payload["claims"][0]["claim_id"]
@@ -496,9 +504,13 @@ def test_provider_is_injected_only_after_pass_and_never_exceeds_two_calls(
     monkeypatch.setattr(
         "claimci.review.preflight.build_git_change_inventory", lambda *_args: inventory
     )
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.verify_git_material_identities",
+        lambda *_args, **_kwargs: None,
+    )
     import claimci.review.preflight as preflight_module
 
-    real_preflight = preflight_module.preflight_review
+    real_preflight = preflight_module._plan_preflight_review
     events: list[str] = []
 
     def observed_preflight(*args: object, **kwargs: object):
@@ -507,14 +519,636 @@ def test_provider_is_injected_only_after_pass_and_never_exceeds_two_calls(
         events.append("preflight_pass")
         return result
 
-    monkeypatch.setattr(preflight_module, "preflight_review", observed_preflight)
+    monkeypatch.setattr(
+        preflight_module, "_plan_preflight_review", observed_preflight
+    )
     provider = _TwoCallProvider(events)
 
     result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
 
-    assert events == ["preflight_pass", "extract", "synthesize"]
+    assert events == [
+        "preflight_pass",
+        "preflight_pass",
+        "extract",
+        "synthesize",
+    ]
     assert len(provider.calls) == 2
     assert len(result.provider_calls) == 2
+
+
+def test_selected_material_is_bound_to_exact_head_blob_under_repeated_read_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-consistent worktree reads cannot substitute bytes outside declared HEAD."""
+
+    import claimci.review.orchestrator as orchestrator_module
+    import claimci.review.preflight as preflight_module
+
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    _write(repository, "README.md", "base\n")
+    base_sha = _commit(repository, "base")
+    committed = b"Benchmark accuracy improves by 5 percent.\n"
+    transient = b"TRANSIENT non-HEAD accuracy improves by 50 percent.\n"
+    study = repository / "study.md"
+    study.write_bytes(committed)
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested,
+        comparison,
+        head,
+        ComparisonBasis.DIRECT_BASE,
+    )
+    inputs = ReviewInputs(
+        repository_root=repository,
+        pr_title="Benchmark accuracy improves by 5%; see study.md",
+        requested_base=requested,
+        comparison_base=comparison,
+        head=head,
+        inventory=inventory,
+    )
+
+    def wrap_reader(reader):
+        def transient_read(root: Path, path: str, *, max_bytes: int):
+            if Path(root).resolve() != repository or path != "study.md":
+                return reader(root, path, max_bytes=max_bytes)
+            study.write_bytes(transient)
+            try:
+                return reader(root, path, max_bytes=max_bytes)
+            finally:
+                study.write_bytes(committed)
+
+        return transient_read
+
+    monkeypatch.setattr(
+        preflight_module,
+        "capture_confined_regular_file",
+        wrap_reader(preflight_module.capture_confined_regular_file),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "inspect_confined_regular_file",
+        wrap_reader(orchestrator_module.inspect_confined_regular_file),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "capture_confined_regular_file",
+        wrap_reader(orchestrator_module.capture_confined_regular_file),
+    )
+    free_preflight = preflight_review(inputs, ReviewConfig(enabled=True))
+    assert free_preflight.ready_for_provider is False
+    assert free_preflight.scope is None
+    assert free_preflight.gates[0].disposition is GateDisposition.FAIL
+    provider = _TwoCallProvider([])
+
+    result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
+
+    assert result.status is ReviewStatus.UNAVAILABLE
+    assert result.error_code == "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"
+    assert result.preflight is not None
+    assert result.preflight.scope is None
+    assert result.provider_calls == ()
+    assert provider.calls == []
+    assert study.read_bytes() == committed
+    assert not _git(repository, "status", "--porcelain")
+
+
+@pytest.mark.parametrize("source_path", ["src/Stable.java", "Stable.java"])
+def test_exact_unchanged_source_literal_is_a_bounded_deterministic_supplement(
+    tmp_path: Path,
+    source_path: str,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    _write(repository, source_path, "final class Stable { int score = 95; }\n")
+    base_sha = _commit(repository, "base")
+    _write(repository, "results/metrics.json", '{"accuracy": 0.95}\n')
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Accuracy improves by 5%",
+            pr_description=(
+                f"The exact implementation is {source_path} and measurements "
+                "are in results/metrics.json."
+            ),
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.scope is not None
+    assert result.scope.selected_paths == (
+        "results/metrics.json",
+        source_path,
+    )
+    assert result.scope.issued_changed_paths == ("results/metrics.json",)
+    assert not any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH"
+        and issue.path == source_path
+        for issue in result.scope.issues
+    )
+
+
+def test_changed_manifest_issues_unchanged_declared_dependencies_as_supplements(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    dependencies = (
+        "base/config.yaml",
+        "base/results.json",
+        "base/train.jsonl",
+        "base/eval.jsonl",
+        "candidate/config.yaml",
+        "candidate/results.json",
+        "candidate/train.jsonl",
+        "candidate/eval.jsonl",
+    )
+    for relative in dependencies:
+        _write(repository, relative, "{}\n")
+    manifest = """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: base/config.yaml
+  results: base/results.json
+  train_dataset: base/train.jsonl
+  eval_dataset: base/eval.jsonl
+candidate:
+  config: candidate/config.yaml
+  results: candidate/results.json
+  train_dataset: candidate/train.jsonl
+  eval_dataset: candidate/eval.jsonl
+"""
+    _write(repository, "research.yaml", manifest.replace("0.05", "0.04"))
+    base_sha = _commit(repository, "base")
+    _write(repository, "research.yaml", manifest)
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Accuracy improves by 5% with reproducible configuration",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.scope is not None
+    assert result.scope.issued_changed_paths == ("research.yaml",)
+    assert result.scope.selected_paths == ("research.yaml", *sorted(dependencies))
+
+
+def test_unchanged_root_manifest_is_supplemented_when_its_dependency_changes(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    dependencies = (
+        "base/config.yaml",
+        "base/results.json",
+        "base/train.jsonl",
+        "base/eval.jsonl",
+        "candidate/config.yaml",
+        "candidate/results.json",
+        "candidate/train.jsonl",
+        "candidate/eval.jsonl",
+    )
+    for relative in dependencies:
+        _write(repository, relative, "{}\n")
+    _write(
+        repository,
+        "research.yaml",
+        """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: base/config.yaml
+  results: base/results.json
+  train_dataset: base/train.jsonl
+  eval_dataset: base/eval.jsonl
+candidate:
+  config: candidate/config.yaml
+  results: candidate/results.json
+  train_dataset: candidate/train.jsonl
+  eval_dataset: candidate/eval.jsonl
+""",
+    )
+    base_sha = _commit(repository, "base")
+    _write(repository, "candidate/results.json", '{"accuracy": 0.95}\n')
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Accuracy improves by 5% with reproducible configuration",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.scope is not None
+    assert result.scope.issued_changed_paths == ("candidate/results.json",)
+    assert result.scope.selected_paths == (
+        "candidate/results.json",
+        "research.yaml",
+        *sorted(set(dependencies) - {"candidate/results.json"}),
+    )
+    assert result.scope.atomic_path_groups == (
+        ("research.yaml", *sorted(dependencies)),
+    )
+
+
+def test_manifest_bundle_is_rejected_atomically_when_dependencies_exceed_file_cap(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    dependencies = (
+        "base/config.yaml",
+        "base/results.json",
+        "base/train.jsonl",
+        "base/eval.jsonl",
+        "candidate/config.yaml",
+        "candidate/results.json",
+        "candidate/train.jsonl",
+        "candidate/eval.jsonl",
+    )
+    for relative in dependencies:
+        _write(repository, relative, "{}\n")
+    manifest = """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: base/config.yaml
+  results: base/results.json
+  train_dataset: base/train.jsonl
+  eval_dataset: base/eval.jsonl
+candidate:
+  config: candidate/config.yaml
+  results: candidate/results.json
+  train_dataset: candidate/train.jsonl
+  eval_dataset: candidate/eval.jsonl
+"""
+    _write(repository, "research.yaml", manifest.replace("0.05", "0.04"))
+    base_sha = _commit(repository, "base")
+    _write(repository, "research.yaml", manifest)
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Accuracy improves by 5% in research.yaml",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True, limits=ReviewLimits(max_files=3)),
+    )
+
+    assert result.ready_for_provider is False
+    assert result.gates[1].disposition is GateDisposition.FAIL
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.scope is not None
+    assert result.scope.selected_paths == ()
+    assert result.scope.atomic_path_groups == ()
+    assert any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH"
+        and issue.path == "research.yaml"
+        for issue in result.scope.issues
+    )
+
+
+def test_nested_exact_manifest_literal_brings_its_complete_atomic_dependency_scope(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    manifest_path = "studies/demo/research.yaml"
+    dependency_names = (
+        "base-config.yaml",
+        "base-results.json",
+        "base-train.jsonl",
+        "base-eval.jsonl",
+        "candidate-config.yaml",
+        "candidate-results.json",
+        "candidate-train.jsonl",
+        "candidate-eval.jsonl",
+    )
+    for name in dependency_names:
+        _write(repository, f"studies/demo/{name}", "{}\n")
+    _write(
+        repository,
+        manifest_path,
+        """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: base-config.yaml
+  results: base-results.json
+  train_dataset: base-train.jsonl
+  eval_dataset: base-eval.jsonl
+candidate:
+  config: candidate-config.yaml
+  results: candidate-results.json
+  train_dataset: candidate-train.jsonl
+  eval_dataset: candidate-eval.jsonl
+""",
+    )
+    base_sha = _commit(repository, "base")
+    _write(repository, "results/metrics.json", '{"accuracy": 0.95}\n')
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Accuracy improves by 5%",
+            pr_description=f"Audit inputs are declared by {manifest_path}.",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    expected_group = (
+        manifest_path,
+        *sorted(f"studies/demo/{name}" for name in dependency_names),
+    )
+    assert result.scope is not None
+    assert result.scope.atomic_path_groups == (expected_group,)
+    assert set(expected_group).issubset(result.scope.selected_paths)
+
+
+def test_deleted_root_manifest_dependency_is_bound_as_atomic_audit_absence(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    dependencies = (
+        "base/config.yaml",
+        "base/results.json",
+        "base/train.jsonl",
+        "base/eval.jsonl",
+        "candidate/config.yaml",
+        "candidate/results.json",
+        "candidate/train.jsonl",
+        "candidate/eval.jsonl",
+    )
+    for relative in dependencies:
+        _write(repository, relative, "{}\n")
+    _write(
+        repository,
+        "research.yaml",
+        """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: base/config.yaml
+  results: base/results.json
+  train_dataset: base/train.jsonl
+  eval_dataset: base/eval.jsonl
+candidate:
+  config: candidate/config.yaml
+  results: candidate/results.json
+  train_dataset: candidate/train.jsonl
+  eval_dataset: candidate/eval.jsonl
+""",
+    )
+    base_sha = _commit(repository, "base")
+    (repository / "candidate" / "eval.jsonl").unlink()
+    _write(repository, "results/metrics.json", '{"accuracy": 0.95}\n')
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=repository,
+            pr_title="Accuracy improves by 5%",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.scope is not None
+    assert "research.yaml" in result.scope.selected_paths
+    assert "candidate/eval.jsonl" not in result.scope.selected_paths
+    assert result.scope.atomic_path_groups == (
+        ("research.yaml", *sorted(dependencies)),
+    )
+    assert not any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH"
+        and issue.path == "candidate/eval.jsonl"
+        for issue in result.scope.issues
+    )
+
+
+def test_deleted_manifest_dependency_remains_relevant_to_runtime_audit(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+    audit_paths = (
+        "research.yaml",
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "baseline-train.jsonl",
+        "baseline-eval.jsonl",
+        "candidate-config.yaml",
+        "candidate-results.json",
+        "candidate-train.jsonl",
+        "candidate-eval.jsonl",
+    )
+    for relative in audit_paths:
+        _write(
+            repository,
+            relative,
+            (fixture / relative).read_text(encoding="utf-8"),
+        )
+    base_sha = _commit(repository, "base")
+    (repository / "candidate-eval.jsonl").unlink()
+    _write(repository, "claim-results.json", '{"accuracy": 0.95}\n')
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+    inputs = ReviewInputs(
+        repository_root=repository,
+        pr_title="Accuracy improves by 5%",
+        requested_base=requested,
+        comparison_base=comparison,
+        head=head,
+        inventory=inventory,
+    )
+    provider = _TwoCallProvider(["preflight_pass", "preflight_pass"])
+
+    result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
+
+    assert ChangeEntry("candidate-eval.jsonl", ChangeStatus.DELETED) in inventory.entries
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.atomic_path_groups == (
+        ("research.yaml", *sorted(audit_paths[1:])),
+    )
+    assert "candidate-eval.jsonl" not in result.preflight.scope.selected_paths
+    extraction_paths = {
+        source["path"]
+        for source in provider.calls[0].payload["sources"]
+        if source["path"] is not None
+    }
+    assert "candidate-eval.jsonl" not in extraction_paths
+    assert len(result.deterministic_audits) == 1
+    audit = result.deterministic_audits[0]
+    assert audit.verdict == "NOT_SUPPORTED"
+    assert "DATASET.MISSING" in {finding.rule_id for finding in audit.findings}
+    assert [call.task for call in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+
+
+def test_manifest_discovery_cap_is_explicit_without_changing_audit_selection(
+    tmp_path: Path,
+) -> None:
+    repository = (tmp_path / "repository").resolve()
+    _new_repo(repository)
+    _write(repository, "README.md", "base\n")
+    base_sha = _commit(repository, "base")
+    for relative in (
+        "a/research.yaml",
+        "a/research.yml",
+        "b/research.yaml",
+        "b/research.yml",
+    ):
+        _write(repository, relative, "not: [valid\n")
+    fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+    valid_paths = (
+        "research.yaml",
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "baseline-train.jsonl",
+        "baseline-eval.jsonl",
+        "candidate-config.yaml",
+        "candidate-results.json",
+        "candidate-train.jsonl",
+        "candidate-eval.jsonl",
+    )
+    for relative in valid_paths:
+        _write(
+            repository,
+            f"c/{relative}",
+            (fixture / relative).read_text(encoding="utf-8"),
+        )
+    head_sha = _commit(repository, "head")
+    base_root = (tmp_path / "base").resolve()
+    _git(repository, "worktree", "add", "-q", "--detach", str(base_root), base_sha)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base_sha)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base_sha)
+    head = _identity(SnapshotRole.HEAD, repository, head_sha)
+    inventory = build_git_change_inventory(
+        requested, comparison, head, ComparisonBasis.DIRECT_BASE
+    )
+    inputs = ReviewInputs(
+        repository_root=repository,
+        pr_title="Candidate improves accuracy from 0.60 to 0.90",
+        pr_description="The bounded deterministic inputs are in c/research.yaml.",
+        requested_base=requested,
+        comparison_base=comparison,
+        head=head,
+        inventory=inventory,
+    )
+    provider = _TwoCallProvider(["preflight_pass", "preflight_pass"])
+
+    result = run_review(inputs, ReviewConfig(enabled=True), provider=provider)
+
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.preflight.scope.complete is False
+    assert "c/research.yaml" in result.preflight.scope.selected_paths
+    assert result.preflight.scope.atomic_path_groups == ()
+    assert result.deterministic_audits == ()
+    assert result.preflight.gates[2].disposition is GateDisposition.PASS_PARTIAL
+    assert "PREFLIGHT_G3_AUDIT_PLAN_OMITTED" in {
+        issue.code for issue in result.preflight.gates[2].reasons
+    }
+    assert [call.task for call in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
 
 
 def _same_head_graph(tmp_path: Path) -> dict[str, Any]:
@@ -599,7 +1233,6 @@ def test_same_head_different_base_coordinates_do_not_share_scope_or_cache(
     assert direct_inventory.entries != merge_inventory.entries
     assert first_direct.scope is not None and merge.scope is not None
     assert first_direct.scope.selected_paths != merge.scope.selected_paths
-    assert first_direct.scope.materialized_path_chars != merge.scope.materialized_path_chars
     assert serialize_preflight(first_direct) != serialize_preflight(merge)
     assert serialize_preflight(first_direct) == serialize_preflight(second_direct)
 
@@ -655,6 +1288,24 @@ def test_source_identity_detects_unreferenced_object_store_addition(
     assert after["git_object_store_sha256"] != before["git_object_store_sha256"]
 
 
+def test_replay_rejects_executable_alternate_refs_config_before_clone(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "source").resolve()
+    _new_repo(source)
+    _git(
+        source,
+        "config",
+        "core.alternateRefsCommand",
+        "claimci-test-sentinel-command",
+    )
+    empty_hooks = (tmp_path / "empty-hooks").resolve()
+    empty_hooks.mkdir()
+
+    with pytest.raises(ValueError, match="not passive"):
+        _reject_unsafe_source_config(source, empty_hooks)
+
+
 def test_metadata_digest_prunes_top_level_objects_before_descent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -684,6 +1335,29 @@ def test_metadata_digest_prunes_top_level_objects_before_descent(
     assert size == len(b"[core]\n\tbare = false\n")
 
 
+def test_review_config_provenance_parses_the_same_snapshot_it_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = (Path(__file__).parents[1] / ".claimci" / "review.yaml").read_bytes()
+    transient = original.replace(b"model: gpt-5.6-terra", b"model: transient-model")
+    assert transient != original
+    config_path = tmp_path / ".claimci" / "review.yaml"
+    config_path.parent.mkdir()
+    config_path.write_bytes(transient)
+
+    monkeypatch.setattr("scripts.replay_review_preflight._WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "scripts.replay_review_preflight._read_bounded",
+        lambda path: original if Path(path) == config_path else Path(path).read_bytes(),
+    )
+
+    config, provenance = _review_config()
+
+    assert config.model == "gpt-5.6-terra"
+    assert provenance["effective"]["model"] == "gpt-5.6-terra"
+    assert provenance["source_sha256"] == hashlib.sha256(original).hexdigest()
+
+
 def test_replay_publication_never_truncates_an_outside_hardlink_to_study_content(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -707,11 +1381,47 @@ def test_replay_publication_never_truncates_an_outside_hardlink_to_study_content
     monkeypatch.setattr(
         "scripts.replay_review_preflight.replay_candidate", provider_free_result
     )
+    runtime_code = {
+        "commit_sha": "a" * 40,
+        "tree_sha": "b" * 40,
+        "worktree_clean": True,
+    }
+    monkeypatch.setattr(
+        "scripts.replay_review_preflight._runtime_code_identity",
+        lambda: runtime_code,
+    )
 
     payload = replay_study(study, destination, fixture_directory=FIXTURES)
 
     assert payload["ready_count"] == 5
     assert payload["provider_calls"] == 0
+    assert payload["runtime_code"] == runtime_code
+    config_bytes = (
+        Path(__file__).parents[1] / ".claimci" / "review.yaml"
+    ).read_bytes()
+    assert payload["review_config"] == {
+        "source_path": ".claimci/review.yaml",
+        "source_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "effective": {
+            "schema_version": 1,
+            "enabled": True,
+            "policy": "advisory",
+            "provider": "openai",
+            "model": "gpt-5.6-terra",
+            "limits": {
+                "max_calls": 2,
+                "max_context_chars": 60_000,
+                "max_output_chars": 24_000,
+                "max_files": 24,
+                "max_file_chars": 16_000,
+                "max_claims": 16,
+                "extraction_max_output_tokens": 5_000,
+                "synthesis_max_output_tokens": 4_000,
+                "timeout_seconds": 90.0,
+                "retries": 0,
+            },
+        },
+    }
     assert frozen.read_bytes() == frozen_bytes
     assert frozen.stat().st_ino == aliased_inode
     assert destination.stat().st_ino != aliased_inode
@@ -793,6 +1503,655 @@ def test_replay_uses_disposable_local_clone_materializes_exact_merge_base_and_pr
     assert not any(temp_parent.iterdir())
 
 
+def test_replay_hydrates_exact_unchanged_literal_before_bound_preflight(
+    tmp_path: Path,
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    source = study / "paid" / "X-Supplement-1" / "head"
+    _new_repo(source)
+    _write(source, "src/accuracy.py", "EXPECTED_ACCURACY = 0.90\n")
+    base = _commit(source, "base")
+    _write(source, "results/metric.json", '{"accuracy": 0.90}\n')
+    head = _commit(source, "head")
+    metadata = study / "paid" / "X-Supplement-1" / "inputs"
+    metadata.mkdir()
+    (metadata / "frozen-coordinates.md").write_text(
+        "- Title: `Benchmark accuracy improves by 5%`\n", encoding="utf-8"
+    )
+    (metadata / "pr-description.md").write_text(
+        "The implementation is in src/accuracy.py and results/metric.json.\n",
+        encoding="utf-8",
+    )
+    candidate = FrozenCandidate(
+        schema_version=1,
+        candidate="X-Supplement-1",
+        repository="example/supplement",
+        pull_request=1,
+        requested_base_sha=base,
+        comparison_base_sha=base,
+        head_sha=head,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        declared_entry_count=1,
+        entries=(ChangeEntry("results/metric.json", ChangeStatus.ADDED),),
+    )
+    layout = CandidateInputLayout(
+        source_relative="paid/X-Supplement-1/head",
+        metadata_relative="paid/X-Supplement-1/inputs/frozen-coordinates.md",
+        metadata_kind="frozen_coordinates",
+        body_relative="paid/X-Supplement-1/inputs/pr-description.md",
+        body_capture="raw_pr_body",
+    )
+    temp_parent = (tmp_path / "supplement-replay-temporary").resolve()
+    temp_parent.mkdir()
+
+    result = replay_candidate(
+        study,
+        candidate,
+        layout,
+        ReviewConfig(enabled=True),
+        temp_parent=temp_parent,
+    )
+
+    assert result["provider_calls"] == 0
+    assert result["ready"] is True
+    assert result["preflight"]["scope"] is not None
+    assert set(result["preflight"]["scope"]["selected_paths"]) == {
+        "results/metric.json",
+        "src/accuracy.py",
+    }
+    assert result["source_before"] == result["source_after"]
+    assert not any(temp_parent.iterdir())
+
+
+def test_replay_hydrates_unchanged_manifest_and_its_dependency_closure(
+    tmp_path: Path,
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    source = study / "paid" / "X-Supplement-2" / "head"
+    _new_repo(source)
+    fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+    audit_paths = (
+        "research.yaml",
+        "baseline-config.yaml",
+        "baseline-results.json",
+        "baseline-train.jsonl",
+        "baseline-eval.jsonl",
+        "candidate-config.yaml",
+        "candidate-results.json",
+        "candidate-train.jsonl",
+        "candidate-eval.jsonl",
+    )
+    for relative in audit_paths:
+        _write(source, relative, (fixture / relative).read_text(encoding="utf-8"))
+    base = _commit(source, "base")
+    _write(source, "candidate-results.json", '{"accuracy": 0.95}\n')
+    head = _commit(source, "head")
+    metadata = study / "paid" / "X-Supplement-2" / "inputs"
+    metadata.mkdir()
+    (metadata / "frozen-coordinates.md").write_text(
+        "- Title: `Candidate accuracy improves from 0.60 to 0.95`\n",
+        encoding="utf-8",
+    )
+    (metadata / "pr-description.md").write_text(
+        "The bounded deterministic inputs are declared in research.yaml.\n",
+        encoding="utf-8",
+    )
+    candidate = FrozenCandidate(
+        schema_version=1,
+        candidate="X-Supplement-2",
+        repository="example/supplement",
+        pull_request=2,
+        requested_base_sha=base,
+        comparison_base_sha=base,
+        head_sha=head,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        declared_entry_count=1,
+        entries=(ChangeEntry("candidate-results.json", ChangeStatus.MODIFIED),),
+    )
+    layout = CandidateInputLayout(
+        source_relative="paid/X-Supplement-2/head",
+        metadata_relative="paid/X-Supplement-2/inputs/frozen-coordinates.md",
+        metadata_kind="frozen_coordinates",
+        body_relative="paid/X-Supplement-2/inputs/pr-description.md",
+        body_capture="raw_pr_body",
+    )
+    temp_parent = (tmp_path / "manifest-replay-temporary").resolve()
+    temp_parent.mkdir()
+
+    result = replay_candidate(
+        study,
+        candidate,
+        layout,
+        ReviewConfig(enabled=True),
+        temp_parent=temp_parent,
+    )
+
+    assert result["provider_calls"] == 0
+    assert result["ready"] is True
+    assert result["preflight"]["scope"] is not None
+    assert set(audit_paths).issubset(
+        result["preflight"]["scope"]["selected_paths"]
+    )
+    assert result["source_before"] == result["source_after"]
+    assert not any(temp_parent.iterdir())
+
+
+def test_gate3_trim_drops_unbound_path_scoped_locality_facts(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "trim-head").resolve()
+    _new_repo(source)
+    _write(source, "README.md", "base\n")
+    base = _commit(source, "base")
+    _write(source, "results/a.json", '{"accuracy":0.95}\n')
+    for index in range(4):
+        _write(
+            source,
+            f"docs/d{index}.md",
+            "".join(
+                f"background doc {index} line {line}\n"
+                for line in range(2_000)
+            ),
+        )
+    head = _commit(source, "head")
+    base_root = (tmp_path / "trim-base").resolve()
+    _git(source, "worktree", "add", "-q", "--detach", str(base_root), base)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base)
+    exact_head = _identity(SnapshotRole.HEAD, source, head)
+    inventory = build_git_change_inventory(
+        requested,
+        comparison,
+        exact_head,
+        ComparisonBasis.DIRECT_BASE,
+    )
+
+    review = run_review(
+        ReviewInputs(
+            repository_root=source,
+            base_root=base_root,
+            pr_title="Benchmark accuracy improves by 5%",
+            pr_description="Benchmark evidence: results/a.json",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=exact_head,
+            inventory=inventory,
+        ),
+        ReviewConfig(
+            enabled=True,
+            limits=ReviewLimits(
+                max_context_chars=38_000,
+                max_file_chars=16_000,
+            ),
+        ),
+        preflight_only=True,
+    )
+
+    assert review.preflight is not None and review.preflight.ready_for_provider
+    assert review.preflight.scope is not None
+    scope = review.preflight.scope
+    trimmed = {"docs/d2.md", "docs/d3.md"}
+    assert trimmed.isdisjoint(scope.selected_paths)
+    assert {
+        issue.code for issue in scope.issues if issue.path in trimmed
+    } == {"PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT"}
+    assert not [
+        issue
+        for gate in review.preflight.gates
+        for issue in gate.reasons
+        if issue.path in trimmed
+        and issue.code != "PREFLIGHT_G3_ROUTABLE_PATH_INDEX_LIMIT"
+    ]
+
+
+def test_replay_does_not_hydrate_large_unselected_changed_other_file(
+    tmp_path: Path,
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    source = study / "paid" / "X-Sparse-1" / "head"
+    _new_repo(source)
+    _write(source, "README.md", "baseline\n")
+    base = _commit(source, "base")
+    unrelated = source / "assets" / "unrelated.bin"
+    unrelated.parent.mkdir()
+    unrelated.write_bytes(b"x" * 16_777_217)
+    _write(source, "results/metric.json", '{"accuracy": 0.90}\n')
+    head = _commit(source, "head")
+    metadata = study / "paid" / "X-Sparse-1" / "inputs"
+    metadata.mkdir()
+    (metadata / "frozen-coordinates.md").write_text(
+        "- Title: `Benchmark accuracy improves by 5%`\n", encoding="utf-8"
+    )
+    (metadata / "pr-description.md").write_text(
+        "The result is in results/metric.json.\n",
+        encoding="utf-8",
+    )
+    candidate = FrozenCandidate(
+        schema_version=1,
+        candidate="X-Sparse-1",
+        repository="example/sparse",
+        pull_request=1,
+        requested_base_sha=base,
+        comparison_base_sha=base,
+        head_sha=head,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        declared_entry_count=2,
+        entries=(
+            ChangeEntry("assets/unrelated.bin", ChangeStatus.ADDED),
+            ChangeEntry("results/metric.json", ChangeStatus.ADDED),
+        ),
+    )
+    layout = CandidateInputLayout(
+        source_relative="paid/X-Sparse-1/head",
+        metadata_relative="paid/X-Sparse-1/inputs/frozen-coordinates.md",
+        metadata_kind="frozen_coordinates",
+        body_relative="paid/X-Sparse-1/inputs/pr-description.md",
+        body_capture="raw_pr_body",
+    )
+    temp_parent = (tmp_path / "sparse-replay-temporary").resolve()
+    temp_parent.mkdir()
+
+    result = replay_candidate(
+        study,
+        candidate,
+        layout,
+        ReviewConfig(enabled=True),
+        temp_parent=temp_parent,
+    )
+
+    assert result["provider_calls"] == 0
+    assert result["ready"] is True
+    assert result["preflight"]["scope"] is not None
+    assert result["preflight"]["scope"]["selected_paths"] == [
+        "results/metric.json"
+    ]
+    assert result["source_before"] == result["source_after"]
+    assert not any(temp_parent.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("omission", "safe_alternative", "expected_code"),
+    (
+        ("non_utf8", True, "PREFLIGHT_G2_CANDIDATE_UNREADABLE"),
+        ("too_large", True, "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"),
+        ("non_utf8", False, "PREFLIGHT_G2_CANDIDATE_UNREADABLE"),
+        ("too_large", False, "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"),
+    ),
+)
+def test_sparse_replay_preserves_exact_changed_candidate_omissions(
+    tmp_path: Path,
+    omission: str,
+    safe_alternative: bool,
+    expected_code: str,
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    source = study / "paid" / "X-Omission-1" / "head"
+    _new_repo(source)
+    _write(source, "README.md", "baseline\n")
+    base = _commit(source, "base")
+    omitted_path = source / "results" / "a-omitted.json"
+    omitted_path.parent.mkdir()
+    if omission == "non_utf8":
+        omitted_path.write_bytes(b'{"accuracy": "\xff"}\n')
+    else:
+        omitted_path.write_bytes(b"x" * 16_777_217)
+    entries = [ChangeEntry("results/a-omitted.json", ChangeStatus.ADDED)]
+    if safe_alternative:
+        _write(source, "results/z-safe.json", '{"accuracy": 0.90}\n')
+        entries.append(ChangeEntry("results/z-safe.json", ChangeStatus.ADDED))
+    head = _commit(source, "head")
+    metadata = study / "paid" / "X-Omission-1" / "inputs"
+    metadata.mkdir()
+    (metadata / "frozen-coordinates.md").write_text(
+        "- Title: `Benchmark accuracy improves by 5%`\n", encoding="utf-8"
+    )
+    description = (
+        "Inspect the changed results for the reported accuracy improvement.\n"
+    )
+    (metadata / "pr-description.md").write_text(description, encoding="utf-8")
+    candidate = FrozenCandidate(
+        schema_version=1,
+        candidate="X-Omission-1",
+        repository="example/omission",
+        pull_request=1,
+        requested_base_sha=base,
+        comparison_base_sha=base,
+        head_sha=head,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        declared_entry_count=len(entries),
+        entries=tuple(entries),
+    )
+    layout = CandidateInputLayout(
+        source_relative="paid/X-Omission-1/head",
+        metadata_relative="paid/X-Omission-1/inputs/frozen-coordinates.md",
+        metadata_kind="frozen_coordinates",
+        body_relative="paid/X-Omission-1/inputs/pr-description.md",
+        body_capture="raw_pr_body",
+    )
+    base_root = (tmp_path / f"{omission}-{safe_alternative}-base").resolve()
+    _git(source, "worktree", "add", "-q", "--detach", str(base_root), base)
+    inventory = build_git_change_inventory(
+        _identity(SnapshotRole.REQUESTED_BASE, base_root, base),
+        _identity(SnapshotRole.COMPARISON_BASE, base_root, base),
+        _identity(SnapshotRole.HEAD, source, head),
+        ComparisonBasis.DIRECT_BASE,
+    )
+    direct = run_review(
+        ReviewInputs(
+            repository_root=source,
+            base_root=base_root,
+            pr_title="Benchmark accuracy improves by 5%",
+            pr_description=description,
+            requested_base=_identity(SnapshotRole.REQUESTED_BASE, base_root, base),
+            comparison_base=_identity(
+                SnapshotRole.COMPARISON_BASE, base_root, base
+            ),
+            head=_identity(SnapshotRole.HEAD, source, head),
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+        preflight_only=True,
+    )
+    assert direct.preflight is not None
+    temp_parent = (tmp_path / f"{omission}-{safe_alternative}-temporary").resolve()
+    temp_parent.mkdir()
+
+    replay = replay_candidate(
+        study,
+        candidate,
+        layout,
+        ReviewConfig(enabled=True),
+        temp_parent=temp_parent,
+    )
+
+    assert replay["provider_calls"] == 0
+    assert replay["ready"] is safe_alternative
+    assert replay["preflight"] == serialize_preflight(direct.preflight)
+    assert replay["preflight"]["gates"][1]["disposition"] == (
+        "pass_partial" if safe_alternative else "fail"
+    )
+    assert expected_code in {
+        reason["code"]
+        for reason in replay["preflight"]["gates"][1]["issues"]
+    }
+    assert replay["source_before"] == replay["source_after"]
+    assert not any(temp_parent.iterdir())
+
+
+def test_sparse_replay_preserves_oversized_comparison_candidate_omission(
+    tmp_path: Path,
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    source = study / "paid" / "X-Comparison-Omission-1" / "head"
+    _new_repo(source)
+    oversized = source / "src" / "metric.py"
+    oversized.parent.mkdir()
+    oversized.write_bytes(b"x" * 16_777_217)
+    base = _commit(source, "base")
+    _write(source, "src/metric.py", "ACCURACY = 0.90\n")
+    _write(source, "results/safe.json", '{"accuracy": 0.90}\n')
+    head = _commit(source, "head")
+    metadata = study / "paid" / "X-Comparison-Omission-1" / "inputs"
+    metadata.mkdir()
+    (metadata / "frozen-coordinates.md").write_text(
+        "- Title: `Benchmark accuracy improves by 5%`\n", encoding="utf-8"
+    )
+    description = "Inspect src/metric.py and results/safe.json for the result.\n"
+    (metadata / "pr-description.md").write_text(
+        description, encoding="utf-8"
+    )
+    entries = (
+        ChangeEntry("results/safe.json", ChangeStatus.ADDED),
+        ChangeEntry("src/metric.py", ChangeStatus.MODIFIED),
+    )
+    candidate = FrozenCandidate(
+        schema_version=1,
+        candidate="X-Comparison-Omission-1",
+        repository="example/comparison-omission",
+        pull_request=1,
+        requested_base_sha=base,
+        comparison_base_sha=base,
+        head_sha=head,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        declared_entry_count=len(entries),
+        entries=entries,
+    )
+    layout = CandidateInputLayout(
+        source_relative="paid/X-Comparison-Omission-1/head",
+        metadata_relative=(
+            "paid/X-Comparison-Omission-1/inputs/frozen-coordinates.md"
+        ),
+        metadata_kind="frozen_coordinates",
+        body_relative="paid/X-Comparison-Omission-1/inputs/pr-description.md",
+        body_capture="raw_pr_body",
+    )
+    base_root = (tmp_path / "comparison-omission-base").resolve()
+    _git(source, "worktree", "add", "-q", "--detach", str(base_root), base)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base)
+    exact_head = _identity(SnapshotRole.HEAD, source, head)
+    inventory = build_git_change_inventory(
+        requested,
+        comparison,
+        exact_head,
+        ComparisonBasis.DIRECT_BASE,
+    )
+    direct = run_review(
+        ReviewInputs(
+            repository_root=source,
+            base_root=base_root,
+            pr_title="Benchmark accuracy improves by 5%",
+            pr_description=description,
+            requested_base=requested,
+            comparison_base=comparison,
+            head=exact_head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+        preflight_only=True,
+    )
+    assert direct.preflight is not None
+    temp_parent = (tmp_path / "comparison-omission-temporary").resolve()
+    temp_parent.mkdir()
+
+    replay = replay_candidate(
+        study,
+        candidate,
+        layout,
+        ReviewConfig(enabled=True),
+        temp_parent=temp_parent,
+    )
+
+    assert replay["provider_calls"] == 0
+    assert replay["ready"] is True
+    assert replay["preflight"] == serialize_preflight(direct.preflight)
+    assert replay["preflight"]["gates"][1]["disposition"] == "pass_partial"
+    assert "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE" in {
+        reason["code"]
+        for reason in replay["preflight"]["gates"][1]["issues"]
+    }
+    assert replay["source_before"] == replay["source_after"]
+    assert not any(temp_parent.iterdir())
+
+
+@pytest.mark.parametrize("route", ("exact_literal", "manifest_dependency"))
+def test_sparse_replay_preserves_oversized_unchanged_supplement_omission(
+    tmp_path: Path,
+    route: str,
+) -> None:
+    study = (tmp_path / "ClaimCI-External-Study-2026-09-02").resolve()
+    source = study / "paid" / "X-Unchanged-Omission-1" / "head"
+    _new_repo(source)
+    if route == "exact_literal":
+        omitted_relative = "src/reference.py"
+        description = (
+            "Inspect src/reference.py and results/safe.json for the result.\n"
+        )
+    else:
+        fixture = Path(__file__).parents[1] / "examples" / "day2_demo"
+        for relative in (
+            "research.yaml",
+            "baseline-config.yaml",
+            "baseline-results.json",
+            "baseline-train.jsonl",
+            "baseline-eval.jsonl",
+            "candidate-config.yaml",
+            "candidate-results.json",
+            "candidate-train.jsonl",
+            "candidate-eval.jsonl",
+        ):
+            _write(
+                source,
+                relative,
+                (fixture / relative).read_text(encoding="utf-8"),
+            )
+        omitted_relative = "candidate-eval.jsonl"
+        description = (
+            "Audit inputs are declared in research.yaml; inspect "
+            "results/safe.json for the result.\n"
+        )
+    omitted = source / omitted_relative
+    omitted.parent.mkdir(parents=True, exist_ok=True)
+    omitted.write_bytes(b"x" * 16_777_217)
+    base = _commit(source, "base")
+    _write(source, "results/safe.json", '{"accuracy": 0.90}\n')
+    head = _commit(source, "head")
+    metadata = study / "paid" / "X-Unchanged-Omission-1" / "inputs"
+    metadata.mkdir()
+    (metadata / "frozen-coordinates.md").write_text(
+        "- Title: `Benchmark accuracy improves by 5%`\n", encoding="utf-8"
+    )
+    (metadata / "pr-description.md").write_text(description, encoding="utf-8")
+    entry = ChangeEntry("results/safe.json", ChangeStatus.ADDED)
+    candidate = FrozenCandidate(
+        schema_version=1,
+        candidate="X-Unchanged-Omission-1",
+        repository="example/unchanged-omission",
+        pull_request=1,
+        requested_base_sha=base,
+        comparison_base_sha=base,
+        head_sha=head,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        declared_entry_count=1,
+        entries=(entry,),
+    )
+    layout = CandidateInputLayout(
+        source_relative="paid/X-Unchanged-Omission-1/head",
+        metadata_relative=(
+            "paid/X-Unchanged-Omission-1/inputs/frozen-coordinates.md"
+        ),
+        metadata_kind="frozen_coordinates",
+        body_relative="paid/X-Unchanged-Omission-1/inputs/pr-description.md",
+        body_capture="raw_pr_body",
+    )
+    base_root = (tmp_path / f"{route}-unchanged-base").resolve()
+    _git(source, "worktree", "add", "-q", "--detach", str(base_root), base)
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base)
+    exact_head = _identity(SnapshotRole.HEAD, source, head)
+    inventory = build_git_change_inventory(
+        requested,
+        comparison,
+        exact_head,
+        ComparisonBasis.DIRECT_BASE,
+    )
+    direct = run_review(
+        ReviewInputs(
+            repository_root=source,
+            base_root=base_root,
+            pr_title="Benchmark accuracy improves by 5%",
+            pr_description=description,
+            requested_base=requested,
+            comparison_base=comparison,
+            head=exact_head,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+        preflight_only=True,
+    )
+    assert direct.preflight is not None
+    temp_parent = (tmp_path / f"{route}-unchanged-temporary").resolve()
+    temp_parent.mkdir()
+
+    replay = replay_candidate(
+        study,
+        candidate,
+        layout,
+        ReviewConfig(enabled=True),
+        temp_parent=temp_parent,
+    )
+
+    assert replay["provider_calls"] == 0
+    assert replay["ready"] is True
+    assert replay["preflight"] == serialize_preflight(direct.preflight)
+    assert replay["preflight"]["gates"][1]["disposition"] == "pass_partial"
+    assert {
+        "code": "PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+        "path": omitted_relative,
+        "observed": 16_777_217,
+        "limit": 16_777_216,
+    } in replay["preflight"]["gates"][1]["issues"]
+    assert replay["source_before"] == replay["source_after"]
+    assert not any(temp_parent.iterdir())
+
+
+def test_forged_sparse_oversize_fact_is_rejected_by_exact_source_size(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "forged-omission-source").resolve()
+    _new_repo(source)
+    _write(source, "README.md", "baseline\n")
+    base = _commit(source, "base")
+    _write(source, "results/metric.json", '{"accuracy": 0.90}\n')
+    head = _commit(source, "head")
+    base_root = (tmp_path / "forged-omission-base").resolve()
+    _git(source, "worktree", "add", "-q", "--detach", str(base_root), base)
+    sparse_root = (tmp_path / "forged-omission-sparse-head").resolve()
+    sparse_root.mkdir()
+    requested = _identity(SnapshotRole.REQUESTED_BASE, base_root, base)
+    comparison = _identity(SnapshotRole.COMPARISON_BASE, base_root, base)
+    exact_head = _identity(SnapshotRole.HEAD, source, head)
+    inventory = build_git_change_inventory(
+        requested,
+        comparison,
+        exact_head,
+        ComparisonBasis.DIRECT_BASE,
+    )
+    object_id = _git(source, "rev-parse", f"{head}:results/metric.json")
+    forged = ExactMaterialOmission(
+        role=SnapshotRole.HEAD,
+        source=exact_head,
+        path="results/metric.json",
+        object_id=object_id,
+        observed=16_777_217,
+        limit=16_777_216,
+        code="PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+    )
+    assert not exact_git_material_omission_matches(forged, exact_head)
+
+    scope = build_review_scope(
+        ReviewInputs(
+            repository_root=sparse_root,
+            base_root=base_root,
+            pr_title="Benchmark accuracy improves by 5%",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=exact_head,
+            inventory=inventory,
+            exact_material_omissions=(forged,),
+        ),
+        ReviewConfig(enabled=True),
+        inventory,
+    )
+
+    assert "PREFLIGHT_G1_MATERIAL_PATH_NOT_REGULAR" in {
+        issue.code for issue in scope.issues
+    }
+    assert "PREFLIGHT_G2_CANDIDATE_TOO_LARGE" not in {
+        issue.code for issue in scope.issues
+    }
+
+
 def test_replay_partial_source_never_fetches_missing_unrelated_blob(
     tmp_path: Path,
 ) -> None:
@@ -859,18 +2218,23 @@ def test_cold_provider_free_preflight_imports_no_openai_adapter_or_sdk(tmp_path:
 import pathlib
 import sys
 import tempfile
-from types import SimpleNamespace
 sys.path.insert(0, str(pathlib.Path.cwd()))
 import scripts.replay_review_preflight as replay
 with tempfile.TemporaryDirectory() as raw:
     root = pathlib.Path(raw).resolve()
-    inputs = SimpleNamespace(
+    inputs = replay.ReviewInputs(
         repository_root=root, base_root=None, pr_title="Documentation cleanup",
         pr_description="", requested_base=None, comparison_base=None, head=None,
         inventory=None, coordinates=None, inventory_failure=None,
     )
-    result = replay.preflight_review(inputs, replay.ReviewConfig(enabled=True))
-    assert not result.ready_for_provider
+    review = replay.run_review(
+        inputs, replay.ReviewConfig(enabled=True), preflight_only=True
+    )
+    assert review.preflight is not None
+    assert not review.preflight.ready_for_provider
+    assert review.provider_lifecycle.value == "not_attempted"
+    assert review.provider_attempt_count == 0
+    assert review.provider_calls == ()
 assert "claimci.review.openai_provider" not in sys.modules
 assert "openai" not in sys.modules
 '''

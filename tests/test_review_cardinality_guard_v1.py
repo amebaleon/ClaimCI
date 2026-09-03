@@ -10,6 +10,7 @@ from claimci.review.evidence import EvidenceKind, EvidenceProvenance
 from claimci.review.models import ProviderUsage, ReviewConfig, ReviewLimits, ReviewStatus
 from claimci.review.orchestrator import ReviewInputs, run_review
 from claimci.review.provider import ProviderResponse, StructuredRequest
+from claimci.review.request_budget import MAX_DETERMINISTIC_JAVA_TEST_COUNT
 
 
 TEST_PATH = (
@@ -283,8 +284,8 @@ def _run(
     description: str = COUNT_CLAIM,
 ):
     route_path = (
-        "docs/review.md"
-        if (repository_root / "docs" / "review.md").is_file()
+        "scripts/run-eval.sh"
+        if (repository_root / "scripts" / "run-eval.sh").is_file()
         else TEST_PATH
     )
     result = run_review(
@@ -361,6 +362,49 @@ def test_fixed_java_lexical_grammar_counts_only_standalone_test_annotations(
     assert synthesis.payload["evidence"][0]["excerpt_locality"] == "complete_file"
 
 
+def test_uninspectable_java_cardinality_is_constrained_without_copying_huge_count(
+    tmp_path: Path,
+) -> None:
+    """An impossible bounded-file count must not make synthesis unreservable."""
+
+    class OutOfDomainProvider(_ConstraintAwareProvider):
+        def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
+            source = _description_source(request)
+            candidate = _count_candidate(source)
+            candidate["claimed_magnitude"] = {
+                "raw": "an uninspectably large number of test cases",
+                "value": MAX_DETERMINISTIC_JAVA_TEST_COUNT + 1,
+                "unit": "cases",
+                "kind": "absolute",
+            }
+            self.calls.append(request)
+            return _provider_response(
+                request,
+                json.dumps({"claims": [candidate]}),
+                index=len(self.calls),
+            )
+
+    repository = tmp_path / "head"
+    repository.mkdir()
+    _write(repository, TEST_PATH, COMPLETE_EIGHT_TEST_SOURCE)
+    provider = OutOfDomainProvider()
+
+    result = _run(repository, provider)
+
+    synthesis = provider.calls[1]
+    claim_id = synthesis.payload["claims"][0]["claim_id"]
+    constraint = synthesis.payload["interpretation_constraints_by_claim_id"][
+        claim_id
+    ]
+    assert constraint["kind"] == "java_test_cardinality"
+    assert constraint["state"] == "out_of_bounds"
+    assert constraint["claimed_count"] is None
+    assert constraint["limit"] == MAX_DETERMINISTIC_JAVA_TEST_COUNT
+    assert constraint["required_citations"] == []
+    assert result.interpretations[0].citations == ()
+    assert "cannot verify" in result.interpretations[0].interpretation.casefold()
+
+
 def test_incomplete_unlocalized_java_test_excerpt_cannot_verify_exact_count(
     tmp_path: Path,
 ) -> None:
@@ -392,7 +436,7 @@ final class DatasetServiceEnrichmentTest {
     head = tmp_path / "head"
     head.mkdir()
     _write(head, TEST_PATH, source)
-    _write(head, "docs/review.md", "Bounded review context.\n")
+    _write(head, "scripts/run-eval.sh", "#!/bin/sh\nexit 0\n")
     provider = _ConstraintAwareProvider()
 
     # The added file is explicitly issued, but its bounded prefix cannot stand
@@ -433,7 +477,7 @@ def test_unavailable_exact_java_test_evidence_cannot_verify_exact_count(
     repository = tmp_path / "head"
     repository.mkdir()
     _write(repository, TEST_PATH, "")
-    _write(repository, "docs/review.md", "Bounded review context.\n")
+    _write(repository, "scripts/run-eval.sh", "#!/bin/sh\nexit 0\n")
     provider = _ConstraintAwareProvider()
 
     result = _run(repository, provider)
@@ -490,6 +534,37 @@ final class DatasetServiceEnrichmentTest {
     void actualCase() {}
 }
 """
+    _write(repository, TEST_PATH, source)
+    provider = _ConstraintAwareProvider()
+
+    result = _run(repository, provider)
+
+    synthesis = provider.calls[1]
+    claim_id = synthesis.payload["claims"][0]["claim_id"]
+    constraint = synthesis.payload["interpretation_constraints_by_claim_id"][claim_id]
+    assert constraint["state"] == "incomplete"
+    assert constraint["observed_count"] is None
+    assert constraint["required_citations"] == []
+    assert result.status is ReviewStatus.COMPLETE
+    assert "cannot verify" in result.interpretations[0].interpretation.casefold()
+
+
+def test_java_text_block_escape_ambiguity_yields_no_deterministic_count(
+    tmp_path: Path,
+) -> None:
+    """Escaped quotes in a text block must not expose string content as code."""
+
+    repository = tmp_path / "head"
+    repository.mkdir()
+    source = (
+        "final class DatasetServiceEnrichmentTest {\n"
+        '    String content = """\n'
+        '        \\"""\n'
+        "        @Test\n"
+        '        \\"""\n'
+        '        """;\n'
+        "}\n"
+    )
     _write(repository, TEST_PATH, source)
     provider = _ConstraintAwareProvider()
 

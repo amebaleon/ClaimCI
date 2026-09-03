@@ -31,6 +31,7 @@ from claimci.review.models import (
     MaterialClaimSeed,
     PreflightGateResult,
     ProviderCallRecord,
+    ProviderLifecycle,
     ProviderUsage,
     ReviewPreflight,
     ReviewScope,
@@ -316,6 +317,8 @@ def _review_fixture() -> ResearchReview:
         ),
         deterministic_audits=(deterministic,),
         provider_calls=calls,
+        provider_lifecycle=ProviderLifecycle.RESPONSE_RECEIVED,
+        provider_attempt_count=2,
         usage=ProviderUsage(
             input_tokens=50,
             output_tokens=15,
@@ -399,6 +402,9 @@ def test_review_json_is_advisory_schema_versioned_deterministic_and_complete() -
         "extract_claims",
         "synthesize_review",
     ]
+    assert payload["provider"]["lifecycle"] == "response_received"
+    assert payload["provider"]["attempted_call_count"] == 2
+    assert payload["provider"]["completed_response_count"] == 2
 
     claim_z = next(claim for claim in payload["claims"] if claim["claim_id"] == "claim-z")
     assert claim_z["source_text"] == _DESCRIPTION_QUOTE
@@ -433,6 +439,37 @@ def test_review_json_is_advisory_schema_versioned_deterministic_and_complete() -
     # JSON may preserve untrusted text as data, but it must never emit invalid
     # JSON constants or a model-derived deterministic section.
     assert "NaN" not in first and "Infinity" not in first
+
+
+def test_provider_report_distinguishes_no_attempt_from_unknown_failed_attempt() -> None:
+    no_attempt = ResearchReview(status=ReviewStatus.DISABLED)
+    failed_attempt = ResearchReview(
+        status=ReviewStatus.UNAVAILABLE,
+        provider_lifecycle=ProviderLifecycle.FAILED_BEFORE_RESPONSE,
+        provider_attempt_count=1,
+    )
+
+    no_attempt_payload = json.loads(render_review_json(no_attempt))["provider"]
+    failed_payload = json.loads(render_review_json(failed_attempt))["provider"]
+
+    assert no_attempt_payload["lifecycle"] == "not_attempted"
+    assert no_attempt_payload["attempted_call_count"] == 0
+    assert no_attempt_payload["completed_response_count"] == 0
+    assert no_attempt_payload["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost_usd": 0.0,
+    }
+    assert failed_payload["lifecycle"] == "failed_before_response"
+    assert failed_payload["attempted_call_count"] == 1
+    assert failed_payload["completed_response_count"] == 0
+    assert failed_payload["usage"] == {
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+        "estimated_cost_usd": None,
+    }
 
 
 def test_review_markdown_is_advisory_escaped_and_parity_preserving() -> None:

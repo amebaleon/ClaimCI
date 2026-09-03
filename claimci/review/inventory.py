@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from .models import (
@@ -15,6 +16,7 @@ from .models import (
     ChangeInventorySource,
     ChangeStatus,
     ComparisonBasis,
+    ExactMaterialOmission,
     MAX_CHANGE_INVENTORY_ENTRIES,
     ReviewError,
     SnapshotIdentity,
@@ -23,6 +25,7 @@ from .models import (
 
 
 MAX_CHANGESET_METADATA_BYTES = 1024 * 1024
+MAX_SELECTED_MATERIAL_BYTES = 16 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 10.0
 _MAX_GIT_ERROR_BYTES = 4_096
 
@@ -430,3 +433,362 @@ def build_git_change_inventory(
             "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
             "Git change metadata could not form a valid inventory",
         ) from exc
+
+
+def _git_blob_descriptor(
+    root: Path,
+    commit_sha: str,
+    path: str,
+) -> tuple[int, str] | None:
+    """Return one exact committed regular blob's size and object ID."""
+
+    try:
+        encoded = _run_git(
+            root,
+            (
+                "ls-tree",
+                "-l",
+                "-z",
+                "--full-tree",
+                commit_sha,
+                "--",
+                path,
+            ),
+            stdout_limit=8_192,
+        )
+    except (_GitCommandError, _GitOutputLimitError) as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected material Git identity is unavailable",
+        ) from exc
+    if not encoded:
+        return None
+    records = encoded.split(b"\0")
+    if len(records) != 2 or records[1] or b"\t" not in records[0]:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material Git metadata is malformed",
+        )
+    metadata, raw_path = records[0].split(b"\t", 1)
+    fields = metadata.split()
+    try:
+        decoded_path = raw_path.decode("utf-8", errors="strict")
+        size = int(fields[3].decode("ascii"))
+        object_id = fields[2].decode("ascii")
+    except (IndexError, UnicodeDecodeError, ValueError) as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material Git metadata is malformed",
+        ) from exc
+    if (
+        len(fields) != 4
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+        or decoded_path != path
+        or size < 0
+    ):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material is not an exact regular Git blob",
+        )
+    if len(object_id) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in object_id
+    ):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material Git object ID is malformed",
+        )
+    return size, object_id
+
+
+def git_blob_descriptor(
+    identity: SnapshotIdentity,
+    path: str,
+) -> tuple[int, str] | None:
+    """Return bounded metadata for one canonical path at an exact snapshot."""
+
+    if not isinstance(identity, SnapshotIdentity):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected material snapshot identity is invalid",
+        )
+    try:
+        canonical = ChangeEntry(path=path, status=ChangeStatus.MODIFIED).path
+    except ReviewError as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH",
+            "selected material path is invalid",
+        ) from exc
+    if canonical != path:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH",
+            "selected material path is not canonical",
+        )
+    return _git_blob_descriptor(identity.root, identity.sha, canonical)
+
+
+def git_blob_object_id(
+    identity: SnapshotIdentity,
+    path: str,
+) -> str | None:
+    """Return one exact regular blob ID without requiring its content or size."""
+
+    if not isinstance(identity, SnapshotIdentity):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected material snapshot identity is invalid",
+        )
+    try:
+        canonical = ChangeEntry(path=path, status=ChangeStatus.MODIFIED).path
+    except ReviewError as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH",
+            "selected material path is invalid",
+        ) from exc
+    if canonical != path:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH",
+            "selected material path is not canonical",
+        )
+    try:
+        encoded = _run_git(
+            identity.root,
+            (
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                identity.sha,
+                "--",
+                canonical,
+            ),
+            stdout_limit=8_192,
+        )
+    except (_GitCommandError, _GitOutputLimitError) as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected material Git identity is unavailable",
+        ) from exc
+    if not encoded:
+        return None
+    records = encoded.split(b"\0")
+    if len(records) != 2 or records[1] or b"\t" not in records[0]:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material Git metadata is malformed",
+        )
+    metadata, raw_path = records[0].split(b"\t", 1)
+    fields = metadata.split()
+    try:
+        decoded_path = raw_path.decode("utf-8", errors="strict")
+        object_id = fields[2].decode("ascii")
+    except (IndexError, UnicodeDecodeError) as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material Git metadata is malformed",
+        ) from exc
+    if (
+        len(fields) != 3
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+        or decoded_path != canonical
+        or len(object_id) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in object_id)
+    ):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+            "selected material is not an exact regular Git blob",
+        )
+    return object_id
+
+
+def exact_git_material_omission_matches(
+    omission: ExactMaterialOmission,
+    identity: SnapshotIdentity,
+) -> bool:
+    """Bind a sparse size fact to its source descriptor and target tree entry."""
+
+    if (
+        not isinstance(omission, ExactMaterialOmission)
+        or not isinstance(identity, SnapshotIdentity)
+        or omission.source.role is not omission.role
+        or identity.role is not omission.role
+        or omission.source.sha != identity.sha
+    ):
+        return False
+    try:
+        source_descriptor = git_blob_descriptor(omission.source, omission.path)
+        target_object_id = git_blob_object_id(identity, omission.path)
+    except InventoryVerificationError:
+        return False
+    return (
+        source_descriptor == (omission.observed, omission.object_id)
+        and target_object_id == omission.object_id
+    )
+
+
+def _read_git_blob(
+    identity: SnapshotIdentity,
+    path: str,
+    *,
+    max_bytes: int,
+    maximum_allowed_bytes: int,
+) -> bytes | None:
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 0 <= max_bytes <= maximum_allowed_bytes
+    ):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected Git blob read bound is invalid",
+        )
+    descriptor = git_blob_descriptor(identity, path)
+    if descriptor is None or descriptor[0] > max_bytes:
+        return None
+    size, object_id = descriptor
+    try:
+        content = _run_git(
+            identity.root,
+            ("cat-file", "blob", object_id),
+            stdout_limit=max_bytes,
+        )
+    except (_GitCommandError, _GitOutputLimitError) as exc:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected Git blob content is unavailable",
+        ) from exc
+    if len(content) != size:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected Git blob content size is inconsistent",
+        )
+    return content
+
+
+def read_git_blob(
+    identity: SnapshotIdentity,
+    path: str,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    """Read one exact metadata blob within the one-mebibyte metadata cap."""
+
+    return _read_git_blob(
+        identity,
+        path,
+        max_bytes=max_bytes,
+        maximum_allowed_bytes=MAX_CHANGESET_METADATA_BYTES,
+    )
+
+
+def read_git_material_blob(
+    identity: SnapshotIdentity,
+    path: str,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    """Read one selected exact Git blob within the materialization byte cap."""
+
+    return _read_git_blob(
+        identity,
+        path,
+        max_bytes=max_bytes,
+        maximum_allowed_bytes=MAX_SELECTED_MATERIAL_BYTES,
+    )
+
+
+def verify_git_material_identities(
+    comparison_base: SnapshotIdentity,
+    head: SnapshotIdentity,
+    inventory: ChangeInventory,
+    selected_paths: Sequence[str],
+    head_identities: Mapping[str, tuple[int, str, str]],
+    comparison_identities: Mapping[str, tuple[int, str, str] | None],
+    *,
+    max_files: int,
+) -> None:
+    """Bind selected descriptor captures to exact comparison/head blob IDs."""
+
+    selected = tuple(selected_paths)
+    if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files < 1:
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected material identity bound is invalid",
+        )
+    if (
+        not isinstance(comparison_base, SnapshotIdentity)
+        or not isinstance(head, SnapshotIdentity)
+        or not isinstance(inventory, ChangeInventory)
+        or not isinstance(selected_paths, Sequence)
+        or isinstance(selected_paths, (str, bytes))
+        or len(selected) > max_files
+        or len(set(selected)) != len(selected)
+        or set(head_identities) != set(selected)
+        or set(comparison_identities) != set(selected)
+    ):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "selected material identity contract is invalid",
+        )
+
+    status_by_path = {entry.path: entry.status for entry in inventory.entries}
+
+    def matches_blob(
+        captured: tuple[int, str, str],
+        blob: tuple[int, str],
+    ) -> bool:
+        size, sha1, sha256 = captured
+        blob_size, object_id = blob
+        return size == blob_size and object_id == (
+            sha1 if len(object_id) == 40 else sha256
+        )
+
+    for path in selected:
+        status = status_by_path.get(path)
+        if status not in {None, ChangeStatus.ADDED, ChangeStatus.MODIFIED}:
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+                "selected material has an invalid exact inventory status",
+            )
+        head_blob = _git_blob_descriptor(
+            head.root,
+            head.sha,
+            path,
+        )
+        if head_blob is None:
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                "selected material is absent from the exact head commit",
+            )
+        if not matches_blob(head_identities[path], head_blob):
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                "selected material does not match the exact head commit",
+            )
+
+        comparison_blob = _git_blob_descriptor(
+            comparison_base.root,
+            comparison_base.sha,
+            path,
+        )
+        expected_comparison = comparison_identities[path]
+        if status is ChangeStatus.ADDED:
+            if comparison_blob is not None or expected_comparison is not None:
+                raise InventoryVerificationError(
+                    "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                    "added material exists in the exact comparison commit",
+                )
+        elif (
+            comparison_blob is None
+            or expected_comparison is None
+            or not matches_blob(expected_comparison, comparison_blob)
+        ):
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                "selected material does not match the exact comparison commit",
+            )
+        elif status is None and comparison_blob != head_blob:
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED",
+                "supplemental material is not unchanged across the comparison",
+            )

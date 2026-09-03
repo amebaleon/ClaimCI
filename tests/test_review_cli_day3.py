@@ -148,7 +148,11 @@ def _coordinate_arguments(
     ]
 
 
-def _patch_run_review(monkeypatch: pytest.MonkeyPatch, result: ResearchReview, calls: list[tuple[Any, ...]]) -> None:
+def _patch_run_review(
+    monkeypatch: pytest.MonkeyPatch,
+    result: ResearchReview,
+    calls: list[tuple[Any, ...]],
+) -> None:
     """Patch either CLI import style without touching the real provider."""
 
     def fake_run_review(*args: Any, **kwargs: Any) -> ResearchReview:
@@ -157,6 +161,22 @@ def _patch_run_review(monkeypatch: pytest.MonkeyPatch, result: ResearchReview, c
 
     monkeypatch.setattr(cli_module, "run_review", fake_run_review, raising=False)
     monkeypatch.setattr(orchestrator, "run_review", fake_run_review)
+
+
+def _spy_on_provider_free_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    """Keep the real preflight runtime while recording the CLI boundary call."""
+
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    real_run_review = orchestrator.run_review
+
+    def recording_run_review(*args: Any, **kwargs: Any) -> ResearchReview:
+        calls.append((args, kwargs))
+        return real_run_review(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "run_review", recording_run_review)
+    return calls
 
 
 def test_review_package_exposes_the_provider_free_preflight_contract() -> None:
@@ -304,7 +324,7 @@ def test_review_cli_requires_the_declared_coordinate_contract_as_one_group(
 
 
 @pytest.mark.parametrize("basis", [ComparisonBasis.DIRECT_BASE, ComparisonBasis.MERGE_BASE])
-def test_review_cli_preflight_only_builds_bound_inventory_once_and_never_runs_provider_work(
+def test_review_cli_preflight_only_builds_inventory_then_calls_provider_free_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -318,7 +338,7 @@ def test_review_cli_preflight_only_builds_bound_inventory_once_and_never_runs_pr
     _write_enabled_config(requested)
     inventory = _inventory(basis=basis)
     inventory_calls: list[tuple[Any, ...]] = []
-    preflight_calls: list[tuple[Any, ...]] = []
+    review_calls: list[tuple[Any, ...]] = []
     json_output = tmp_path / "preflight.json"
     markdown_output = tmp_path / "preflight.md"
 
@@ -326,16 +346,14 @@ def test_review_cli_preflight_only_builds_bound_inventory_once_and_never_runs_pr
         inventory_calls.append(args)
         return inventory
 
-    def fake_preflight(*args: Any) -> ReviewPreflight:
-        preflight_calls.append(args)
-        return _ready_preflight(inventory)
-
     monkeypatch.setattr(cli_module, "build_git_change_inventory", fake_inventory)
-    monkeypatch.setattr(cli_module, "preflight_review", fake_preflight)
-    monkeypatch.setattr(
-        cli_module,
-        "run_review",
-        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
+    _patch_run_review(
+        monkeypatch,
+        ResearchReview(
+            status=ReviewStatus.COMPLETE,
+            preflight=_ready_preflight(inventory),
+        ),
+        review_calls,
     )
     monkeypatch.setattr(
         orchestrator,
@@ -371,13 +389,24 @@ def test_review_cli_preflight_only_builds_bound_inventory_once_and_never_runs_pr
     assert head_id.role is SnapshotRole.HEAD
     assert head_id.root == repository.resolve()
     assert passed_basis is basis
-    assert len(preflight_calls) == 1
-    inputs, config = preflight_calls[0]
+    assert len(review_calls) == 1
+    args, kwargs = review_calls[0]
+    assert kwargs == {"preflight_only": True}
+    inputs, config = args
     assert inputs.inventory is inventory
+    assert inputs.requested_base is requested_id
+    assert inputs.comparison_base is comparison_id
+    assert inputs.head is head_id
+    assert inputs.coordinates.requested_base_sha == _REQUESTED_SHA
+    assert inputs.coordinates.comparison_base_sha == comparison_id.sha
+    assert inputs.coordinates.head_sha == _HEAD_SHA
+    assert inputs.coordinates.comparison_basis is basis
     assert isinstance(config, ReviewConfig)
     payload = json.loads(captured.out)
     assert payload["schema_version"] == 2
     assert payload["preflight"]["ready_for_provider"] is True
+    assert payload["provider"]["lifecycle"] == "not_attempted"
+    assert payload["provider"]["attempted_call_count"] == 0
     assert payload["provider"]["calls"] == []
     assert payload["provider"]["usage"] == {
         "estimated_cost_usd": 0.0,
@@ -387,7 +416,8 @@ def test_review_cli_preflight_only_builds_bound_inventory_once_and_never_runs_pr
     }
     assert json.loads(json_output.read_text(encoding="utf-8")) == payload
     markdown = markdown_output.read_text(encoding="utf-8")
-    assert "Provider calls: 0; input tokens: 0; output tokens: 0; total tokens: 0;" in markdown
+    assert "Provider lifecycle: not&#95;attempted." in markdown
+    assert "Provider attempts: 0; completed response records: 0." in markdown
 
 
 def test_review_cli_preflight_inventory_failure_is_structured_and_does_not_leak_git_output(
@@ -401,8 +431,7 @@ def test_review_cli_preflight_inventory_failure_is_structured_and_does_not_leak_
     for root in (repository, requested, comparison):
         root.mkdir()
     _write_enabled_config(requested)
-    original_preflight = cli_module.preflight_review
-    calls = 0
+    review_calls = _spy_on_provider_free_runtime(monkeypatch)
 
     def fail_inventory(*_args: Any) -> ChangeInventory:
         raise InventoryVerificationError(
@@ -410,18 +439,7 @@ def test_review_cli_preflight_inventory_failure_is_structured_and_does_not_leak_
             "fatal: hostile-git-output sk-secret",
         )
 
-    def counted_preflight(*args: Any) -> ReviewPreflight:
-        nonlocal calls
-        calls += 1
-        return original_preflight(*args)
-
     monkeypatch.setattr(cli_module, "build_git_change_inventory", fail_inventory)
-    monkeypatch.setattr(cli_module, "preflight_review", counted_preflight)
-    monkeypatch.setattr(
-        cli_module,
-        "run_review",
-        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
-    )
 
     exit_code = main(
         [
@@ -438,7 +456,13 @@ def test_review_cli_preflight_inventory_failure_is_structured_and_does_not_leak_
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert exit_code == 0
-    assert calls == 1
+    assert len(review_calls) == 1
+    args, kwargs = review_calls[0]
+    assert kwargs == {"preflight_only": True}
+    inputs, config = args
+    assert inputs.inventory is None
+    assert inputs.inventory_failure.code == "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"
+    assert isinstance(config, ReviewConfig)
     assert payload["review"]["status"] == "UNAVAILABLE"
     assert payload["preflight"]["ready_for_provider"] is False
     assert payload["preflight"]["gates"][0]["reasons"] == [
@@ -494,11 +518,7 @@ def test_review_cli_declared_symlink_root_is_a_structured_gate_one_failure(
         "build_git_change_inventory",
         lambda *_args: pytest.fail("a symlinked declared root must not reach Git"),
     )
-    monkeypatch.setattr(
-        cli_module,
-        "run_review",
-        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
-    )
+    review_calls = _spy_on_provider_free_runtime(monkeypatch)
 
     exit_code = main(
         [
@@ -516,6 +536,8 @@ def test_review_cli_declared_symlink_root_is_a_structured_gate_one_failure(
     payload = json.loads(captured.out)
     reasons = payload["preflight"]["gates"][0]["reasons"]
     assert exit_code == 0
+    assert len(review_calls) == 1
+    assert review_calls[0][1] == {"preflight_only": True}
     assert reasons == [{"code": "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"}]
     assert payload["preflight"]["coordinates"] == {
         "requested_base_sha": _REQUESTED_SHA,
@@ -544,11 +566,7 @@ def test_review_cli_invalid_requested_root_without_config_root_is_structured(
         "build_git_change_inventory",
         lambda *_args: pytest.fail("an invalid requested root must not reach Git"),
     )
-    monkeypatch.setattr(
-        cli_module,
-        "run_review",
-        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
-    )
+    review_calls = _spy_on_provider_free_runtime(monkeypatch)
 
     exit_code = main(
         [
@@ -564,6 +582,8 @@ def test_review_cli_invalid_requested_root_without_config_root_is_structured(
     payload = json.loads(captured.out)
     reasons = payload["preflight"]["gates"][0]["reasons"]
     assert exit_code == 0
+    assert len(review_calls) == 1
+    assert review_calls[0][1] == {"preflight_only": True}
     assert payload["review"]["status"] == "UNAVAILABLE"
     assert reasons == [{"code": "PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"}]
     assert payload["preflight"]["coordinates"]["comparison_basis"] == "merge_base"
@@ -630,11 +650,7 @@ def test_review_cli_declared_invalid_roots_preserve_raw_coordinates_without_git(
         "build_git_change_inventory",
         lambda *_args: pytest.fail("invalid declared roots must not reach Git"),
     )
-    monkeypatch.setattr(
-        cli_module,
-        "run_review",
-        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call run_review"),
-    )
+    review_calls = _spy_on_provider_free_runtime(monkeypatch)
 
     exit_code = main(
         [
@@ -651,6 +667,8 @@ def test_review_cli_declared_invalid_roots_preserve_raw_coordinates_without_git(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert exit_code == 0
+    assert len(review_calls) == 1
+    assert review_calls[0][1] == {"preflight_only": True}
     assert payload["review"]["status"] == "UNAVAILABLE"
     assert payload["preflight"]["gates"][0]["reasons"] == [
         {"code": reason_code}
@@ -685,13 +703,10 @@ def test_review_cli_preflight_only_short_circuits_disabled_config_before_git(
     )
     monkeypatch.setattr(
         cli_module,
-        "preflight_review",
-        lambda *_args: pytest.fail("disabled preflight must short-circuit"),
-    )
-    monkeypatch.setattr(
-        cli_module,
         "run_review",
-        lambda *_args, **_kwargs: pytest.fail("preflight-only must not call runtime"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "disabled preflight must short-circuit before run_review"
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -798,11 +813,17 @@ def test_review_cli_preflight_event_json_keeps_the_one_mebibyte_input_cap(
     _write_enabled_config(requested)
     event = tmp_path / "event.json"
     event.write_bytes(b"{" + b"x" * (cli_module.MAX_EVENT_METADATA_BYTES + 1))
-    monkeypatch.setattr(cli_module, "build_git_change_inventory", lambda *_args: _inventory(basis=ComparisonBasis.MERGE_BASE))
     monkeypatch.setattr(
         cli_module,
-        "preflight_review",
-        lambda *_args: pytest.fail("oversized event metadata must fail before preflight"),
+        "build_git_change_inventory",
+        lambda *_args: _inventory(basis=ComparisonBasis.MERGE_BASE),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_review",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized event metadata must fail before run_review"
+        ),
     )
 
     exit_code = main(

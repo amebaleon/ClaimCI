@@ -8,6 +8,7 @@ import pytest
 
 import claimci.review.preflight as preflight_module
 from claimci.passive_files import PassiveFileError
+from claimci.review.evidence import EvidenceKind, _kind
 from claimci.review.models import (
     ChangeEntry,
     ChangeInventory,
@@ -21,6 +22,8 @@ from claimci.review.models import (
     ReviewStatus,
     ScopeIssue,
     ScientificClaim,
+    SnapshotIdentity,
+    SnapshotRole,
     SourceKind,
 )
 from claimci.review.orchestrator import ReviewInputs
@@ -121,6 +124,150 @@ def test_quantitative_comparative_benchmark_reproducibility_and_model_dataset_se
 
 
 @pytest.mark.parametrize(
+    ("path", "title", "seed_categories", "evidence_kind"),
+    [
+        (
+            "src/accuracy.py",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.SOURCE,
+        ),
+        (
+            "tests/test_accuracy.py",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.TEST,
+        ),
+        (
+            "config/accuracy.yaml",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.CONFIG,
+        ),
+        (
+            "results/metrics.json",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.RESULTS,
+        ),
+        (
+            "research.yaml",
+            "Candidate accuracy improves by 5%",
+            ("benchmark", "comparative_causal", "quantitative"),
+            EvidenceKind.MANIFEST,
+        ),
+        (
+            "benchmarks/accuracy.txt",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.BENCHMARK,
+        ),
+        (
+            "benchmark/submit.sh",
+            "Benchmark improves",
+            ("benchmark", "comparative_causal"),
+            EvidenceKind.CONFIG,
+        ),
+    ],
+    ids=(
+        "source",
+        "test",
+        "config",
+        "result",
+        "research-manifest",
+        "benchmark",
+        "submission-config",
+    ),
+)
+def test_supported_changed_material_kinds_form_gate2_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    title: str,
+    seed_categories: tuple[str, ...],
+    evidence_kind: EvidenceKind,
+) -> None:
+    """Gate 2 routes material seeds without invoking evidence or a provider."""
+
+    for variable in (
+        "OPENAI_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, path, "claim:\n  metric: accuracy\n")
+    inventory = _inventory((path, ChangeStatus.ADDED))
+    scope = _scope(root, inventory, title=title)
+
+    assert scope.inventory.entries == (ChangeEntry(path, ChangeStatus.ADDED),)
+    assert scope.selected_paths == (path,)
+    assert tuple(seed.category for seed in scope.seeds) == seed_categories
+    assert _kind(path) is evidence_kind
+
+    gate2 = preflight_module._gate2(scope)
+    assert gate2.disposition is GateDisposition.PASS_COMPLETE
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" not in {
+        issue.code for issue in scope.issues
+    }
+
+
+@pytest.mark.parametrize("path", ["src/model.py", "config/train.yaml"])
+def test_generic_kind_without_exact_or_token_ownership_does_not_route_gate2(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """A safe material kind alone does not claim an unrelated numeric seed."""
+
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, path, "generic material\n")
+    scope = _scope(
+        root,
+        _inventory((path, ChangeStatus.ADDED)),
+        title="Candidate reaches 5%",
+    )
+
+    assert tuple(seed.category for seed in scope.seeds) == ("quantitative",)
+    gate2 = preflight_module._gate2(scope)
+    assert gate2.disposition is GateDisposition.FAIL
+    assert gate2.metrics["routed_seed_count"] == 0
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" in {
+        issue.code for issue in scope.issues
+    }
+
+
+def test_self_referential_document_does_not_route_gate2(
+    tmp_path: Path,
+) -> None:
+    """Prose cannot authorize itself merely by naming its own exact path."""
+
+    root = tmp_path / "head"
+    root.mkdir()
+    path = "docs/claim.md"
+    _write(
+        root,
+        path,
+        "Accuracy improves by 5 percent; see docs/claim.md.\n",
+    )
+    scope = _scope(
+        root,
+        _inventory((path, ChangeStatus.ADDED)),
+    )
+
+    assert scope.selected_paths == (path,)
+    gate2 = preflight_module._gate2(scope)
+    assert gate2.disposition is GateDisposition.FAIL
+    assert gate2.metrics["routed_seed_count"] == 0
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" in {
+        issue.code for issue in scope.issues
+    }
+
+
+@pytest.mark.parametrize(
     ("description", "category"),
     [
         ("Processed 42 files in the held-out run.", "quantitative"),
@@ -149,17 +296,19 @@ def test_material_seed_truncation_is_deterministic_and_forces_partial_scope(
     roots = (tmp_path / "first", tmp_path / "second")
     material = (
         "Benchmark model accuracy improves by 5% with reproducible seed "
-        "configuration; see docs/one.md."
+        "configuration; see results/metric.json."
     )
     inventory = _inventory(
         ("docs/one.md", ChangeStatus.MODIFIED),
         ("docs/two.md", ChangeStatus.MODIFIED),
+        ("results/metric.json", ChangeStatus.ADDED),
     )
     scopes = []
     for root in roots:
         root.mkdir()
         _write(root, "docs/one.md", material)
         _write(root, "docs/two.md", material)
+        _write(root, "results/metric.json", '{"accuracy": 0.95}\n')
         scopes.append(
             _scope(
                 root,
@@ -363,10 +512,97 @@ def test_cross_metadata_exact_result_survives_document_flood_at_file_cap(
     assert len(set(scopes[0].selected_paths) & set(document_paths)) == 23
     assert gates[0].gates[1].disposition is GateDisposition.PASS_PARTIAL
     assert gates[1].gates[1].disposition is GateDisposition.PASS_PARTIAL
-    assert all(
-        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+    assert {
+        issue.code
         for issue in scopes[0].issues
         if issue.path not in scopes[0].selected_paths
+    } == {
+        "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
+        "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+    }
+    assert any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH" and issue.path is None
+        for issue in scopes[0].issues
+    )
+
+
+def test_root_level_exact_result_mention_survives_document_flood_at_file_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root-level exact path gets the first fixed attempt, without backfill."""
+
+    document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
+    result_path = "results.json"
+    inventory = _inventory(
+        *((path, ChangeStatus.MODIFIED) for path in (*document_paths, result_path))
+    )
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in document_paths:
+        _write(root, path, f"supporting note for {path}\n")
+    _write(root, result_path, '{"accuracy": 0.95}\n')
+
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", traced_capture)
+    scope = _scope(
+        root,
+        inventory,
+        title="Benchmark accuracy improves by 5%.",
+        description="See results.json.",
+        limits=ReviewLimits(max_files=24),
+    )
+
+    assert opened[0] == result_path
+    assert len(opened) == 24
+    assert len(set(opened)) == 24
+    assert scope.selected_paths == (result_path, *document_paths[:23])
+    assert result_path in scope.selected_paths
+    assert document_paths[-1] not in scope.selected_paths
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
+        path=document_paths[-1],
+        observed=25,
+        limit=24,
+    ) in scope.issues
+    assert len(scope.selected_paths) <= 24
+
+
+def test_root_basename_matching_does_not_promote_dotted_prose_to_exact_paths(
+    tmp_path: Path,
+) -> None:
+    """Root-level path support must not treat ordinary dotted prose as a path."""
+
+    document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
+    result_path = "results.json"
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in document_paths:
+        _write(root, path, f"supporting note for {path}\n")
+    _write(root, result_path, '{"accuracy": 0.95}\n')
+
+    scope = _scope(
+        root,
+        _inventory(
+            *((path, ChangeStatus.MODIFIED) for path in (*document_paths, result_path))
+        ),
+        title="Benchmark accuracy improves by 5%.",
+        description="Version 1.2 is prose; release.v1 is a label, not an inventory path.",
+        limits=ReviewLimits(max_files=24),
+    )
+
+    assert scope.selected_paths == document_paths
+    assert result_path not in scope.selected_paths
+    assert not any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH"
+        and issue.path in {"1.2", "release.v1"}
+        for issue in scope.issues
     )
 
 
@@ -599,6 +835,101 @@ def test_changed_entries_survive_a_legacy_2048_path_lexical_prefix(tmp_path: Pat
         title="GLM model accuracy improves by 9%",
     )
     assert scope.issued_changed_paths == targets
+
+
+def test_supplement_git_probes_share_the_remaining_file_attempt_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "results/metrics.json", '{"accuracy": 0.95}\n')
+    mentions = " ".join(f"source/path_{index:04}.py" for index in range(200))
+    probed: list[str] = []
+
+    def reject_supplement(_inputs, _inventory, path: str) -> bool:
+        probed.append(path)
+        return False
+
+    monkeypatch.setattr(
+        preflight_module,
+        "_git_supplement_is_exact",
+        reject_supplement,
+    )
+    scope = _scope(
+        root,
+        _inventory(("results/metrics.json", ChangeStatus.ADDED)),
+        title="Accuracy improves by 5%",
+        description=mentions,
+        limits=ReviewLimits(max_files=3),
+    )
+
+    assert scope.selected_paths == ("results/metrics.json",)
+    assert probed == ["source/path_0000.py", "source/path_0001.py"]
+
+
+def test_preflight_manifest_groups_preserve_the_four_candidate_audit_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    manifest_paths = (
+        "a/research.yaml",
+        "a/research.yml",
+        "b/research.yaml",
+        "b/research.yml",
+        "c/research.yaml",
+    )
+    artifact_paths = tuple(
+        f"{Path(path).parent.as_posix()}/results-{index}.json"
+        for index, path in enumerate(manifest_paths)
+    )
+    for path in (*manifest_paths, *artifact_paths):
+        _write(root, path, '{"accuracy": 0.95}\n')
+    inventory = _inventory(
+        *((path, ChangeStatus.ADDED) for path in (*manifest_paths, *artifact_paths))
+    )
+    observed_candidates: list[tuple[str, ...]] = []
+
+    def manifest_dependencies(
+        _inputs: object,
+        candidates: tuple[str, ...],
+        *,
+        max_bytes: int,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        assert max_bytes > 0
+        observed_candidates.append(candidates)
+        dependency_by_manifest = dict(zip(manifest_paths, artifact_paths))
+        return tuple(
+            (manifest, (dependency_by_manifest[manifest],))
+            for manifest in candidates
+        )
+
+    monkeypatch.setattr(
+        preflight_module,
+        "_exact_manifest_dependency_map",
+        manifest_dependencies,
+    )
+
+    scope = _scope(
+        root,
+        inventory,
+        title="Candidate accuracy improves by 5%",
+    )
+
+    assert observed_candidates == [manifest_paths[:4]]
+    assert scope.atomic_path_groups == tuple(
+        (manifest, artifact)
+        for manifest, artifact in zip(manifest_paths[:4], artifact_paths[:4])
+    )
+    assert manifest_paths[4] in scope.selected_paths
+    omission = next(
+        issue
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G3_AUDIT_PLAN_OMITTED"
+    )
+    assert (omission.observed, omission.limit) == (1, 4)
 
 
 @pytest.mark.parametrize("deleted_path", ["results/deleted.json", "src/deleted.py"])
@@ -912,6 +1243,71 @@ def test_selected_huge_file_is_recorded_and_a_safe_route_keeps_partial_scope(
     assert not scope.complete
 
 
+@pytest.mark.parametrize("include_safe_result", [True, False])
+def test_oversized_comparison_blob_is_omitted_before_head_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_safe_result: bool,
+) -> None:
+    base = (tmp_path / "base").resolve()
+    head = (tmp_path / "head").resolve()
+    base.mkdir()
+    head.mkdir()
+    _write(head, "src/metric.py", "accuracy = 0.95\n")
+    entries = [("src/metric.py", ChangeStatus.MODIFIED)]
+    if include_safe_result:
+        _write(head, "results/metric.json", '{"accuracy": 0.95}\n')
+        entries.append(("results/metric.json", ChangeStatus.ADDED))
+    inventory = _inventory(*entries)
+    requested = SnapshotIdentity(SnapshotRole.REQUESTED_BASE, base, BASE)
+    comparison = SnapshotIdentity(SnapshotRole.COMPARISON_BASE, base, BASE)
+    head_identity = SnapshotIdentity(SnapshotRole.HEAD, head, HEAD)
+
+    def descriptor(identity: SnapshotIdentity, path: str):
+        if identity.role is SnapshotRole.COMPARISON_BASE and path == "src/metric.py":
+            return (preflight_module.MAX_SOURCE_FILE_BYTES + 1, "1" * 40)
+        return None
+
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def capture(root: Path, path: str, *, max_bytes: int):
+        opened.append(path)
+        return real_capture(root, path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "git_blob_descriptor", descriptor)
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", capture)
+    scope = build_review_scope(
+        ReviewInputs(
+            repository_root=head,
+            pr_title="Candidate accuracy improves by 5%",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head_identity,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+        inventory,
+    )
+
+    assert "src/metric.py" not in scope.selected_paths
+    assert "src/metric.py" not in opened
+    assert any(
+        issue.code == "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE"
+        and issue.path == "src/metric.py"
+        and issue.observed == preflight_module.MAX_SOURCE_FILE_BYTES + 1
+        and issue.limit == preflight_module.MAX_SOURCE_FILE_BYTES
+        for issue in scope.issues
+    )
+    gate2 = preflight_module._gate2(scope)
+    if include_safe_result:
+        assert scope.selected_paths == ("results/metric.json",)
+        assert gate2.disposition is GateDisposition.PASS_PARTIAL
+    else:
+        assert scope.selected_paths == ()
+        assert gate2.disposition is GateDisposition.FAIL
+
+
 @pytest.mark.parametrize("status", [ChangeStatus.DELETED])
 def test_deleted_only_required_route_never_produces_complete_scope(
     tmp_path: Path,
@@ -1011,6 +1407,48 @@ def test_required_changed_document_truncation_is_an_explicit_locality_omission(
         and issue.path == "docs/large-study.md"
         and issue.observed == 126
         and issue.limit == 20
+        for issue in scope.issues
+    )
+
+
+def test_oversized_modified_document_materializes_the_changed_region(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+    prefix = "Ordinary documentation without a material claim.\n" * 400
+    _write(base, "docs/study.md", prefix + "Accuracy was 90%.\n")
+    _write(head, "docs/study.md", prefix + "Accuracy is now 95%.\n")
+    _write(base, "results/metrics.json", '{"accuracy": 0.90}\n')
+    _write(head, "results/metrics.json", '{"accuracy": 0.95}\n')
+
+    scope = build_review_scope(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Please review docs/study.md",
+        ),
+        ReviewConfig(enabled=True, limits=ReviewLimits(max_file_chars=160)),
+        _inventory(
+            ("docs/study.md", ChangeStatus.MODIFIED),
+            ("results/metrics.json", ChangeStatus.MODIFIED),
+        ),
+    )
+
+    document = next(
+        source
+        for source in scope.sources
+        if source.kind is SourceKind.REPOSITORY_FILE
+        and source.path == "docs/study.md"
+    )
+    assert "Accuracy is now 95%." in document.text
+    assert "Accuracy was 90%." not in document.text
+    assert preflight_module._gate2(scope).disposition is GateDisposition.PASS_COMPLETE
+    assert any(
+        issue.code == "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+        and issue.path == "docs/study.md"
         for issue in scope.issues
     )
 

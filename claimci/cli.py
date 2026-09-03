@@ -511,7 +511,7 @@ def _review_command(args: argparse.Namespace) -> int:
     # Keep this call singular: rendering both output formats must never rerun
     # provider calls or deterministic evidence discovery.
     result = (
-        _preflight_only_review(preflight_review(inputs, config))
+        run_review(inputs, config, preflight_only=True)
         if args.preflight_only
         else run_review(inputs, config)
     )

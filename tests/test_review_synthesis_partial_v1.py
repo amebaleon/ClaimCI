@@ -78,10 +78,11 @@ class _InvalidSynthesisProvider:
 def test_invalid_synthesis_is_partial_and_preserves_trusted_extraction(
     tmp_path: Path,
 ) -> None:
-    document = tmp_path / "docs" / "review.md"
-    document.parent.mkdir(parents=True)
-    document.write_text(
-        "Bounded review context.\n", encoding="utf-8"
+    result_file = tmp_path / "results" / "rollup.json"
+    result_file.parent.mkdir(parents=True)
+    result_file.write_text(
+        '{"runs": [{"rows_read": 25}]}\n',
+        encoding="utf-8",
     )
     provider = _InvalidSynthesisProvider()
 
@@ -90,7 +91,7 @@ def test_invalid_synthesis_is_partial_and_preserves_trusted_extraction(
             repository_root=tmp_path,
             pr_description=(
                 "The rollup reads 4.0x fewer rows for the 90-day benchmark; "
-                "see docs/review.md."
+                "see results/rollup.json."
             ),
         ),
         ReviewConfig(enabled=True, limits=ReviewLimits()),

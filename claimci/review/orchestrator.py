@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -13,14 +14,18 @@ from typing import Any
 
 from claimci.passive_files import (
     PassiveFileError,
+    capture_confined_regular_file,
     inspect_confined_regular_file,
 )
 from claimci.parsing import unique_json_object
 
 from .evidence import (
+    changed_region_excerpt_from_text,
     EvidenceBundle,
     EvidenceKind,
     EvidenceLocality,
+    EvidenceMaterialIdentity,
+    EvidenceMaterialInvalidated,
     EvidenceReference,
     discover_evidence,
 )
@@ -30,20 +35,34 @@ from .models import (
     ChangeInventorySource,
     ChangeStatus,
     DeclaredReviewCoordinates,
+    ExactMaterialOmission,
     GateDisposition,
     MagnitudeKind,
     PreflightGateResult,
     ProviderCallRecord,
+    ProviderLifecycle,
     ProviderUsage,
     ReviewConfig,
     ReviewError,
     ReviewInventoryFailure,
+    ReviewMaterialKind,
     ReviewPreflight,
+    ReviewScope,
     ReviewStatus,
     ScientificClaim,
     ScopeIssue,
     SnapshotIdentity,
+    SnapshotRole,
     SourceBundle,
+    SourceKind,
+    SourceRecord,
+)
+from .path_policy import classify_review_material
+from .inventory import (
+    exact_git_material_omission_matches,
+    InventoryVerificationError,
+    git_blob_descriptor,
+    verify_git_material_identities,
 )
 from .provider import (
     ProviderResponse,
@@ -51,6 +70,7 @@ from .provider import (
     StructuredRequest,
 )
 from .request_budget import (
+    MAX_DETERMINISTIC_JAVA_TEST_COUNT,
     allocate_synthesis_inputs,
     build_extraction_request_parts,
     build_synthesis_request_parts,
@@ -66,6 +86,7 @@ from .sources import (
     validate_claim_candidates_best_effort,
 )
 from .tools import (
+    MAX_MANIFEST_AUDITS,
     DeterministicAuditSnapshot,
     ManifestAuditBundle,
     ManifestAuditPlan,
@@ -100,6 +121,7 @@ class ReviewInputs:
     inventory: ChangeInventory | object | None = None
     coordinates: DeclaredReviewCoordinates | None = None
     inventory_failure: ReviewInventoryFailure | None = None
+    exact_material_omissions: tuple[ExactMaterialOmission, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.repository_root, Path):
@@ -118,6 +140,17 @@ class ReviewInputs:
             raise ReviewError("review inventory failure is invalid")
         if self.inventory is not None and self.inventory_failure is not None:
             raise ReviewError("review inventory and failure are mutually exclusive")
+        if (
+            not isinstance(self.exact_material_omissions, tuple)
+            or len(self.exact_material_omissions) > 24
+            or not all(
+                isinstance(item, ExactMaterialOmission)
+                for item in self.exact_material_omissions
+            )
+            or len({item.path for item in self.exact_material_omissions})
+            != len(self.exact_material_omissions)
+        ):
+            raise ReviewError("exact material omissions are invalid")
 
 
 @dataclass(frozen=True)
@@ -140,8 +173,36 @@ class ResearchReview:
     deterministic_audits: tuple[DeterministicAuditSnapshot, ...] = ()
     provider_calls: tuple[ProviderCallRecord, ...] = ()
     usage: ProviderUsage = ProviderUsage()
+    provider_lifecycle: ProviderLifecycle = ProviderLifecycle.NOT_ATTEMPTED
+    provider_attempt_count: int = 0
     error_code: str | None = None
     error_message: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.provider_attempt_count, bool)
+            or not isinstance(self.provider_attempt_count, int)
+            or not 0 <= self.provider_attempt_count <= 2
+        ):
+            raise ReviewError("provider attempt count must be from zero through two")
+        completed = len(self.provider_calls)
+        expected_attempts = (
+            completed + 1
+            if self.provider_lifecycle is ProviderLifecycle.FAILED_BEFORE_RESPONSE
+            else completed
+        )
+        if self.provider_attempt_count != expected_attempts:
+            raise ReviewError("provider lifecycle and attempt count are inconsistent")
+        if (
+            self.provider_lifecycle is ProviderLifecycle.NOT_ATTEMPTED
+            and self.provider_attempt_count != 0
+        ):
+            raise ReviewError("unattempted provider lifecycle cannot contain calls")
+        if (
+            self.provider_lifecycle is ProviderLifecycle.RESPONSE_RECEIVED
+            and self.provider_attempt_count == 0
+        ):
+            raise ReviewError("received provider lifecycle requires a response")
 
 
 def _extraction_schema(max_claims: int) -> dict[str, Any]:
@@ -257,6 +318,13 @@ def _java_standalone_test_count(text: str) -> int | None:
             continue
 
         if state == "text_block":
+            # Java text blocks permit escaped quotes specifically so an
+            # embedded quote run does not become the closing delimiter.  This
+            # narrow scanner does not implement the JLS escape transformation;
+            # fail closed on every text-block escape instead of exposing string
+            # content as code and emitting a false whole-file count.
+            if character == "\\":
+                return None
             if normalized.startswith('\"\"\"', index):
                 masked.extend((" ", " ", " "))
                 state = "code"
@@ -329,6 +397,22 @@ def _java_test_cardinality_constraints(
             and claim.claim_id in reference.claim_ids
         ]
         reference = references[0] if len(references) == 1 else None
+        if float(magnitude.value) > MAX_DETERMINISTIC_JAVA_TEST_COUNT:
+            constraints[claim.claim_id] = {
+                "kind": "java_test_cardinality",
+                "state": "out_of_bounds",
+                "claimed_count": None,
+                "observed_count": None,
+                "evidence_id": None,
+                "limit": MAX_DETERMINISTIC_JAVA_TEST_COUNT,
+                "required_interpretation": (
+                    "ClaimCI cannot verify the claimed whole-file test count "
+                    "because it exceeds the maximum count representable by a "
+                    "complete file within the bounded inspection size."
+                ),
+                "required_citations": [],
+            }
+            continue
         claimed_count = int(magnitude.value)
         observed_count = (
             _java_standalone_test_count(reference.excerpt)
@@ -651,6 +735,8 @@ def _result(
     evidence: EvidenceBundle = EvidenceBundle(),
     deterministic_audits: tuple[DeterministicAuditSnapshot, ...] = (),
     calls: Sequence[ProviderCallRecord] = (),
+    provider_lifecycle: ProviderLifecycle = ProviderLifecycle.NOT_ATTEMPTED,
+    provider_attempt_count: int = 0,
     error_code: str | None = None,
     error_message: str | None = None,
 ) -> ResearchReview:
@@ -663,7 +749,13 @@ def _result(
         evidence=evidence,
         deterministic_audits=deterministic_audits,
         provider_calls=call_tuple,
-        usage=_aggregate_usage(call_tuple),
+        usage=(
+            ProviderUsage()
+            if provider_lifecycle is ProviderLifecycle.FAILED_BEFORE_RESPONSE
+            else _aggregate_usage(call_tuple)
+        ),
+        provider_lifecycle=provider_lifecycle,
+        provider_attempt_count=provider_attempt_count,
         error_code=error_code,
         error_message=error_message,
     )
@@ -750,6 +842,69 @@ def _record_runtime_gate3_omissions(
     )
 
 
+def _merge_ready_runtime_gate3(
+    refreshed: ReviewPreflight,
+    previous: ReviewPreflight | None,
+) -> ReviewPreflight:
+    """Keep prior runtime Gate 3 facts on a newly refreshed ready record."""
+
+    if previous is None:
+        return refreshed
+    if not refreshed.ready_for_provider or not previous.ready_for_provider:
+        raise ReviewError("runtime Gate 3 merge requires ready preflights")
+    prior_gate3 = previous.gates[2]
+    refreshed_gate3 = refreshed.gates[2]
+    reasons = tuple(
+        sorted(
+            set((*prior_gate3.reasons, *refreshed_gate3.reasons)),
+            key=lambda issue: (
+                issue.code,
+                issue.path or "",
+                -1 if issue.observed is None else issue.observed,
+                -1 if issue.limit is None else issue.limit,
+            ),
+        )
+    )
+    disposition = (
+        GateDisposition.PASS_PARTIAL
+        if reasons
+        else GateDisposition.PASS_COMPLETE
+    )
+    gate3 = PreflightGateResult(
+        gate=3,
+        disposition=disposition,
+        reasons=reasons,
+        metrics={**dict(prior_gate3.metrics), **dict(refreshed_gate3.metrics)},
+    )
+    scope = refreshed.scope
+    if scope is not None and previous.scope is not None:
+        scope = replace(
+            scope,
+            complete=scope.complete and previous.scope.complete and not reasons,
+            issues=tuple(
+                sorted(
+                    set((*scope.issues, *previous.scope.issues)),
+                    key=lambda issue: (
+                        issue.code,
+                        issue.path or "",
+                        -1 if issue.observed is None else issue.observed,
+                        -1 if issue.limit is None else issue.limit,
+                    ),
+                )
+            ),
+        )
+    return replace(
+        refreshed,
+        gates=(*refreshed.gates[:2], gate3),
+        review_status_ceiling=(
+            ReviewStatus.PARTIAL
+            if disposition is GateDisposition.PASS_PARTIAL
+            else ReviewStatus.COMPLETE
+        ),
+        scope=scope,
+    )
+
+
 @dataclass(frozen=True)
 class _MaterialPathIdentity:
     """Content identity/state for one already-authorized repository path."""
@@ -757,6 +912,8 @@ class _MaterialPathIdentity:
     state: str
     size: int | None = None
     sha256: str | None = None
+    git_blob_sha1: str | None = None
+    git_blob_sha256: str | None = None
 
 
 def _capture_material_path_identity(
@@ -779,6 +936,8 @@ def _capture_material_path_identity(
         state="present",
         size=inspection.size,
         sha256=inspection.sha256,
+        git_blob_sha1=inspection.git_blob_sha1,
+        git_blob_sha256=inspection.git_blob_sha256,
     )
 
 
@@ -837,13 +996,18 @@ def _material_scope_capture_failure_paths(
 
     for path, head_identity, base_identity in captured:
         status = status_by_path.get(path)
-        if status not in {ChangeStatus.ADDED, ChangeStatus.MODIFIED}:
+        if status not in {None, ChangeStatus.ADDED, ChangeStatus.MODIFIED}:
             fail(path, head=True)
             continue
         if head_identity.state != "present":
             fail(path, head=True)
-        if status is ChangeStatus.MODIFIED:
+        if status in {None, ChangeStatus.MODIFIED}:
             if base_identity is None or base_identity.state != "present":
+                fail(path)
+            elif status is None and base_identity != head_identity:
+                # A selected path absent from the complete change inventory is
+                # an unchanged deterministic supplement, never an implicit
+                # changed candidate.
                 fail(path)
         elif (
             base_identity is not None
@@ -854,6 +1018,108 @@ def _material_scope_capture_failure_paths(
             # inconsistent with the authoritative inventory and fail closed.
             fail(path)
     return tuple(failures), tuple(head_failures)
+
+
+def _verify_material_git_binding(
+    inputs: ReviewInputs,
+    scope: ReviewScope,
+    captured: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+) -> None:
+    """Prove descriptor-captured material equals exact declared Git blobs."""
+
+    if scope.inventory.source is not ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH:
+        return
+    if not (
+        isinstance(inputs.comparison_base, SnapshotIdentity)
+        and isinstance(inputs.head, SnapshotIdentity)
+    ):
+        raise InventoryVerificationError(
+            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+            "declared material snapshots are unavailable",
+        )
+    head_identities: dict[str, tuple[int, str, str]] = {}
+    comparison_identities: dict[str, tuple[int, str, str] | None] = {}
+    for path, head_identity, base_identity in captured:
+        if (
+            head_identity.state != "present"
+            or head_identity.size is None
+            or head_identity.git_blob_sha1 is None
+            or head_identity.git_blob_sha256 is None
+        ):
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                "selected head material identity is unavailable",
+            )
+        head_identities[path] = (
+            head_identity.size,
+            head_identity.git_blob_sha1,
+            head_identity.git_blob_sha256,
+        )
+        if base_identity is None or base_identity.state == "error:unavailable":
+            comparison_identities[path] = None
+        elif (
+            base_identity.state == "present"
+            and base_identity.size is not None
+            and base_identity.git_blob_sha1 is not None
+            and base_identity.git_blob_sha256 is not None
+        ):
+            comparison_identities[path] = (
+                base_identity.size,
+                base_identity.git_blob_sha1,
+                base_identity.git_blob_sha256,
+            )
+        else:
+            raise InventoryVerificationError(
+                "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                "selected comparison material identity is unavailable",
+            )
+    verify_git_material_identities(
+        inputs.comparison_base,
+        inputs.head,
+        scope.inventory,
+        tuple(path for path, _head, _base in captured),
+        head_identities,
+        comparison_identities,
+        max_files=max(1, len(captured)),
+    )
+
+
+def _coordinate_failure_preflight(
+    preflight: ReviewPreflight,
+    code: str,
+) -> ReviewPreflight:
+    """Replace any materialized record with one exact Gate 1 failure."""
+
+    gate1 = PreflightGateResult(
+        gate=1,
+        disposition=GateDisposition.FAIL,
+        reasons=(ScopeIssue(code=code),),
+        metrics={},
+    )
+    skipped = tuple(
+        PreflightGateResult(
+            gate=gate,
+            disposition=GateDisposition.NOT_EVALUATED,
+            reasons=(
+                ScopeIssue(code="PREFLIGHT_NOT_EVALUATED_UPSTREAM_FAILURE"),
+            ),
+            metrics={},
+        )
+        for gate in (2, 3)
+    )
+    return ReviewPreflight(
+        schema_version=preflight.schema_version,
+        requested_base_sha=preflight.requested_base_sha,
+        comparison_base_sha=preflight.comparison_base_sha,
+        head_sha=preflight.head_sha,
+        gates=(gate1, *skipped),
+        ready_for_provider=False,
+        review_status_ceiling=ReviewStatus.UNAVAILABLE,
+        scope=None,
+        comparison_basis=preflight.comparison_basis,
+    )
 
 
 def _material_scope_drifted_paths(
@@ -883,6 +1149,544 @@ def _material_scope_drifted_paths(
     return head_drifted, base_drifted
 
 
+def _sanitize_scope_material_paths(
+    scope: ReviewScope,
+    paths: Sequence[str],
+) -> ReviewScope:
+    """Remove every scope fact derived from unbound material paths."""
+
+    invalid = set(paths)
+    expanded = True
+    while expanded:
+        expanded = False
+        for group in scope.atomic_path_groups:
+            if invalid.intersection(group) and not set(group).issubset(invalid):
+                invalid.update(group)
+                expanded = True
+    removed_source_ids = {
+        source.source_id
+        for source in scope.sources
+        if source.kind is SourceKind.REPOSITORY_FILE and source.path in invalid
+    }
+    retained_selected = tuple(
+        path for path in scope.selected_paths if path not in invalid
+    )
+    retained_path_chars = tuple(
+        item for item in scope.materialized_path_chars if item[0] not in invalid
+    )
+    removed_chars = sum(
+        chars
+        for path, chars in scope.materialized_path_chars
+        if path in invalid
+    )
+    return replace(
+        scope,
+        issued_paths=tuple(
+            path for path in scope.issued_paths if path not in invalid
+        ),
+        issued_changed_paths=tuple(
+            path for path in scope.issued_changed_paths if path not in invalid
+        ),
+        selected_paths=retained_selected,
+        sources=tuple(
+            source
+            for source in scope.sources
+            if source.kind is not SourceKind.REPOSITORY_FILE
+            or source.path not in invalid
+        ),
+        seeds=tuple(
+            seed
+            for seed in scope.seeds
+            if seed.origin_source_id not in removed_source_ids
+        ),
+        complete=False,
+        issues=tuple(issue for issue in scope.issues if issue.path not in invalid),
+        materialized_chars=max(0, scope.materialized_chars - removed_chars),
+        materialized_path_chars=retained_path_chars,
+        atomic_path_groups=tuple(
+            group
+            for group in scope.atomic_path_groups
+            if not invalid.intersection(group)
+        ),
+    )
+
+
+def _sanitize_preflight_material_facts(
+    preflight: ReviewPreflight,
+    scope: ReviewScope,
+    paths: Sequence[str],
+) -> ReviewPreflight:
+    """Replace unprovable material facts with one content-free Gate 2 failure."""
+
+    del scope
+    invalid_count = len(set(paths))
+    if invalid_count < 1:
+        raise ReviewError("material invalidation requires at least one path")
+    if preflight.gates[0].disposition is GateDisposition.FAIL:
+        return replace(preflight, scope=None)
+    gate2 = PreflightGateResult(
+        gate=2,
+        disposition=GateDisposition.FAIL,
+        reasons=(
+            ScopeIssue(
+                code="PREFLIGHT_G2_MATERIAL_SOURCE_INVALIDATED",
+                observed=invalid_count,
+                limit=0,
+            ),
+        ),
+        metrics={"material_source_invalidated_count": invalid_count},
+    )
+    gate3 = PreflightGateResult(
+        gate=3,
+        disposition=GateDisposition.NOT_EVALUATED,
+        reasons=(ScopeIssue(code="PREFLIGHT_NOT_EVALUATED_UPSTREAM_FAILURE"),),
+        metrics={},
+    )
+    return ReviewPreflight(
+        schema_version=preflight.schema_version,
+        requested_base_sha=preflight.requested_base_sha,
+        comparison_base_sha=preflight.comparison_base_sha,
+        head_sha=preflight.head_sha,
+        gates=(preflight.gates[0], gate2, gate3),
+        ready_for_provider=False,
+        review_status_ceiling=ReviewStatus.UNAVAILABLE,
+        scope=None,
+        comparison_basis=preflight.comparison_basis,
+    )
+
+
+_UNMATERIALIZED_SCOPE_ISSUE_CODES = frozenset(
+    {
+        "PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+        "PREFLIGHT_G2_CANDIDATE_UNREADABLE",
+        "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE",
+    }
+)
+
+
+def _unmaterialized_material_issue_paths(scope: ReviewScope) -> tuple[str, ...]:
+    """Return attempted candidates whose material never entered the scope."""
+
+    selected = set(scope.selected_paths)
+    return tuple(
+        sorted(
+            {
+                issue.path
+                for issue in scope.issues
+                if issue.code in _UNMATERIALIZED_SCOPE_ISSUE_CODES
+                and issue.path is not None
+                and issue.path not in selected
+            }
+        )
+    )
+
+
+def _revalidate_unmaterialized_material_issues(
+    inputs: ReviewInputs,
+    scope: ReviewScope,
+) -> tuple[str, ...]:
+    """Reproduce content-derived omissions without retaining their content."""
+
+    if not isinstance(inputs.head, SnapshotIdentity):
+        return _unmaterialized_material_issue_paths(scope)
+    issue_codes_by_path: dict[str, set[str]] = {}
+    for issue in scope.issues:
+        if (
+            issue.path is not None
+            and issue.code in _UNMATERIALIZED_SCOPE_ISSUE_CODES
+            and issue.path not in scope.selected_paths
+        ):
+            issue_codes_by_path.setdefault(issue.path, set()).add(issue.code)
+
+    invalidated: list[str] = []
+    for path in sorted(issue_codes_by_path):
+        expected = issue_codes_by_path[path]
+        if len(expected) != 1:
+            invalidated.append(path)
+            continue
+        expected_code = next(iter(expected))
+        if expected_code in {
+            "PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+            "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE",
+        }:
+            expected_role = (
+                SnapshotRole.HEAD
+                if expected_code == "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"
+                else SnapshotRole.COMPARISON_BASE
+            )
+            omission = next(
+                (
+                    item
+                    for item in inputs.exact_material_omissions
+                    if item.path == path
+                    and item.code == expected_code
+                    and item.role is expected_role
+                ),
+                None,
+            )
+            issue = next(
+                (
+                    item
+                    for item in scope.issues
+                    if item.path == path and item.code == expected_code
+                ),
+                None,
+            )
+            identity = (
+                inputs.head
+                if expected_role is SnapshotRole.HEAD
+                else inputs.comparison_base
+            )
+            inventory_status = next(
+                (
+                    entry.status
+                    for entry in scope.inventory.entries
+                    if entry.path == path
+                ),
+                None,
+            )
+            status_is_valid = (
+                inventory_status is ChangeStatus.MODIFIED
+                if expected_role is SnapshotRole.COMPARISON_BASE
+                else inventory_status is not ChangeStatus.DELETED
+            )
+            expected_sha = (
+                scope.inventory.head_sha
+                if expected_role is SnapshotRole.HEAD
+                else scope.inventory.comparison_base_sha
+            )
+            if (
+                omission is not None
+                and issue is not None
+                and issue.observed == omission.observed
+                and issue.limit == omission.limit
+                and isinstance(identity, SnapshotIdentity)
+                and identity.role is expected_role
+                and identity.sha == expected_sha
+                and status_is_valid
+            ):
+                if exact_git_material_omission_matches(omission, identity):
+                    continue
+        if expected_code == "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE":
+            status = next(
+                (
+                    entry.status
+                    for entry in scope.inventory.entries
+                    if entry.path == path
+                ),
+                None,
+            )
+            if (
+                status is not ChangeStatus.MODIFIED
+                or not isinstance(inputs.comparison_base, SnapshotIdentity)
+            ):
+                invalidated.append(path)
+                continue
+            try:
+                descriptor = git_blob_descriptor(inputs.comparison_base, path)
+            except InventoryVerificationError:
+                invalidated.append(path)
+                continue
+            if descriptor is None or descriptor[0] <= MAX_SOURCE_FILE_BYTES:
+                invalidated.append(path)
+            continue
+        if expected_code == "PREFLIGHT_G2_CANDIDATE_TOO_LARGE":
+            try:
+                descriptor = git_blob_descriptor(inputs.head, path)
+            except InventoryVerificationError:
+                invalidated.append(path)
+                continue
+            if descriptor is None or descriptor[0] <= MAX_SOURCE_FILE_BYTES:
+                invalidated.append(path)
+            continue
+
+        try:
+            first = capture_confined_regular_file(
+                inputs.repository_root,
+                path,
+                max_bytes=MAX_SOURCE_FILE_BYTES,
+            )
+            first.content.decode("utf-8", errors="strict")
+        except UnicodeError:
+            pass
+        except (
+            PassiveFileError,
+            OSError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            invalidated.append(path)
+            continue
+        else:
+            invalidated.append(path)
+            continue
+        try:
+            descriptor = git_blob_descriptor(inputs.head, path)
+            if descriptor is None or descriptor[0] != first.size:
+                invalidated.append(path)
+                continue
+            header = f"blob {first.size}\0".encode("ascii")
+            sha1 = hashlib.sha1(
+                header + first.content,
+                usedforsecurity=False,
+            ).hexdigest()
+            sha256 = hashlib.sha256(header + first.content).hexdigest()
+            object_id = descriptor[1]
+            if object_id != (sha1 if len(object_id) == 40 else sha256):
+                invalidated.append(path)
+                continue
+            second = capture_confined_regular_file(
+                inputs.repository_root,
+                path,
+                max_bytes=MAX_SOURCE_FILE_BYTES,
+            )
+            if second.size != first.size or second.sha256 != first.sha256:
+                invalidated.append(path)
+                continue
+            second.content.decode("utf-8", errors="strict")
+        except UnicodeError:
+            continue
+        except (
+            InventoryVerificationError,
+            PassiveFileError,
+            OSError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            invalidated.append(path)
+            continue
+        invalidated.append(path)
+    return tuple(invalidated)
+
+
+def _bind_scope_materialization(
+    head_root: Path,
+    scope: ReviewScope,
+    captured: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+    *,
+    comparison_base_root: Path | None,
+) -> tuple[ReviewScope, tuple[str, ...], tuple[str, ...]]:
+    """Bind every material decision and provider-visible source to exact bytes.
+
+    ``SourceRecord.sha256`` identifies its normalized, possibly truncated text,
+    while ``_MaterialPathIdentity.sha256`` identifies the complete raw file.
+    Re-capture every selected path and reproduce preflight's materialization
+    and changed-region decision so transient head/base reads cannot authorize a
+    provider request. Documents additionally bind their issued text records.
+    """
+
+    identities = {path: (head, base) for path, head, base in captured}
+    allocated_chars = dict(scope.materialized_path_chars)
+    status_by_path = {entry.path: entry.status for entry in scope.inventory.entries}
+    expected_document_paths = tuple(
+        path
+        for path in scope.selected_paths
+        if classify_review_material(path) is ReviewMaterialKind.DOCUMENT
+    )
+    repository_records = tuple(
+        source
+        for source in scope.sources
+        if source.kind is SourceKind.REPOSITORY_FILE
+    )
+    records_by_path: dict[str, list[SourceRecord]] = {}
+    for source in repository_records:
+        assert source.path is not None
+        records_by_path.setdefault(source.path, []).append(source)
+
+    drifted: set[str] = set()
+    head_drifted: set[str] = set()
+    expected_set = set(expected_document_paths)
+    actual_set = set(records_by_path)
+    drifted.update(expected_set.symmetric_difference(actual_set))
+    drifted.update(
+        path for path, records in records_by_path.items() if len(records) != 1
+    )
+
+    locality_codes = {
+        "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE",
+        "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT",
+    }
+    locality_issues_by_path = {
+        path: {
+            issue
+            for issue in scope.issues
+            if issue.path == path and issue.code in locality_codes
+        }
+        for path in scope.selected_paths
+    }
+
+    for path in scope.selected_paths:
+        identity_pair = identities.get(path)
+        if identity_pair is None or identity_pair[0].state != "present":
+            drifted.add(path)
+            head_drifted.add(path)
+            continue
+        head_identity, base_identity = identity_pair
+        try:
+            head_capture = capture_confined_regular_file(
+                head_root,
+                path,
+                max_bytes=MAX_SOURCE_FILE_BYTES,
+            )
+        except (
+            PassiveFileError,
+            OSError,
+            RecursionError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            drifted.add(path)
+            head_drifted.add(path)
+            continue
+        if (
+            head_capture.size != head_identity.size
+            or head_capture.sha256 != head_identity.sha256
+        ):
+            drifted.add(path)
+            head_drifted.add(path)
+            continue
+        try:
+            head_text = head_capture.content.decode("utf-8", errors="strict")
+            head_text = head_text.replace("\r\n", "\n").replace("\r", "\n")
+        except UnicodeError:
+            drifted.add(path)
+            continue
+        char_count = allocated_chars.get(path)
+        if char_count is None or len(head_text) < char_count:
+            drifted.add(path)
+            continue
+
+        expected_locality_code: str | None = None
+        expected_material_text = head_text
+        if len(head_text) > char_count:
+            recorded_locality = locality_issues_by_path.get(path, set())
+            if len(recorded_locality) != 1:
+                drifted.add(path)
+                continue
+            recorded_issue = next(iter(recorded_locality))
+            representation_limit = recorded_issue.limit
+            if (
+                isinstance(representation_limit, bool)
+                or not isinstance(representation_limit, int)
+                or representation_limit < char_count
+                or representation_limit < 1
+            ):
+                drifted.add(path)
+                continue
+            changed_region: tuple[str, int, int] | None = None
+            if base_identity is None:
+                changed_region = None
+            elif (
+                base_identity.state == "error:unavailable"
+                and status_by_path.get(path) is ChangeStatus.ADDED
+            ):
+                changed_region = changed_region_excerpt_from_text(
+                    head_text,
+                    None,
+                    char_limit=representation_limit,
+                )
+            elif (
+                base_identity.state == "present"
+                and comparison_base_root is not None
+            ):
+                try:
+                    base_capture = capture_confined_regular_file(
+                        comparison_base_root,
+                        path,
+                        max_bytes=MAX_SOURCE_FILE_BYTES,
+                    )
+                except (
+                    PassiveFileError,
+                    OSError,
+                    RecursionError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    drifted.add(path)
+                    continue
+                if (
+                    base_capture.size != base_identity.size
+                    or base_capture.sha256 != base_identity.sha256
+                ):
+                    drifted.add(path)
+                    continue
+                try:
+                    base_text = base_capture.content.decode(
+                        "utf-8", errors="strict"
+                    )
+                    base_text = base_text.replace("\r\n", "\n").replace(
+                        "\r", "\n"
+                    )
+                except UnicodeError:
+                    base_text = None
+                    changed_region = None
+                else:
+                    changed_region = changed_region_excerpt_from_text(
+                        head_text,
+                        base_text,
+                        char_limit=representation_limit,
+                    )
+            else:
+                drifted.add(path)
+                continue
+            localized = changed_region is not None
+            expected_material_text = (
+                changed_region[0]
+                if changed_region is not None
+                else head_text[:representation_limit]
+            )
+            if len(expected_material_text) != char_count:
+                drifted.add(path)
+                continue
+            expected_locality_code = (
+                "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+                if localized
+                else "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+            )
+        expected_locality_issues = (
+            set()
+            if expected_locality_code is None
+            else {
+                ScopeIssue(
+                    code=expected_locality_code,
+                    path=path,
+                    observed=len(head_text),
+                    limit=(
+                        next(iter(locality_issues_by_path[path])).limit
+                        if expected_locality_code is not None
+                        else None
+                    ),
+                )
+            }
+        )
+        if locality_issues_by_path.get(path, set()) != expected_locality_issues:
+            drifted.add(path)
+
+        if path in expected_set:
+            records = records_by_path.get(path, ())
+            if (
+                len(records) != 1
+                or records[0].text != expected_material_text
+                or records[0].sha256
+                != hashlib.sha256(records[0].text.encode("utf-8")).hexdigest()
+            ):
+                drifted.add(path)
+
+    if not drifted:
+        return scope, (), ()
+
+    sanitized = _sanitize_scope_material_paths(scope, drifted)
+    return sanitized, tuple(sorted(drifted)), tuple(sorted(head_drifted))
+
+
 def _retain_audits_after_material_drift(
     snapshots: Sequence[DeterministicAuditSnapshot],
     plans: Sequence[ManifestAuditPlan],
@@ -900,6 +1704,98 @@ def _retain_audits_after_material_drift(
         snapshot
         for snapshot in snapshots
         if snapshot.manifest_path not in invalidated_manifests
+    )
+
+
+def _audit_plan_drifted_paths(
+    plans: Sequence[ManifestAuditPlan],
+    material_identities: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+) -> tuple[str, ...]:
+    """Compare planned Audit inputs with the initial preflight-bound head state."""
+
+    expected = {
+        path: head.sha256 if head.state == "present" else None
+        for path, head, _base in material_identities
+    }
+    drifted: set[str] = set()
+    for plan in plans:
+        # Empty identities remain a compatibility seam for manually supplied
+        # plans; every production plan carries a complete bounded identity set.
+        if not plan.input_sha256:
+            continue
+        for path, sha256 in plan.input_sha256:
+            if path not in expected:
+                if sha256 is not None:
+                    drifted.add(path)
+                continue
+            if expected[path] != sha256:
+                drifted.add(path)
+    return tuple(sorted(drifted))
+
+
+def _evidence_material_identities(
+    captured: Sequence[
+        tuple[str, _MaterialPathIdentity, _MaterialPathIdentity | None]
+    ],
+) -> tuple[EvidenceMaterialIdentity, ...]:
+    """Adapt validated bounded identities for descriptor-bound evidence reads."""
+
+    identities: list[EvidenceMaterialIdentity] = []
+    for path, head, base in captured:
+        if head.state != "present" or head.sha256 is None or head.size is None:
+            raise ReviewError("selected head evidence identity is unavailable")
+        if base is None:
+            base_sha256 = None
+            base_size = None
+            base_bound = False
+            base_absent = False
+        elif base.state == "error:unavailable":
+            base_sha256 = None
+            base_size = None
+            base_bound = True
+            base_absent = True
+        elif base.state == "present" and base.sha256 is not None and base.size is not None:
+            base_sha256 = base.sha256
+            base_size = base.size
+            base_bound = True
+            base_absent = False
+        else:
+            raise ReviewError("selected base evidence identity is unavailable")
+        identities.append(
+            EvidenceMaterialIdentity(
+                path=path,
+                head_sha256=head.sha256,
+                head_size=head.size,
+                base_sha256=base_sha256,
+                base_size=base_size,
+                base_bound=base_bound,
+                base_absent=base_absent,
+            )
+        )
+    return tuple(identities)
+
+
+def _evidence_identity_drifted_paths(
+    evidence: EvidenceBundle,
+    identities: Sequence[EvidenceMaterialIdentity],
+) -> tuple[str, ...]:
+    """Reject evidence envelopes not tied to the authorized full-file identity."""
+
+    expected = {
+        identity.path: (identity.head_sha256, identity.head_size)
+        for identity in identities
+    }
+    return tuple(
+        sorted(
+            {
+                reference.path
+                for reference in evidence.references
+                if expected.get(reference.path)
+                != (reference.sha256, reference.size)
+            }
+        )
     )
 
 
@@ -974,31 +1870,192 @@ def run_review(
     config: ReviewConfig,
     *,
     provider: ReviewerProvider | None = None,
+    preflight_only: bool = False,
 ) -> ResearchReview:
     """Run the fixed two-call advisory review state machine."""
 
     if not isinstance(config, ReviewConfig):
         raise ReviewError("config must be ReviewConfig")
+    if not isinstance(preflight_only, bool):
+        raise ReviewError("preflight_only must be a boolean")
     preflight: ReviewPreflight | None = None
+    provider_lifecycle = ProviderLifecycle.NOT_ATTEMPTED
+    provider_attempt_count = 0
 
     def finish(status: ReviewStatus, **kwargs: Any) -> ResearchReview:
-        return _result(status, preflight=preflight, **kwargs)
+        return _result(
+            status,
+            preflight=preflight,
+            provider_lifecycle=provider_lifecycle,
+            provider_attempt_count=provider_attempt_count,
+            **kwargs,
+        )
 
     if not config.enabled:
         return finish(ReviewStatus.DISABLED)
     if not isinstance(inputs, ReviewInputs):
         raise ReviewError("inputs must be ReviewInputs")
     from .preflight import (
-        build_git_change_inventory,
-        build_review_scope,
-        preflight_review,
+        _plan_preflight_review,
+        revalidate_preflight_coordinates,
         scope_source_bundle,
     )
 
-    preflight = preflight_review(inputs, config)
+    preflight = _plan_preflight_review(inputs, config)
+    comparison_base_root = (
+        inputs.comparison_base.root
+        if inputs.comparison_base is not None
+        else inputs.base_root
+    )
+    if (
+        preflight is not None
+        and preflight.ready_for_provider
+        and preflight.scope is not None
+    ):
+        invalidated_issue_paths = _revalidate_unmaterialized_material_issues(
+            inputs,
+            preflight.scope,
+        )
+        if invalidated_issue_paths:
+            sanitized_scope = _sanitize_scope_material_paths(
+                preflight.scope,
+                invalidated_issue_paths,
+            )
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                sanitized_scope,
+                invalidated_issue_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                error_code="PREFLIGHT_G2_MATERIAL_SOURCE_INVALIDATED",
+                error_message=(
+                    "A material omission could not be bound to the exact "
+                    "repository bytes; provider execution was skipped."
+                ),
+            )
     if preflight is not None and not preflight.ready_for_provider:
         failure = next(
             gate for gate in preflight.gates if gate.disposition.value == "fail"
+        )
+        if failure.gate == 1:
+            # A failed coordinate/inventory gate cannot authorize retaining any
+            # materialized repository content from that untrusted scope.
+            preflight = replace(preflight, scope=None)
+        elif preflight.scope is not None:
+            failed_scope = preflight.scope
+            selected = tuple(sorted(failed_scope.selected_paths))
+            unmaterialized_issue_paths = _unmaterialized_material_issue_paths(
+                failed_scope
+            )
+            hash_bindable_issue_paths = tuple(
+                path
+                for path in unmaterialized_issue_paths
+                if any(
+                    issue.path == path
+                    and issue.code == "PREFLIGHT_G2_CANDIDATE_UNREADABLE"
+                    for issue in failed_scope.issues
+                )
+            )
+            bound_paths = tuple(
+                sorted(set(selected) | set(hash_bindable_issue_paths))
+            )
+            captured = ()
+            invalidated_paths: set[str] = set()
+            try:
+                captured = _capture_material_scope_identities(
+                    inputs.repository_root,
+                    bound_paths,
+                    comparison_base_root=comparison_base_root,
+                )
+                failed_scope, drifted, _head_drifted = _bind_scope_materialization(
+                    inputs.repository_root,
+                    failed_scope,
+                    captured,
+                    comparison_base_root=comparison_base_root,
+                )
+            except ReviewError:
+                drifted = tuple(
+                    sorted(
+                        set(selected)
+                        | {
+                            source.path
+                            for source in failed_scope.sources
+                            if source.kind is SourceKind.REPOSITORY_FILE
+                            and source.path is not None
+                        }
+                    )
+                )
+                failed_scope = _sanitize_scope_material_paths(
+                    failed_scope,
+                    drifted,
+                )
+            invalidated_paths.update(drifted)
+            invalidated_paths.update(
+                _revalidate_unmaterialized_material_issues(inputs, failed_scope)
+            )
+
+            # A descriptor-consistent filesystem snapshot must still belong to
+            # the declared Git HEAD. Revalidate without rematerializing, then
+            # recapture to close a restore-during-Git-check ABA window.
+            preflight = replace(preflight, scope=failed_scope)
+            preflight = revalidate_preflight_coordinates(inputs, preflight)
+            if preflight.gates[0].disposition is not GateDisposition.FAIL:
+                try:
+                    _verify_material_git_binding(
+                        inputs,
+                        failed_scope,
+                        captured,
+                    )
+                except InventoryVerificationError as exc:
+                    preflight = _coordinate_failure_preflight(
+                        preflight,
+                        exc.code,
+                    )
+            if preflight.gates[0].disposition is not GateDisposition.FAIL:
+                invalidated_paths.update(
+                    _revalidate_unmaterialized_material_issues(
+                        inputs,
+                        failed_scope,
+                    )
+                )
+                try:
+                    recaptured = _capture_material_scope_identities(
+                        inputs.repository_root,
+                        bound_paths,
+                        comparison_base_root=comparison_base_root,
+                    )
+                    recapture_failures, _recapture_head_failures = (
+                        _material_scope_capture_failure_paths(
+                            recaptured,
+                            failed_scope.inventory,
+                        )
+                    )
+                    recaptured_head_drift, recaptured_base_drift = (
+                        _material_scope_drifted_paths(captured, recaptured)
+                    )
+                    invalidated_paths.update(recapture_failures)
+                    invalidated_paths.update(recaptured_head_drift)
+                    invalidated_paths.update(recaptured_base_drift)
+                except ReviewError:
+                    invalidated_paths.update(bound_paths)
+            if (
+                preflight.gates[0].disposition is not GateDisposition.FAIL
+                and invalidated_paths
+            ):
+                failed_scope = _sanitize_scope_material_paths(
+                    failed_scope,
+                    tuple(sorted(invalidated_paths)),
+                )
+                preflight = _sanitize_preflight_material_facts(
+                    preflight,
+                    failed_scope,
+                    tuple(sorted(invalidated_paths)),
+                )
+        else:
+            preflight = revalidate_preflight_coordinates(inputs, preflight)
+        failure = next(
+            gate for gate in preflight.gates if gate.disposition is GateDisposition.FAIL
         )
         return finish(
             ReviewStatus.UNAVAILABLE,
@@ -1009,11 +2066,7 @@ def run_review(
         assert preflight.scope is not None
         planned_scope = preflight.scope
         selected_material_paths = tuple(sorted(planned_scope.selected_paths))
-        comparison_base_root = (
-            inputs.comparison_base.root
-            if inputs.comparison_base is not None
-            else inputs.base_root
-        )
+        materialized_scope_identities = ()
         try:
             materialized_scope_identities = _capture_material_scope_identities(
                 inputs.repository_root,
@@ -1029,25 +2082,151 @@ def run_review(
             )
         except ReviewError:
             initial_capture_failure_paths = tuple(selected_material_paths)
-        if initial_capture_failure_paths:
-            preflight = _record_runtime_gate3_omissions(
-                preflight,
-                (
-                    (
-                        "PREFLIGHT_G3_MATERIAL_SCOPE_UNAVAILABLE",
-                        "material_scope_capture_failure_count",
-                        len(initial_capture_failure_paths),
-                    ),
+        try:
+            (
+                planned_scope,
+                source_scope_drifted_paths,
+                _source_head_drifted_paths,
+            ) = _bind_scope_materialization(
+                inputs.repository_root,
+                planned_scope,
+                materialized_scope_identities,
+                comparison_base_root=comparison_base_root,
+            )
+        except ReviewError:
+            source_scope_drifted_paths = tuple(
+                sorted(
+                    set(selected_material_paths)
+                    | {
+                        source.path
+                        for source in planned_scope.sources
+                        if source.kind is SourceKind.REPOSITORY_FILE
+                        and source.path is not None
+                    }
+                )
+            )
+            planned_scope = _sanitize_scope_material_paths(
+                planned_scope,
+                source_scope_drifted_paths,
+            )
+        preflight = replace(preflight, scope=planned_scope)
+        preflight = revalidate_preflight_coordinates(inputs, preflight)
+        if preflight.gates[0].disposition is GateDisposition.FAIL:
+            failure = preflight.gates[0]
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                error_code=failure.reasons[0].code,
+                error_message=(
+                    "Research review coordinates changed after materialization; "
+                    "provider execution was skipped."
                 ),
+            )
+        initially_unbound_paths = tuple(
+            sorted(
+                set(initial_capture_failure_paths)
+                | set(source_scope_drifted_paths)
+            )
+        )
+        if initially_unbound_paths:
+            planned_scope = _sanitize_scope_material_paths(
+                planned_scope,
+                initially_unbound_paths,
+            )
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                planned_scope,
+                initially_unbound_paths,
             )
             return finish(
-                ReviewStatus.PARTIAL,
-                error_code="MATERIAL_SCOPE_CAPTURE_FAILED",
+                ReviewStatus.UNAVAILABLE,
+                error_code="PREFLIGHT_G2_MATERIAL_SOURCE_INVALIDATED",
                 error_message=(
-                    f"{len(initial_capture_failure_paths)} selected material "
-                    "path(s) could not be bound after preflight materialization."
+                    f"{len(initially_unbound_paths)} selected material path(s) "
+                    "could not be bound to exact repository bytes; provider "
+                    "execution was skipped."
                 ),
             )
+        try:
+            _verify_material_git_binding(
+                inputs,
+                planned_scope,
+                materialized_scope_identities,
+            )
+        except InventoryVerificationError as exc:
+            preflight = _coordinate_failure_preflight(preflight, exc.code)
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                error_code=exc.code,
+                error_message=(
+                    "Selected review material did not match the exact declared "
+                    "Git objects; provider execution was skipped."
+                ),
+            )
+
+        post_git_capture_failure_paths: tuple[str, ...] = ()
+        post_git_identity_drifted_paths: tuple[str, ...] = ()
+        try:
+            post_git_material_identities = _capture_material_scope_identities(
+                inputs.repository_root,
+                selected_material_paths,
+                comparison_base_root=comparison_base_root,
+            )
+            post_git_capture_failure_paths, _post_git_head_failures = (
+                _material_scope_capture_failure_paths(
+                    post_git_material_identities,
+                    planned_scope.inventory,
+                )
+            )
+            post_git_head_drifted, post_git_base_drifted = (
+                _material_scope_drifted_paths(
+                    materialized_scope_identities,
+                    post_git_material_identities,
+                )
+            )
+            post_git_identity_drifted_paths = tuple(
+                sorted(set(post_git_head_drifted) | set(post_git_base_drifted))
+            )
+        except ReviewError:
+            post_git_capture_failure_paths = tuple(selected_material_paths)
+        initial_capture_failure_paths = tuple(
+            sorted(
+                set(initial_capture_failure_paths)
+                | set(post_git_capture_failure_paths)
+            )
+        )
+        source_scope_drifted_paths = tuple(
+            sorted(
+                set(source_scope_drifted_paths)
+                | set(post_git_identity_drifted_paths)
+            )
+        )
+        unbound_initial_paths = tuple(
+            sorted(
+                set(initial_capture_failure_paths)
+                | set(source_scope_drifted_paths)
+            )
+        )
+        if unbound_initial_paths:
+            planned_scope = _sanitize_scope_material_paths(
+                planned_scope,
+                unbound_initial_paths,
+            )
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                planned_scope,
+                unbound_initial_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                error_code="PREFLIGHT_G2_MATERIAL_SOURCE_INVALIDATED",
+                error_message=(
+                    f"{len(unbound_initial_paths)} selected material path(s) "
+                    "could not be bound to exact repository bytes; provider "
+                    "execution was skipped."
+                ),
+            )
+        if preflight_only:
+            return finish(preflight.review_status_ceiling)
         preflight_sources = scope_source_bundle(planned_scope)
         evidence_limits = replace(
             config.limits,
@@ -1068,6 +2247,9 @@ def run_review(
         evidence_limits = config.limits
 
     calls: list[ProviderCallRecord] = []
+    provider_failure_handler: Any = None
+    failure_claims: tuple[ScientificClaim, ...] = ()
+    failure_evidence = EvidenceBundle()
     try:
         sources = (
             preflight_sources
@@ -1083,15 +2265,32 @@ def run_review(
         manifest_candidates = discover_manifests(
             inputs.repository_root,
             sources.repository_paths,
-            max_manifests=min(4, config.limits.max_files),
+            max_manifests=min(MAX_MANIFEST_AUDITS, config.limits.max_files),
         )
-        audit_issued_paths = (
-            sources.repository_paths if preflight_sources is not None else None
-        )
+        audit_issued_paths = None
+        if preflight_sources is not None:
+            assert preflight is not None and preflight.scope is not None
+            audit_issued_paths = tuple(
+                dict.fromkeys(
+                    (
+                        *sources.repository_paths,
+                        *(
+                            path
+                            for group in preflight.scope.atomic_path_groups
+                            for path in group
+                        ),
+                    )
+                )
+            )
         audit_selected_paths = (
             preflight.scope.selected_paths
             if preflight is not None and preflight.scope is not None
             else ()
+        )
+        audit_relevance_paths = (
+            tuple(entry.path for entry in preflight.scope.inventory.entries)
+            if preflight is not None and preflight.scope is not None
+            else sources.changed_paths
         )
         audit_plans = select_relevant_manifest_audit_plans(
             plan_manifest_audits(
@@ -1101,13 +2300,13 @@ def run_review(
                 selected_paths=audit_selected_paths,
                 issued_paths=audit_issued_paths,
             ),
-            changed_paths=sources.changed_paths,
+            changed_paths=audit_relevance_paths,
         )
         omitted_audit_plan_count = 0
         omitted_audit_dependency_count = 0
         invalidated_audit_plan_count = 0
         if preflight_sources is not None:
-            issued_paths = set(preflight_sources.repository_paths)
+            issued_paths = set(audit_issued_paths or ())
             retained_audit_plans = tuple(
                 plan
                 for plan in audit_plans
@@ -1156,6 +2355,32 @@ def run_review(
             reserved_plans=audit_plans,
             issued_paths=audit_issued_paths,
         )
+        audit_plan_drifted_paths = _audit_plan_drifted_paths(
+            audit_plans,
+            materialized_scope_identities,
+        )
+        if audit_plan_drifted_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                audit_plan_drifted_paths,
+            )
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                preflight.scope,
+                audit_plan_drifted_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "A deterministic Audit plan observed selected head bytes "
+                    "that differ from the provider-free materialization; "
+                    "provider execution was skipped."
+                ),
+            )
         completed_audit_manifests = {
             snapshot.manifest_path for snapshot in deterministic_audits
         }
@@ -1174,6 +2399,180 @@ def run_review(
             ),
         )
         if invalidated_audit_plan_count:
+            # A missing Audit snapshot can mean either a stable local execution
+            # failure or that the live checkout stopped matching the bound
+            # private-mirror inputs while Audit was running.  Prove the former
+            # before returning a scope that still describes provider-eligible
+            # material.  The Git check and trailing recapture close the same
+            # descriptor/Git/descriptor ABA window as the normal provider path.
+            assert preflight.scope is not None
+            audit_failure_scope = preflight.scope
+            audit_failure_invalidated: set[str] = set()
+            audit_failure_head_invalidated: set[str] = set()
+            audit_failure_identities = ()
+            try:
+                audit_failure_identities = _capture_material_scope_identities(
+                    inputs.repository_root,
+                    selected_material_paths,
+                    comparison_base_root=comparison_base_root,
+                )
+                (
+                    audit_failure_capture_paths,
+                    audit_failure_capture_head_paths,
+                ) = _material_scope_capture_failure_paths(
+                    audit_failure_identities,
+                    planned_scope.inventory,
+                )
+                (
+                    audit_failure_head_drifted,
+                    audit_failure_base_drifted,
+                ) = _material_scope_drifted_paths(
+                    materialized_scope_identities,
+                    audit_failure_identities,
+                )
+                (
+                    audit_failure_scope,
+                    audit_failure_source_drifted,
+                    audit_failure_source_head_drifted,
+                ) = _bind_scope_materialization(
+                    inputs.repository_root,
+                    audit_failure_scope,
+                    audit_failure_identities,
+                    comparison_base_root=comparison_base_root,
+                )
+                audit_failure_invalidated.update(audit_failure_capture_paths)
+                audit_failure_invalidated.update(audit_failure_head_drifted)
+                audit_failure_invalidated.update(audit_failure_base_drifted)
+                audit_failure_invalidated.update(audit_failure_source_drifted)
+                audit_failure_head_invalidated.update(
+                    audit_failure_capture_head_paths
+                )
+                audit_failure_head_invalidated.update(audit_failure_head_drifted)
+                audit_failure_head_invalidated.update(
+                    audit_failure_source_head_drifted
+                )
+            except ReviewError:
+                audit_failure_invalidated.update(selected_material_paths)
+                audit_failure_head_invalidated.update(selected_material_paths)
+                audit_failure_scope = _sanitize_scope_material_paths(
+                    audit_failure_scope,
+                    selected_material_paths,
+                )
+            audit_failure_invalidated.update(
+                _revalidate_unmaterialized_material_issues(
+                    inputs,
+                    audit_failure_scope,
+                )
+            )
+            if audit_failure_invalidated:
+                deterministic_audits = _retain_audits_after_material_drift(
+                    deterministic_audits,
+                    audit_plans,
+                    tuple(sorted(audit_failure_head_invalidated)),
+                )
+                preflight = _sanitize_preflight_material_facts(
+                    preflight,
+                    audit_failure_scope,
+                    tuple(sorted(audit_failure_invalidated)),
+                )
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    deterministic_audits=deterministic_audits,
+                    error_code="MATERIAL_SCOPE_INVALIDATED",
+                    error_message=(
+                        "Selected material changed while deterministic Audit "
+                        "was running; provider execution was skipped."
+                    ),
+                )
+
+            preflight = replace(preflight, scope=audit_failure_scope)
+            preflight = revalidate_preflight_coordinates(inputs, preflight)
+            if preflight.gates[0].disposition is GateDisposition.FAIL:
+                deterministic_audits = ()
+                failure = preflight.gates[0]
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    deterministic_audits=deterministic_audits,
+                    error_code=failure.reasons[0].code,
+                    error_message=(
+                        "Research review coordinates changed after deterministic "
+                        "Audit; provider execution was skipped."
+                    ),
+                )
+            try:
+                _verify_material_git_binding(
+                    inputs,
+                    audit_failure_scope,
+                    audit_failure_identities,
+                )
+            except InventoryVerificationError as exc:
+                deterministic_audits = ()
+                preflight = _coordinate_failure_preflight(preflight, exc.code)
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    deterministic_audits=deterministic_audits,
+                    error_code=exc.code,
+                    error_message=(
+                        "Selected review material no longer matched the exact "
+                        "declared Git objects after deterministic Audit."
+                    ),
+                )
+
+            post_audit_invalidated: set[str] = set()
+            post_audit_head_invalidated: set[str] = set()
+            try:
+                post_audit_identities = _capture_material_scope_identities(
+                    inputs.repository_root,
+                    selected_material_paths,
+                    comparison_base_root=comparison_base_root,
+                )
+                post_audit_failures, post_audit_head_failures = (
+                    _material_scope_capture_failure_paths(
+                        post_audit_identities,
+                        planned_scope.inventory,
+                    )
+                )
+                post_audit_head_drifted, post_audit_base_drifted = (
+                    _material_scope_drifted_paths(
+                        audit_failure_identities,
+                        post_audit_identities,
+                    )
+                )
+                post_audit_invalidated.update(post_audit_failures)
+                post_audit_invalidated.update(post_audit_head_drifted)
+                post_audit_invalidated.update(post_audit_base_drifted)
+                post_audit_head_invalidated.update(post_audit_head_failures)
+                post_audit_head_invalidated.update(post_audit_head_drifted)
+            except ReviewError:
+                post_audit_invalidated.update(selected_material_paths)
+                post_audit_head_invalidated.update(selected_material_paths)
+            post_audit_invalidated.update(
+                _revalidate_unmaterialized_material_issues(
+                    inputs,
+                    audit_failure_scope,
+                )
+            )
+            if post_audit_invalidated:
+                deterministic_audits = _retain_audits_after_material_drift(
+                    deterministic_audits,
+                    audit_plans,
+                    tuple(sorted(post_audit_head_invalidated)),
+                )
+                preflight = _sanitize_preflight_material_facts(
+                    preflight,
+                    audit_failure_scope,
+                    tuple(sorted(post_audit_invalidated)),
+                )
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    deterministic_audits=deterministic_audits,
+                    error_code="MATERIAL_SCOPE_INVALIDATED",
+                    error_message=(
+                        "Selected material changed while deterministic Audit "
+                        "authority was being revalidated; provider execution "
+                        "was skipped."
+                    ),
+                )
             return finish(
                 ReviewStatus.PARTIAL,
                 deterministic_audits=deterministic_audits,
@@ -1193,55 +2592,6 @@ def run_review(
             if (plan := plans_by_manifest.get(snapshot.manifest_path)) is not None
         )
         assert planned_scope is not None
-        scope_refresh_failed = False
-        try:
-            if (
-                planned_scope.inventory.source
-                is ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH
-            ):
-                requested = inputs.requested_base
-                comparison = inputs.comparison_base
-                head = inputs.head
-                if requested is None or comparison is None or head is None:
-                    raise ReviewError("declared material coordinates are unavailable")
-                verified_inventory = build_git_change_inventory(
-                    requested,
-                    comparison,
-                    head,
-                    planned_scope.inventory.comparison_basis,
-                )
-                if verified_inventory != planned_scope.inventory:
-                    raise ReviewError("declared material inventory changed at runtime")
-            refreshed_scope = build_review_scope(
-                inputs,
-                config,
-                planned_scope.inventory,
-            )
-            if refreshed_scope != planned_scope:
-                raise ReviewError("selected material scope changed at runtime")
-        except ReviewError:
-            scope_refresh_failed = True
-        if scope_refresh_failed:
-            deterministic_audits = ()
-            preflight = _record_runtime_gate3_omissions(
-                preflight,
-                (
-                    (
-                        "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED",
-                        "material_scope_invalidated_count",
-                        len(selected_material_paths),
-                    ),
-                ),
-            )
-            return finish(
-                ReviewStatus.PARTIAL,
-                deterministic_audits=deterministic_audits,
-                error_code="MATERIAL_SCOPE_INVALIDATED",
-                error_message=(
-                    "The exact selected material scope changed after its "
-                    "provider-free preflight; provider execution was skipped."
-                ),
-            )
         try:
             pre_provider_material_identities = _capture_material_scope_identities(
                 inputs.repository_root,
@@ -1256,39 +2606,241 @@ def run_review(
                 planned_scope.inventory,
             )
         except ReviewError:
+            pre_provider_material_identities = ()
             material_capture_failure_paths = tuple(selected_material_paths)
             material_capture_head_failure_paths = tuple(selected_material_paths)
-        if material_capture_failure_paths:
-            deterministic_audits = _retain_audits_after_material_drift(
-                deterministic_audits,
-                audit_plans,
-                material_capture_head_failure_paths,
+        if pre_provider_material_identities:
+            (
+                head_material_drifted_paths,
+                base_material_drifted_paths,
+            ) = _material_scope_drifted_paths(
+                materialized_scope_identities,
+                pre_provider_material_identities,
             )
-            preflight = _record_runtime_gate3_omissions(
-                preflight,
-                (
+        else:
+            head_material_drifted_paths = tuple(selected_material_paths)
+            base_material_drifted_paths = ()
+        material_drifted_paths = tuple(
+            sorted(
+                set(head_material_drifted_paths)
+                | set(base_material_drifted_paths)
+            )
+        )
+
+        # Re-run the complete free gate sequence after deterministic Audit and
+        # before provider construction. A coordinate failure must replace the
+        # stale passing record with its exact authoritative gate result.
+        refreshed_preflight = _plan_preflight_review(inputs, config)
+        if not refreshed_preflight.ready_for_provider:
+            preflight = refreshed_preflight
+            failure = next(
+                gate
+                for gate in preflight.gates
+                if gate.disposition is GateDisposition.FAIL
+            )
+            if failure.gate == 1:
+                # Exact-coordinate failure means no prior Audit can retain
+                # authoritative provenance, regardless of matching path hashes.
+                deterministic_audits = ()
+            else:
+                # A later routing/budget failure does not erase an Audit whose
+                # exact head inputs remain stable. Re-capture after the failed
+                # refresh as well, so a mutation at its return boundary cannot
+                # preserve a stale authoritative snapshot.
+                failed_refresh_identities = ()
+                try:
+                    failed_refresh_identities = _capture_material_scope_identities(
+                        inputs.repository_root,
+                        selected_material_paths,
+                        comparison_base_root=comparison_base_root,
+                    )
                     (
-                        "PREFLIGHT_G3_MATERIAL_SCOPE_UNAVAILABLE",
-                        "material_scope_capture_failure_count",
-                        len(material_capture_failure_paths),
-                    ),
-                ),
+                        _failed_refresh_capture_paths,
+                        failed_refresh_head_failure_paths,
+                    ) = _material_scope_capture_failure_paths(
+                        failed_refresh_identities,
+                        planned_scope.inventory,
+                    )
+                    (
+                        failed_refresh_head_drifted_paths,
+                        _failed_refresh_base_drifted_paths,
+                    ) = _material_scope_drifted_paths(
+                        materialized_scope_identities,
+                        failed_refresh_identities,
+                    )
+                except ReviewError:
+                    failed_refresh_head_failure_paths = tuple(
+                        selected_material_paths
+                    )
+                    failed_refresh_head_drifted_paths = tuple(
+                        selected_material_paths
+                    )
+                failed_source_head_drifted_paths: tuple[str, ...] = ()
+                if preflight.scope is not None:
+                    failed_scope = preflight.scope
+                    try:
+                        (
+                            sanitized_failed_scope,
+                            failed_source_drifted_paths,
+                            failed_source_head_drifted_paths,
+                        ) = _bind_scope_materialization(
+                            inputs.repository_root,
+                            failed_scope,
+                            failed_refresh_identities,
+                            comparison_base_root=comparison_base_root,
+                        )
+                    except ReviewError:
+                        failed_source_drifted_paths = tuple(
+                            sorted(
+                                set(selected_material_paths)
+                                | {
+                                    source.path
+                                    for source in failed_scope.sources
+                                    if source.kind is SourceKind.REPOSITORY_FILE
+                                    and source.path is not None
+                                }
+                            )
+                        )
+                        failed_source_head_drifted_paths = tuple(
+                            selected_material_paths
+                        )
+                        sanitized_failed_scope = _sanitize_scope_material_paths(
+                            failed_scope,
+                            failed_source_drifted_paths,
+                        )
+                    failed_issue_drifted_paths = (
+                        _revalidate_unmaterialized_material_issues(
+                            inputs,
+                            sanitized_failed_scope,
+                        )
+                    )
+                    failed_scope_drifted_paths = tuple(
+                        sorted(
+                            set(failed_source_drifted_paths)
+                            | set(failed_issue_drifted_paths)
+                        )
+                    )
+                    if failed_scope_drifted_paths:
+                        sanitized_failed_scope = _sanitize_scope_material_paths(
+                            sanitized_failed_scope,
+                            failed_scope_drifted_paths,
+                        )
+                        preflight = _sanitize_preflight_material_facts(
+                            preflight,
+                            sanitized_failed_scope,
+                            failed_scope_drifted_paths,
+                        )
+                    else:
+                        preflight = replace(
+                            preflight,
+                            scope=sanitized_failed_scope,
+                        )
+                invalid_audit_head_paths = tuple(
+                    sorted(
+                        set(material_capture_head_failure_paths)
+                        | set(head_material_drifted_paths)
+                        | set(failed_refresh_head_failure_paths)
+                        | set(failed_refresh_head_drifted_paths)
+                        | set(failed_source_head_drifted_paths)
+                    )
+                )
+                deterministic_audits = _retain_audits_after_material_drift(
+                    deterministic_audits,
+                    audit_plans,
+                    invalid_audit_head_paths,
+                )
+            failure = next(
+                gate
+                for gate in preflight.gates
+                if gate.disposition is GateDisposition.FAIL
             )
             return finish(
-                ReviewStatus.PARTIAL,
+                ReviewStatus.UNAVAILABLE,
                 deterministic_audits=deterministic_audits,
-                error_code="MATERIAL_SCOPE_CAPTURE_FAILED",
+                error_code=failure.reasons[0].code,
                 error_message=(
-                    f"{len(material_capture_failure_paths)} selected material "
-                    "path(s) could not be captured before provider execution."
+                    "Research review runtime preflight did not pass; provider "
+                    "execution was skipped."
                 ),
             )
-        (
-            head_material_drifted_paths,
-            base_material_drifted_paths,
-        ) = _material_scope_drifted_paths(
-            materialized_scope_identities,
-            pre_provider_material_identities,
+        assert refreshed_preflight.scope is not None
+        refreshed_scope = refreshed_preflight.scope
+        refreshed_issue_drifted_paths = _revalidate_unmaterialized_material_issues(
+            inputs,
+            refreshed_scope,
+        )
+        if refreshed_issue_drifted_paths:
+            refreshed_scope = _sanitize_scope_material_paths(
+                refreshed_scope,
+                refreshed_issue_drifted_paths,
+            )
+            preflight = _sanitize_preflight_material_facts(
+                refreshed_preflight,
+                refreshed_scope,
+                refreshed_issue_drifted_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                error_code="PREFLIGHT_G2_MATERIAL_SOURCE_INVALIDATED",
+                error_message=(
+                    "A refreshed material omission could not be bound to the "
+                    "exact repository bytes; provider execution was skipped."
+                ),
+            )
+        pre_refresh_capture_failure_paths = material_capture_failure_paths
+        pre_refresh_head_failure_paths = material_capture_head_failure_paths
+        pre_refresh_head_drifted_paths = head_material_drifted_paths
+        pre_refresh_base_drifted_paths = base_material_drifted_paths
+        try:
+            pre_provider_material_identities = _capture_material_scope_identities(
+                inputs.repository_root,
+                selected_material_paths,
+                comparison_base_root=comparison_base_root,
+            )
+            (
+                post_refresh_capture_failure_paths,
+                post_refresh_head_failure_paths,
+            ) = _material_scope_capture_failure_paths(
+                pre_provider_material_identities,
+                planned_scope.inventory,
+            )
+            (
+                post_refresh_head_drifted_paths,
+                post_refresh_base_drifted_paths,
+            ) = _material_scope_drifted_paths(
+                materialized_scope_identities,
+                pre_provider_material_identities,
+            )
+        except ReviewError:
+            pre_provider_material_identities = ()
+            post_refresh_capture_failure_paths = tuple(selected_material_paths)
+            post_refresh_head_failure_paths = tuple(selected_material_paths)
+            post_refresh_head_drifted_paths = tuple(selected_material_paths)
+            post_refresh_base_drifted_paths = ()
+        material_capture_failure_paths = tuple(
+            sorted(
+                set(pre_refresh_capture_failure_paths)
+                | set(post_refresh_capture_failure_paths)
+            )
+        )
+        material_capture_head_failure_paths = tuple(
+            sorted(
+                set(pre_refresh_head_failure_paths)
+                | set(post_refresh_head_failure_paths)
+            )
+        )
+        head_material_drifted_paths = tuple(
+            sorted(
+                set(pre_refresh_head_drifted_paths)
+                | set(post_refresh_head_drifted_paths)
+            )
+        )
+        base_material_drifted_paths = tuple(
+            sorted(
+                set(pre_refresh_base_drifted_paths)
+                | set(post_refresh_base_drifted_paths)
+            )
         )
         material_drifted_paths = tuple(
             sorted(
@@ -1296,24 +2848,87 @@ def run_review(
                 | set(base_material_drifted_paths)
             )
         )
+        (
+            refreshed_scope,
+            source_scope_drifted_paths,
+            source_head_drifted_paths,
+        ) = _bind_scope_materialization(
+            inputs.repository_root,
+            refreshed_scope,
+            pre_provider_material_identities,
+            comparison_base_root=comparison_base_root,
+        )
+        refreshed_preflight = replace(
+            refreshed_preflight,
+            scope=refreshed_scope,
+        )
+        head_material_drifted_paths = tuple(
+            sorted(
+                set(head_material_drifted_paths)
+                | set(source_head_drifted_paths)
+            )
+        )
+        material_drifted_paths = tuple(
+            sorted(
+                set(material_drifted_paths)
+                | set(source_scope_drifted_paths)
+            )
+        )
+        if material_capture_failure_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                material_capture_head_failure_paths,
+            )
+            preflight = _sanitize_preflight_material_facts(
+                refreshed_preflight,
+                refreshed_scope,
+                material_capture_failure_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                error_code="MATERIAL_SCOPE_CAPTURE_FAILED",
+                error_message=(
+                    f"{len(material_capture_failure_paths)} selected material "
+                    "path(s) could not be captured before provider execution."
+                ),
+            )
+        if refreshed_scope != planned_scope:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                head_material_drifted_paths,
+            )
+            invalidated_paths = material_drifted_paths or selected_material_paths
+            preflight = _sanitize_preflight_material_facts(
+                refreshed_preflight,
+                refreshed_scope,
+                invalidated_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "The exact selected material scope changed after its "
+                    "provider-free preflight; provider execution was skipped."
+                ),
+            )
         if material_drifted_paths:
             deterministic_audits = _retain_audits_after_material_drift(
                 deterministic_audits,
                 audit_plans,
                 head_material_drifted_paths,
             )
-            preflight = _record_runtime_gate3_omissions(
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
                 preflight,
-                (
-                    (
-                        "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED",
-                        "material_scope_invalidated_count",
-                        len(material_drifted_paths),
-                    ),
-                ),
+                preflight.scope,
+                material_drifted_paths,
             )
             return finish(
-                ReviewStatus.PARTIAL,
+                ReviewStatus.UNAVAILABLE,
                 deterministic_audits=deterministic_audits,
                 error_code="MATERIAL_SCOPE_INVALIDATED",
                 error_message=(
@@ -1321,7 +2936,379 @@ def run_review(
                     "materialization; provider execution was skipped."
                 ),
             )
+        evidence_material_identities = _evidence_material_identities(
+            pre_provider_material_identities
+        )
         frozen_material_identities = pre_provider_material_identities
+
+        def finish_provider_failure(
+            exc: Exception,
+            *,
+            retained_claims: tuple[ScientificClaim, ...] = (),
+            retained_evidence: EvidenceBundle = EvidenceBundle(),
+        ) -> ResearchReview:
+            """Fail closed while retaining only freshly revalidated authority."""
+
+            nonlocal preflight
+            safe_claims = retained_claims
+            safe_evidence = retained_evidence
+            safe_audits = deterministic_audits
+            invalid_paths: set[str] = set()
+            invalid_head_paths: set[str] = set()
+
+            try:
+                if preflight is None or preflight.scope is None:
+                    raise ReviewError("provider failure has no bound scope")
+                preflight = revalidate_preflight_coordinates(inputs, preflight)
+                if preflight.gates[0].disposition is GateDisposition.FAIL:
+                    preflight = replace(preflight, scope=None)
+                    safe_claims = ()
+                    safe_evidence = EvidenceBundle()
+                    safe_audits = ()
+                else:
+                    assert preflight.scope is not None
+                    post_failure_identities = _capture_material_scope_identities(
+                        inputs.repository_root,
+                        selected_material_paths,
+                        comparison_base_root=comparison_base_root,
+                    )
+                    capture_failures, capture_head_failures = (
+                        _material_scope_capture_failure_paths(
+                            post_failure_identities,
+                            planned_scope.inventory,
+                        )
+                    )
+                    head_drifted, base_drifted = _material_scope_drifted_paths(
+                        frozen_material_identities,
+                        post_failure_identities,
+                    )
+                    invalid_paths.update(capture_failures)
+                    invalid_paths.update(head_drifted)
+                    invalid_paths.update(base_drifted)
+                    invalid_head_paths.update(capture_head_failures)
+                    invalid_head_paths.update(head_drifted)
+
+                    if not invalid_paths:
+                        _verify_material_git_binding(
+                            inputs,
+                            preflight.scope,
+                            post_failure_identities,
+                        )
+                        recaptured_identities = (
+                            _capture_material_scope_identities(
+                                inputs.repository_root,
+                                selected_material_paths,
+                                comparison_base_root=comparison_base_root,
+                            )
+                        )
+                        recapture_failures, recapture_head_failures = (
+                            _material_scope_capture_failure_paths(
+                                recaptured_identities,
+                                planned_scope.inventory,
+                            )
+                        )
+                        recaptured_head_drifted, recaptured_base_drifted = (
+                            _material_scope_drifted_paths(
+                                frozen_material_identities,
+                                recaptured_identities,
+                            )
+                        )
+                        invalid_paths.update(recapture_failures)
+                        invalid_paths.update(recaptured_head_drifted)
+                        invalid_paths.update(recaptured_base_drifted)
+                        invalid_head_paths.update(recapture_head_failures)
+                        invalid_head_paths.update(recaptured_head_drifted)
+
+                    if invalid_paths:
+                        safe_claims = ()
+                        safe_evidence = EvidenceBundle()
+                        safe_audits = _retain_audits_after_material_drift(
+                            safe_audits,
+                            audit_plans,
+                            tuple(sorted(invalid_head_paths)),
+                        )
+                        sanitized_scope = _sanitize_scope_material_paths(
+                            preflight.scope,
+                            tuple(sorted(invalid_paths)),
+                        )
+                        preflight = _sanitize_preflight_material_facts(
+                            preflight,
+                            sanitized_scope,
+                            tuple(sorted(invalid_paths)),
+                        )
+                    else:
+                        retained_plans = (
+                            revalidate_manifest_audit_input_identities(
+                                inputs.repository_root,
+                                audit_plans,
+                                limits=config.limits,
+                                issued_paths=audit_issued_paths,
+                            )
+                        )
+                        retained_keys = {
+                            (plan.manifest_path, plan.paths)
+                            for plan in retained_plans
+                        }
+                        invalidated_plans = tuple(
+                            plan
+                            for plan in audit_plans
+                            if (plan.manifest_path, plan.paths)
+                            not in retained_keys
+                        )
+                        safe_audits = tuple(
+                            snapshot
+                            for snapshot in safe_audits
+                            if any(
+                                plan.manifest_path == snapshot.manifest_path
+                                and (plan.manifest_path, plan.paths)
+                                in retained_keys
+                                for plan in audit_plans
+                            )
+                        )
+                        invalidated_count = len(audit_plans) - len(
+                            retained_plans
+                        )
+                        if invalidated_count:
+                            safe_claims = ()
+                            safe_evidence = EvidenceBundle()
+                            invalidated_paths = tuple(
+                                sorted(
+                                    {
+                                        path
+                                        for plan in invalidated_plans
+                                        for path in plan.paths
+                                    }
+                                )
+                            )
+                            assert preflight.scope is not None
+                            preflight = _sanitize_preflight_material_facts(
+                                preflight,
+                                preflight.scope,
+                                invalidated_paths,
+                            )
+            except InventoryVerificationError as verification_error:
+                if preflight is not None:
+                    preflight = _coordinate_failure_preflight(
+                        preflight,
+                        verification_error.code,
+                    )
+                safe_claims = ()
+                safe_evidence = EvidenceBundle()
+                safe_audits = ()
+            except Exception:
+                if preflight is not None:
+                    if preflight.scope is not None and selected_material_paths:
+                        sanitized_scope = _sanitize_scope_material_paths(
+                            preflight.scope,
+                            selected_material_paths,
+                        )
+                        preflight = _sanitize_preflight_material_facts(
+                            preflight,
+                            sanitized_scope,
+                            selected_material_paths,
+                        )
+                    else:
+                        preflight = _coordinate_failure_preflight(
+                            preflight,
+                            "PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED",
+                        )
+                safe_claims = ()
+                safe_evidence = EvidenceBundle()
+                safe_audits = ()
+
+            # Provider/model text is never included in the safe status message.
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                claims=safe_claims,
+                evidence=safe_evidence,
+                deterministic_audits=safe_audits,
+                calls=calls,
+                error_code="REVIEW_UNAVAILABLE",
+                error_message=(
+                    "Research review is unavailable "
+                    f"({type(exc).__name__})."
+                ),
+            )
+
+        provider_failure_handler = finish_provider_failure
+
+        def validate_provider_response_authority(
+            *,
+            retained_claims: tuple[ScientificClaim, ...] = (),
+            retained_evidence: EvidenceBundle = EvidenceBundle(),
+        ) -> ResearchReview | None:
+            """Revalidate frozen authority after every returned response."""
+
+            nonlocal preflight, deterministic_audits
+
+            def capture_drift() -> tuple[set[str], set[str]]:
+                captured = _capture_material_scope_identities(
+                    inputs.repository_root,
+                    selected_material_paths,
+                    comparison_base_root=comparison_base_root,
+                )
+                failures, head_failures = _material_scope_capture_failure_paths(
+                    captured,
+                    planned_scope.inventory,
+                )
+                head_drifted, base_drifted = _material_scope_drifted_paths(
+                    frozen_material_identities,
+                    captured,
+                )
+                return (
+                    set(failures) | set(head_drifted) | set(base_drifted),
+                    set(head_failures) | set(head_drifted),
+                )
+
+            def material_invalidated(
+                invalid: set[str],
+                invalid_head: set[str],
+            ) -> ResearchReview:
+                nonlocal preflight, deterministic_audits
+                deterministic_audits = _retain_audits_after_material_drift(
+                    deterministic_audits,
+                    audit_plans,
+                    tuple(sorted(invalid_head)),
+                )
+                if preflight is None or preflight.scope is None:
+                    raise ReviewError("material invalidation has no bound scope")
+                preflight = _sanitize_preflight_material_facts(
+                    preflight,
+                    preflight.scope,
+                    tuple(sorted(invalid)),
+                )
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    deterministic_audits=deterministic_audits,
+                    calls=calls,
+                    error_code="MATERIAL_SCOPE_INVALIDATED",
+                    error_message=(
+                        "Selected material changed while a provider response "
+                        "was pending; derived advisory data was discarded."
+                    ),
+                )
+
+            try:
+                if preflight is None or preflight.scope is None:
+                    raise ReviewError("provider response has no bound scope")
+                preflight = revalidate_preflight_coordinates(inputs, preflight)
+                if preflight.gates[0].disposition is GateDisposition.FAIL:
+                    preflight = replace(preflight, scope=None)
+                    deterministic_audits = ()
+                    return finish(
+                        ReviewStatus.UNAVAILABLE,
+                        calls=calls,
+                        error_code=preflight.gates[0].reasons[0].code,
+                        error_message=(
+                            "Exact review coordinates changed while a provider "
+                            "response was pending."
+                        ),
+                    )
+
+                invalid_paths, invalid_head_paths = capture_drift()
+                if not invalid_paths:
+                    assert preflight.scope is not None
+                    _verify_material_git_binding(
+                        inputs,
+                        preflight.scope,
+                        _capture_material_scope_identities(
+                            inputs.repository_root,
+                            selected_material_paths,
+                            comparison_base_root=comparison_base_root,
+                        ),
+                    )
+                    recaptured_paths, recaptured_head_paths = capture_drift()
+                    invalid_paths.update(recaptured_paths)
+                    invalid_head_paths.update(recaptured_head_paths)
+                if invalid_paths:
+                    return material_invalidated(
+                        invalid_paths,
+                        invalid_head_paths,
+                    )
+
+                retained_plans = revalidate_manifest_audit_input_identities(
+                    inputs.repository_root,
+                    audit_plans,
+                    limits=config.limits,
+                    issued_paths=audit_issued_paths,
+                )
+                retained_keys = {
+                    (plan.manifest_path, plan.paths) for plan in retained_plans
+                }
+                invalidated_plans = tuple(
+                    plan
+                    for plan in audit_plans
+                    if (plan.manifest_path, plan.paths) not in retained_keys
+                )
+                invalidated_count = len(audit_plans) - len(retained_plans)
+                if invalidated_count:
+                    deterministic_audits = tuple(
+                        snapshot
+                        for snapshot in deterministic_audits
+                        if any(
+                            plan.manifest_path == snapshot.manifest_path
+                            and (plan.manifest_path, plan.paths)
+                            in retained_keys
+                            for plan in audit_plans
+                        )
+                    )
+                    invalidated_paths = tuple(
+                        sorted(
+                            {
+                                path
+                                for plan in invalidated_plans
+                                for path in plan.paths
+                            }
+                        )
+                    )
+                    assert preflight is not None and preflight.scope is not None
+                    preflight = _sanitize_preflight_material_facts(
+                        preflight,
+                        preflight.scope,
+                        invalidated_paths,
+                    )
+                    return finish(
+                        ReviewStatus.UNAVAILABLE,
+                        deterministic_audits=deterministic_audits,
+                        calls=calls,
+                        error_code="AUDIT_PLANS_INVALIDATED",
+                        error_message=(
+                            f"{invalidated_count} deterministic Audit input "
+                            "bundle(s) changed while a provider response was "
+                            "pending."
+                        ),
+                    )
+
+                final_paths, final_head_paths = capture_drift()
+                if final_paths:
+                    return material_invalidated(
+                        final_paths,
+                        final_head_paths,
+                    )
+                return None
+            except InventoryVerificationError as exc:
+                if preflight is not None:
+                    preflight = _coordinate_failure_preflight(
+                        preflight,
+                        exc.code,
+                    )
+                deterministic_audits = ()
+                return finish(
+                    ReviewStatus.UNAVAILABLE,
+                    calls=calls,
+                    error_code=exc.code,
+                    error_message=(
+                        "Selected review material no longer matched the exact "
+                        "declared Git objects."
+                    ),
+                )
+            except Exception as exc:
+                return finish_provider_failure(
+                    exc,
+                    retained_claims=retained_claims,
+                    retained_evidence=retained_evidence,
+                )
+
         sources = scope_source_bundle(refreshed_scope)
         extraction_parts = build_extraction_request_parts(
             sources, config.limits.max_claims
@@ -1342,6 +3329,7 @@ def run_review(
             if config.provider != "openai":
                 return finish(
                     ReviewStatus.UNAVAILABLE,
+                    deterministic_audits=deterministic_audits,
                     error_code="PROVIDER_UNSUPPORTED",
                     error_message="Configured review provider is not available.",
                 )
@@ -1359,16 +3347,26 @@ def run_review(
             schema=extraction_parts.schema,
             max_output_tokens=config.limits.extraction_max_output_tokens,
         )
-        extraction_response = provider.extract_claims(extraction_request)
+        provider_lifecycle = ProviderLifecycle.FAILED_BEFORE_RESPONSE
+        provider_attempt_count += 1
+        try:
+            extraction_response = provider.extract_claims(extraction_request)
+        except Exception as exc:
+            return finish_provider_failure(exc)
         extraction_call = _record_call(
             "extract_claims", extraction_response, extraction_chars
         )
         calls.append(extraction_call)
+        provider_lifecycle = ProviderLifecycle.RESPONSE_RECEIVED
+        response_authority_failure = validate_provider_response_authority()
+        if response_authority_failure is not None:
+            return response_authority_failure
         if not extraction_response.complete:
             truncated = extraction_response.incomplete_reason == "max_output_tokens"
             return finish(
                 ReviewStatus.PARTIAL,
                 calls=calls,
+                deterministic_audits=deterministic_audits,
                 error_code=(
                     "CLAIM_EXTRACTION_TRUNCATED"
                     if truncated
@@ -1405,18 +3403,29 @@ def run_review(
                 for snapshot in deterministic_audits
                 if snapshot.manifest_path in retained_manifests
             )
-            preflight = _record_runtime_gate3_omissions(
+            invalidated_plans = tuple(
+                plan
+                for plan in audit_plans
+                if (plan.manifest_path, plan.paths)
+                not in retained_audit_keys
+            )
+            invalidated_paths = tuple(
+                sorted(
+                    {
+                        path
+                        for plan in invalidated_plans
+                        for path in plan.paths
+                    }
+                )
+            )
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
                 preflight,
-                (
-                    (
-                        "PREFLIGHT_G3_AUDIT_PLAN_INVALIDATED",
-                        "invalidated_audit_plan_count",
-                        invalidated_audit_plan_count,
-                    ),
-                ),
+                preflight.scope,
+                invalidated_paths,
             )
             return finish(
-                ReviewStatus.PARTIAL,
+                ReviewStatus.UNAVAILABLE,
                 deterministic_audits=deterministic_audits,
                 calls=calls,
                 error_code="AUDIT_PLANS_INVALIDATED",
@@ -1454,18 +3463,14 @@ def run_review(
                 audit_plans,
                 head_material_drifted_paths,
             )
-            preflight = _record_runtime_gate3_omissions(
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
                 preflight,
-                (
-                    (
-                        "PREFLIGHT_G3_MATERIAL_SCOPE_INVALIDATED",
-                        "material_scope_invalidated_count",
-                        len(material_drifted_paths),
-                    ),
-                ),
+                preflight.scope,
+                material_drifted_paths,
             )
             return finish(
-                ReviewStatus.PARTIAL,
+                ReviewStatus.UNAVAILABLE,
                 deterministic_audits=deterministic_audits,
                 calls=calls,
                 error_code="MATERIAL_SCOPE_INVALIDATED",
@@ -1481,6 +3486,7 @@ def run_review(
             max_claims=config.limits.max_claims,
         )
         claims = claim_validation.claims
+        failure_claims = claims
         rejected_claim_candidates = claim_validation.rejected_count
         if rejected_claim_candidates and not claims:
             raise ReviewError(
@@ -1506,26 +3512,136 @@ def run_review(
             audit_bundles,
             repository_paths=sources.repository_paths,
         )
-        evidence = discover_evidence(
-            inputs.repository_root,
-            claims,
-            sources.repository_paths,
-            limits=evidence_limits,
-            priority_paths=priority_paths,
-            selected_paths=tuple(sorted(selected_paths)),
-            changed_paths=sources.changed_paths,
-            base_root=(
-                inputs.comparison_base.root
-                if preflight_sources is not None
-                and inputs.comparison_base is not None
-                else inputs.base_root
-            ),
-            materialized_path_chars=(
-                preflight.scope.materialized_path_chars
-                if preflight is not None and preflight.scope is not None
-                else None
-            ),
+        try:
+            evidence = discover_evidence(
+                inputs.repository_root,
+                claims,
+                sources.repository_paths,
+                limits=evidence_limits,
+                priority_paths=priority_paths,
+                selected_paths=tuple(sorted(selected_paths)),
+                changed_paths=sources.changed_paths,
+                base_root=(
+                    inputs.comparison_base.root
+                    if preflight_sources is not None
+                    and inputs.comparison_base is not None
+                    else inputs.base_root
+                ),
+                materialized_path_chars=(
+                    preflight.scope.materialized_path_chars
+                    if preflight is not None and preflight.scope is not None
+                    else None
+                ),
+                material_identities=evidence_material_identities,
+            )
+        except EvidenceMaterialInvalidated as exc:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                (exc.path,) if exc.head else (),
+            )
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                preflight.scope,
+                (exc.path,),
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "Selected material changed during descriptor-bound evidence "
+                    "discovery; synthesis was skipped."
+                ),
+            )
+        failure_evidence = evidence
+        evidence_identity_drifted_paths = _evidence_identity_drifted_paths(
+            evidence,
+            evidence_material_identities,
         )
+        if evidence_identity_drifted_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                evidence_identity_drifted_paths,
+            )
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                preflight.scope,
+                evidence_identity_drifted_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "Evidence identities did not match the frozen selected "
+                    "material; synthesis was skipped."
+                ),
+            )
+        try:
+            post_evidence_material_identities = _capture_material_scope_identities(
+                inputs.repository_root,
+                selected_material_paths,
+                comparison_base_root=comparison_base_root,
+            )
+            (
+                post_evidence_capture_failures,
+                post_evidence_head_failures,
+            ) = _material_scope_capture_failure_paths(
+                post_evidence_material_identities,
+                planned_scope.inventory,
+            )
+            (
+                post_evidence_head_drifted_paths,
+                post_evidence_base_drifted_paths,
+            ) = _material_scope_drifted_paths(
+                frozen_material_identities,
+                post_evidence_material_identities,
+            )
+        except ReviewError:
+            post_evidence_capture_failures = tuple(selected_material_paths)
+            post_evidence_head_failures = tuple(selected_material_paths)
+            post_evidence_head_drifted_paths = tuple(selected_material_paths)
+            post_evidence_base_drifted_paths = ()
+        post_evidence_drifted_paths = tuple(
+            sorted(
+                set(post_evidence_capture_failures)
+                | set(post_evidence_head_drifted_paths)
+                | set(post_evidence_base_drifted_paths)
+            )
+        )
+        if post_evidence_drifted_paths:
+            deterministic_audits = _retain_audits_after_material_drift(
+                deterministic_audits,
+                audit_plans,
+                tuple(
+                    sorted(
+                        set(post_evidence_head_failures)
+                        | set(post_evidence_head_drifted_paths)
+                    )
+                ),
+            )
+            assert preflight is not None and preflight.scope is not None
+            preflight = _sanitize_preflight_material_facts(
+                preflight,
+                preflight.scope,
+                post_evidence_drifted_paths,
+            )
+            return finish(
+                ReviewStatus.UNAVAILABLE,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="MATERIAL_SCOPE_INVALIDATED",
+                error_message=(
+                    "Selected material changed during evidence processing; "
+                    "synthesis was skipped."
+                ),
+            )
         if config.limits.max_calls < 2:
             return finish(
                 ReviewStatus.PARTIAL,
@@ -1582,6 +3698,27 @@ def run_review(
                 ),
             ),
         )
+        if omission_counts["interpretation_constraints"]:
+            return finish(
+                ReviewStatus.PARTIAL,
+                claims=claims,
+                evidence=evidence,
+                deterministic_audits=deterministic_audits,
+                calls=calls,
+                error_code="SYNTHESIS_INPUTS_OMITTED",
+                error_message=(
+                    "Bounded advisory synthesis was skipped because deterministic "
+                    "interpretation constraints could not be issued with all of "
+                    "their required evidence. Exact omitted input counts: "
+                    f"evidence={omission_counts['evidence']}, "
+                    "interpretation_constraints="
+                    f"{omission_counts['interpretation_constraints']}, "
+                    f"missing_evidence={omission_counts['missing_evidence']}, "
+                    "deterministic_audits="
+                    f"{omission_counts['deterministic_audits']}. Full evidence and "
+                    "deterministic Audit results remain in the review record."
+                ),
+            )
         synthesis_chars = _request_chars(
             synthesis_parts.task,
             synthesis_parts.payload,
@@ -1603,11 +3740,27 @@ def run_review(
             schema=synthesis_parts.schema,
             max_output_tokens=config.limits.synthesis_max_output_tokens,
         )
-        synthesis_response = provider.synthesize_review(synthesis_request)
+        provider_lifecycle = ProviderLifecycle.FAILED_BEFORE_RESPONSE
+        provider_attempt_count += 1
+        try:
+            synthesis_response = provider.synthesize_review(synthesis_request)
+        except Exception as exc:
+            return finish_provider_failure(
+                exc,
+                retained_claims=claims,
+                retained_evidence=evidence,
+            )
         synthesis_call = _record_call(
             "synthesize_review", synthesis_response, synthesis_chars
         )
         calls.append(synthesis_call)
+        provider_lifecycle = ProviderLifecycle.RESPONSE_RECEIVED
+        response_authority_failure = validate_provider_response_authority(
+            retained_claims=claims,
+            retained_evidence=evidence,
+        )
+        if response_authority_failure is not None:
+            return response_authority_failure
         if not synthesis_response.complete:
             truncated = synthesis_response.incomplete_reason == "max_output_tokens"
             return finish(
@@ -1753,6 +3906,12 @@ def run_review(
             calls=calls,
         )
     except Exception as exc:
+        if provider_failure_handler is not None:
+            return provider_failure_handler(
+                exc,
+                retained_claims=failure_claims,
+                retained_evidence=failure_evidence,
+            )
         # Provider/model text is never included in the safe status message.
         return finish(
             ReviewStatus.UNAVAILABLE,

@@ -856,10 +856,11 @@ def test_preflight_path_allocations_preserve_changed_region_after_earlier_exact_
     assert result.preflight is not None and result.preflight.scope is not None
     assert result.preflight.gates[1].disposition is GateDisposition.PASS_PARTIAL
     assert result.preflight.gates[2].disposition is GateDisposition.PASS_PARTIAL
-    assert dict(result.preflight.scope.materialized_path_chars)[target] == 16_000
+    allocated_chars = dict(result.preflight.scope.materialized_path_chars)[target]
+    assert 0 < allocated_chars <= 16_000
     target_reference = _reference_for(result.evidence.references, target)
     assert _locality(target_reference) == "changed_region"
-    assert target_reference.excerpt
+    assert len(target_reference.excerpt) == allocated_chars
     assert [request.task for request in provider.calls] == [
         "extract_claims",
         "synthesize_review",
@@ -955,7 +956,8 @@ def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
         + "\nlong materialCountContract(); // MATERIAL_AT_END\n"
     )
     _write(head, DAO, oversized)
-    _write(head, "docs/review.md", "Bounded review context.\n")
+    routed_artifact = "scripts/run-eval.sh"
+    _write(head, routed_artifact, "#!/bin/sh\nexit 0\n")
     claim_text = "The DAO establishes the material count contract."
     provider = _EvidenceAwareFakeProvider(
         claim_text=claim_text,
@@ -965,7 +967,7 @@ def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
         synthesis_mode="affirm_unlocalized_prefix",
     )
     routed_description = (
-        f"{claim_text}\nBenchmark evidence: 1 run in docs/review.md"
+        f"{claim_text}\nEvaluation configuration: {routed_artifact}"
     )
 
     result = run_review(

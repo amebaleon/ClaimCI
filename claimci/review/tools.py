@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -13,13 +15,31 @@ import yaml
 
 from claimci.audit import audit_research, load_research_spec
 from claimci.models import AuditResult, ClaimCIError
-from claimci.passive_files import PassiveFileError, inspect_confined_regular_file
+from claimci.passive_files import (
+    PassiveFileError,
+    capture_confined_regular_file,
+    inspect_confined_regular_file,
+)
 from claimci.parsing import load_unique_yaml
 
 from .models import ReviewError, ReviewLimits
 
 
 _ARTIFACT_FIELDS = ("config", "results", "train_dataset", "eval_dataset")
+MAX_MANIFEST_AUDITS = 4
+
+
+def manifest_candidate_order_key(path: str) -> tuple[int, str, str]:
+    """Return the frozen deterministic manifest discovery order."""
+
+    relative = _relative(path)
+    if relative is None or relative != path:
+        raise ReviewError("manifest candidate path is unsafe")
+    return (
+        len(PurePosixPath(relative).parts),
+        relative.casefold(),
+        relative,
+    )
 
 
 class _FrozenList(tuple):
@@ -152,21 +172,131 @@ def snapshot_audit_result(
 ) -> DeterministicAuditSnapshot:
     """Copy an actual deterministic result into immutable plain review data."""
 
+    return _snapshot_audit_result(
+        result,
+        repository_root=repository_root,
+    )
+
+
+def _rewrite_snapshot_provenance(
+    value: Any,
+    *,
+    source_root: Path,
+    repository_root: Path,
+) -> Any:
+    """Replace private mirror paths while retaining deterministic evidence."""
+
+    if isinstance(value, Path):
+        try:
+            relative = value.resolve().relative_to(source_root)
+        except (OSError, ValueError, RuntimeError):
+            return value
+        return str(repository_root / relative)
+    if isinstance(value, str):
+        source_names = (str(source_root), source_root.as_posix())
+        destination_names = (str(repository_root), repository_root.as_posix())
+        rewritten = value
+        for source_name, destination_name in zip(source_names, destination_names):
+            rewritten = rewritten.replace(source_name, destination_name)
+        return rewritten
+    if isinstance(value, Mapping):
+        return {
+            _rewrite_snapshot_provenance(
+                key,
+                source_root=source_root,
+                repository_root=repository_root,
+            ): _rewrite_snapshot_provenance(
+                item,
+                source_root=source_root,
+                repository_root=repository_root,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _rewrite_snapshot_provenance(
+                item,
+                source_root=source_root,
+                repository_root=repository_root,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _rewrite_snapshot_provenance(
+                item,
+                source_root=source_root,
+                repository_root=repository_root,
+            )
+            for item in value
+        )
+    if isinstance(value, (set, frozenset)):
+        return type(value)(
+            _rewrite_snapshot_provenance(
+                item,
+                source_root=source_root,
+                repository_root=repository_root,
+            )
+            for item in value
+        )
+    return value
+
+
+def _snapshot_audit_result(
+    result: AuditResult,
+    *,
+    repository_root: Path,
+    manifest_relative: str | None = None,
+    source_root: Path | None = None,
+) -> DeterministicAuditSnapshot:
+    """Build a snapshot, optionally translating a private mirror's paths."""
+
     if not isinstance(result, AuditResult):
         raise ReviewError("deterministic snapshots require an actual AuditResult")
     root = _root(repository_root)
-    try:
-        manifest = result.manifest_path.resolve().relative_to(root).as_posix()
-    except (OSError, ValueError, RuntimeError) as exc:
-        raise ReviewError("deterministic manifest resolves outside repository") from exc
+    source = None if source_root is None else _root(source_root)
+    if (manifest_relative is None) != (source is None):
+        raise ReviewError("deterministic snapshot provenance is incomplete")
+    if manifest_relative is None:
+        try:
+            manifest = result.manifest_path.resolve().relative_to(root).as_posix()
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ReviewError(
+                "deterministic manifest resolves outside repository"
+            ) from exc
+    else:
+        manifest = _relative(manifest_relative)
+        if manifest is None:
+            raise ReviewError("deterministic manifest path is unsafe")
+        assert source is not None
+        try:
+            audited_manifest = result.manifest_path.resolve()
+            expected_manifest = (source / Path(manifest)).resolve()
+            audited_manifest.relative_to(source)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ReviewError(
+                "deterministic manifest resolves outside its captured source"
+            ) from exc
+        if audited_manifest != expected_manifest:
+            raise ReviewError("deterministic manifest differs from its captured source")
+
+    def rewrite(value: Any) -> Any:
+        if source is None:
+            return value
+        return _rewrite_snapshot_provenance(
+            value,
+            source_root=source,
+            repository_root=root,
+        )
+
     findings = tuple(
         DeterministicFindingSnapshot(
             rule_id=finding.rule_id,
             severity=finding.severity.value,
             impact=finding.impact.value,
-            title=finding.title,
-            explanation=finding.explanation,
-            evidence=_freeze(finding.evidence),
+            title=rewrite(finding.title),
+            explanation=rewrite(finding.explanation),
+            evidence=_freeze(rewrite(finding.evidence)),
         )
         for finding in result.findings
     )
@@ -184,7 +314,7 @@ def discover_manifests(
     repository_root: Path,
     repository_paths: Sequence[str],
     *,
-    max_manifests: int = 4,
+    max_manifests: int = MAX_MANIFEST_AUDITS,
 ) -> tuple[str, ...]:
     """Return bounded, confined manifests with repository-root studies first."""
 
@@ -207,14 +337,7 @@ def discover_manifests(
         if resolved.is_file():
             candidates.add(relative)
     return tuple(
-        sorted(
-            candidates,
-            key=lambda path: (
-                len(PurePosixPath(path).parts),
-                path.casefold(),
-                path,
-            ),
-        )[:max_manifests]
+        sorted(candidates, key=manifest_candidate_order_key)[:max_manifests]
     )
 
 
@@ -232,17 +355,20 @@ def _has_symlink_component(root: Path, relative: str) -> bool:
     return False
 
 
-def _declared_artifact_paths(
-    root: Path, manifest_relative: str
+def declared_manifest_artifact_paths(
+    manifest_relative: str,
+    text: str,
 ) -> tuple[str, ...] | None:
-    """Read declared lexical paths without following provider-selected links."""
+    """Parse bounded manifest text into canonical repository-owned references."""
 
     try:
-        manifest_path = root / Path(manifest_relative)
-        payload = load_unique_yaml(manifest_path.read_text(encoding="utf-8"))
+        relative = _relative(manifest_relative)
+        if relative is None or relative != manifest_relative:
+            return None
+        payload = load_unique_yaml(text)
         if not isinstance(payload, Mapping):
             return None
-        parent = PurePosixPath(manifest_relative).parent
+        parent = PurePosixPath(relative).parent
         declared: list[str] = []
         for experiment_name in ("baseline", "candidate"):
             experiment = payload.get(experiment_name)
@@ -263,13 +389,27 @@ def _declared_artifact_paths(
                 declared.append(joined)
         return tuple(declared)
     except (
-        OSError,
         UnicodeError,
         TypeError,
         ValueError,
         RuntimeError,
         yaml.YAMLError,
     ):
+        return None
+
+
+def _declared_artifact_paths(
+    root: Path, manifest_relative: str
+) -> tuple[str, ...] | None:
+    """Read declared lexical paths without following provider-selected links."""
+
+    try:
+        manifest_path = root / Path(manifest_relative)
+        return declared_manifest_artifact_paths(
+            manifest_relative,
+            manifest_path.read_text(encoding="utf-8"),
+        )
+    except (OSError, UnicodeError, TypeError, ValueError, RuntimeError):
         return None
 
 
@@ -349,6 +489,67 @@ def _valid_manifest_input_sha256(plan: ManifestAuditPlan) -> bool:
         )
         for path, item in zip(plan.paths, identities)
     )
+
+
+def _write_mirror_file(path: Path, content: bytes) -> None:
+    """Write one captured file without following a destination link."""
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(content)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _materialize_manifest_audit_mirror(
+    root: Path,
+    plan: ManifestAuditPlan,
+    mirror: Path,
+    limits: ReviewLimits,
+) -> bool:
+    """Copy only descriptor-verified plan inputs into a private mirror."""
+
+    if not _valid_manifest_input_sha256(plan):
+        return False
+    for relative, expected_sha256 in plan.input_sha256:
+        target = mirror / Path(relative)
+        if expected_sha256 is None:
+            try:
+                (root / Path(relative)).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            # A null identity is authoritative only for a path that is still
+            # absent.  Symlinks and every present/non-regular value fail here.
+            return False
+        try:
+            capture = capture_confined_regular_file(
+                root,
+                relative,
+                max_bytes=limits.max_file_chars * 4,
+            )
+        except PassiveFileError:
+            return False
+        if capture.sha256 != expected_sha256:
+            return False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_mirror_file(target, capture.content)
+        except (OSError, RuntimeError, ValueError):
+            return False
+    return True
 
 
 def plan_manifest_audits(
@@ -704,15 +905,60 @@ def collect_manifest_audits(
     bundles: list[ManifestAuditBundle] = []
     for plan in plans:
         try:
-            result = audit_research(root / Path(plan.manifest_path), artifact_root=root)
-            if plan.input_sha256 and (
-                _capture_manifest_input_sha256(root, plan.paths, limits)
-                != plan.input_sha256
-            ):
-                continue
+            if plan.input_sha256:
+                # The reserved identity is the authority boundary.  Audit
+                # reads a private one-plan mirror so a live checkout mutation
+                # cannot alter deterministic findings during the run.
+                with tempfile.TemporaryDirectory(prefix="claimci-audit-") as value:
+                    mirror = Path(value).resolve()
+                    if not _materialize_manifest_audit_mirror(
+                        root, plan, mirror, limits
+                    ):
+                        continue
+                    # The plan's dependency boundary and the manifest bytes
+                    # copied into the private mirror must describe the same
+                    # bundle.  This closes a parse/capture ABA window where a
+                    # transient live manifest could nominate one path set while
+                    # the later identity capture copied different manifest
+                    # bytes into the mirror.
+                    mirror_artifacts = _declared_artifact_paths(
+                        mirror,
+                        plan.manifest_path,
+                    )
+                    if mirror_artifacts is None:
+                        continue
+                    mirror_paths = tuple(
+                        dict.fromkeys(
+                            (plan.manifest_path, *mirror_artifacts)
+                        )
+                    )
+                    if mirror_paths != plan.paths:
+                        continue
+                    result = audit_research(
+                        mirror / Path(plan.manifest_path),
+                        artifact_root=mirror,
+                    )
+                    if (
+                        _capture_manifest_input_sha256(root, plan.paths, limits)
+                        != plan.input_sha256
+                    ):
+                        continue
+                    snapshot = _snapshot_audit_result(
+                        result,
+                        repository_root=root,
+                        manifest_relative=plan.manifest_path,
+                        source_root=mirror,
+                    )
+            else:
+                # Preserve the pre-existing route for callers that construct
+                # legacy plans without private identities.
+                result = audit_research(
+                    root / Path(plan.manifest_path), artifact_root=root
+                )
+                snapshot = snapshot_audit_result(result, repository_root=root)
             bundles.append(
                 ManifestAuditBundle(
-                    snapshot=snapshot_audit_result(result, repository_root=root),
+                    snapshot=snapshot,
                     paths=plan.paths,
                 )
             )

@@ -21,7 +21,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 # A directly executed script otherwise gives its ``scripts`` directory import
@@ -37,14 +36,17 @@ from claimci.review.models import (
     ChangeInventorySource,
     ChangeStatus,
     ComparisonBasis,
+    ProviderLifecycle,
     ReviewConfig,
     ReviewError,
-    ReviewLimits,
     ReviewPreflight,
     SnapshotIdentity,
     SnapshotRole,
 )
-from claimci.review.preflight import preflight_review
+from claimci.review.config import load_review_config
+from claimci.review.inventory import build_git_change_inventory
+from claimci.review.orchestrator import ReviewInputs, run_review
+from claimci.review.preflight import plan_review_supplement_paths
 
 
 MAX_MANIFEST_BYTES = 1_048_576
@@ -554,13 +556,14 @@ def _run_git(
     return bytes(stdout)
 
 
-def _copy_declared_snapshot_blobs(
+def _copy_snapshot_blobs(
     source: Path,
     clone: Path,
     candidate: FrozenCandidate,
+    paths: Sequence[str],
     empty_hooks: Path,
 ) -> dict[str, tuple[str, ...]]:
-    """Hydrate bounded declared blobs needed by each disposable snapshot."""
+    """Hydrate bounded exact blobs needed by each disposable snapshot."""
 
     role_shas = (
         ("requested_base", candidate.requested_base_sha),
@@ -569,11 +572,13 @@ def _copy_declared_snapshot_blobs(
     )
     role_paths: dict[str, list[str]] = {role: [] for role, _sha in role_shas}
     copied_objects: set[str] = set()
+    material_paths = tuple(dict.fromkeys(paths))
     for role, sha in role_shas:
-        for entry in candidate.entries:
+        for path in material_paths:
+            _safe_relative(path)
             raw = _run_git(
                 source,
-                ("ls-tree", "-z", "--full-tree", sha, "--", entry.path),
+                ("ls-tree", "-z", "--full-tree", sha, "--", path),
                 empty_hooks=empty_hooks,
                 output_limit=8_192,
             )
@@ -590,13 +595,13 @@ def _copy_declared_snapshot_blobs(
             except (UnicodeError, ValueError) as exc:
                 raise ValueError("declared material tree identity is invalid") from exc
             if (
-                actual_path != entry.path
+                actual_path != path
                 or object_type != b"blob"
                 or mode not in {b"100644", b"100755"}
                 or not _HEX_OBJECT.fullmatch(object_id)
             ):
                 raise ValueError("declared material is not a regular Git blob")
-            role_paths[role].append(entry.path)
+            role_paths[role].append(path)
             if object_id in copied_objects:
                 continue
             content = _run_git(
@@ -655,6 +660,21 @@ def _add_sparse_worktree(
     )
 
 
+def _set_sparse_worktree_paths(
+    root: Path,
+    paths: Sequence[str],
+    empty_hooks: Path,
+) -> None:
+    """Expand one disposable sparse worktree to an exact bounded path set."""
+
+    _run_git(
+        root,
+        ("sparse-checkout", "set", "--no-cone", "--stdin"),
+        empty_hooks=empty_hooks,
+        input_bytes=_sparse_patterns(paths),
+    )
+
+
 def _reject_unsafe_source_config(source: Path, empty_hooks: Path) -> None:
     raw = _run_git(
         source,
@@ -667,6 +687,7 @@ def _reject_unsafe_source_config(source: Path, empty_hooks: Path) -> None:
         "include.",
         "includeif.",
         "uploadpack.packobjectshook",
+        "core.alternaterefscommand",
         "core.fsmonitor",
         "core.sshcommand",
         "credential.",
@@ -1049,8 +1070,94 @@ def serialize_preflight(preflight: ReviewPreflight) -> dict[str, Any]:
     }
 
 
-def _review_config() -> ReviewConfig:
-    return ReviewConfig(enabled=True, limits=ReviewLimits())
+def _serialize_review_config(config: ReviewConfig) -> dict[str, Any]:
+    limits = config.limits
+    return {
+        "schema_version": config.schema_version,
+        "enabled": config.enabled,
+        "policy": config.policy,
+        "provider": config.provider,
+        "model": config.model,
+        "limits": {
+            "max_calls": limits.max_calls,
+            "max_context_chars": limits.max_context_chars,
+            "max_output_chars": limits.max_output_chars,
+            "max_files": limits.max_files,
+            "max_file_chars": limits.max_file_chars,
+            "max_claims": limits.max_claims,
+            "extraction_max_output_tokens": limits.extraction_max_output_tokens,
+            "synthesis_max_output_tokens": limits.synthesis_max_output_tokens,
+            "timeout_seconds": limits.timeout_seconds,
+            "retries": limits.retries,
+        },
+    }
+
+
+def _runtime_code_identity() -> dict[str, Any]:
+    """Bind replay output to one clean exact Core commit and tree."""
+
+    with tempfile.TemporaryDirectory(prefix="claimci-runtime-identity-") as raw:
+        empty_hooks = Path(raw) / "empty-hooks"
+        empty_hooks.mkdir()
+        commit = _run_git(
+            _WORKSPACE_ROOT,
+            ("rev-parse", "--verify", "HEAD^{commit}"),
+            empty_hooks=empty_hooks,
+            output_limit=256,
+        ).decode("ascii", errors="strict").strip()
+        tree = _run_git(
+            _WORKSPACE_ROOT,
+            ("rev-parse", "--verify", "HEAD^{tree}"),
+            empty_hooks=empty_hooks,
+            output_limit=256,
+        ).decode("ascii", errors="strict").strip()
+        status = _run_git(
+            _WORKSPACE_ROOT,
+            (
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ),
+            empty_hooks=empty_hooks,
+            output_limit=MAX_METADATA_BYTES,
+        )
+    if not _HEX_OBJECT.fullmatch(commit) or not _HEX_OBJECT.fullmatch(tree):
+        raise ValueError("runtime Core Git identity is invalid")
+    if status:
+        raise ValueError("provider-free replay requires a clean Core worktree")
+    return {
+        "commit_sha": commit,
+        "tree_sha": tree,
+        "worktree_clean": True,
+    }
+
+
+def _review_config() -> tuple[ReviewConfig, dict[str, Any]]:
+    """Load and fingerprint the exact trusted workspace review configuration."""
+
+    if os.environ.get("CLAIMCI_OPENAI_MODEL") is not None:
+        raise ValueError("provider-free replay forbids review model overrides")
+    config_path = _WORKSPACE_ROOT / ".claimci" / "review.yaml"
+    if config_path.parent.is_symlink():
+        raise ValueError("review replay configuration directory is unsafe")
+    before = _read_bounded(config_path)
+    config = load_review_config(
+        _WORKSPACE_ROOT,
+        config_path=config_path,
+        content=before,
+    )
+    after = _read_bounded(config_path)
+    if after != before:
+        raise ValueError("review replay configuration changed while loading")
+    if not config.enabled:
+        raise ValueError("review replay configuration must be enabled")
+    return config, {
+        "source_path": ".claimci/review.yaml",
+        "source_sha256": hashlib.sha256(before).hexdigest(),
+        "effective": _serialize_review_config(config),
+    }
 
 
 def _validate_temp_parent(study: Path, temp_parent: Path | None) -> Path:
@@ -1113,9 +1220,11 @@ def replay_candidate(
                 empty_hooks=empty_hooks,
             )
             _reject_unsafe_source_config(clone, empty_hooks)
-            snapshot_paths = _copy_declared_snapshot_blobs(
-                source, clone, candidate, empty_hooks
-            )
+            snapshot_paths: dict[str, tuple[str, ...]] = {
+                "requested_base": (),
+                "comparison_base": (),
+                "head": (),
+            }
             roots: dict[str, Path] = {}
             for role, sha in (
                 ("requested_base", candidate.requested_base_sha),
@@ -1147,29 +1256,115 @@ def replay_candidate(
                     raise ValueError("disposable snapshot is dirty")
                 roots[role] = root
 
-            inputs = SimpleNamespace(
+            snapshot_identities = {
+                "requested_base": SnapshotIdentity(
+                    SnapshotRole.REQUESTED_BASE,
+                    roots["requested_base"],
+                    candidate.requested_base_sha,
+                ),
+                "comparison_base": SnapshotIdentity(
+                    SnapshotRole.COMPARISON_BASE,
+                    roots["comparison_base"],
+                    candidate.comparison_base_sha,
+                ),
+                "head": SnapshotIdentity(
+                    SnapshotRole.HEAD,
+                    roots["head"],
+                    candidate.head_sha,
+                ),
+            }
+            verified_inventory = build_git_change_inventory(
+                snapshot_identities["requested_base"],
+                snapshot_identities["comparison_base"],
+                snapshot_identities["head"],
+                candidate.comparison_basis,
+            )
+            if verified_inventory != candidate.inventory:
+                raise ValueError("frozen change inventory does not match exact Git metadata")
+
+            planning_inputs = ReviewInputs(
                 repository_root=roots["head"],
                 base_root=roots["comparison_base"],
                 pr_title=title,
                 pr_description=body,
                 requested_base=SnapshotIdentity(
                     SnapshotRole.REQUESTED_BASE,
-                    roots["requested_base"],
+                    source,
                     candidate.requested_base_sha,
                 ),
                 comparison_base=SnapshotIdentity(
                     SnapshotRole.COMPARISON_BASE,
-                    roots["comparison_base"],
+                    source,
                     candidate.comparison_base_sha,
                 ),
                 head=SnapshotIdentity(
-                    SnapshotRole.HEAD, roots["head"], candidate.head_sha
+                    SnapshotRole.HEAD,
+                    source,
+                    candidate.head_sha,
                 ),
                 inventory=candidate.inventory,
                 coordinates=None,
                 inventory_failure=None,
             )
-            preflight = preflight_review(inputs, config)
+            hydration_plan = plan_review_supplement_paths(
+                planning_inputs,
+                config,
+                candidate.inventory,
+            )
+            material_paths = hydration_plan.paths
+            if len(material_paths) > config.limits.max_files:
+                raise ValueError("hydration plan exceeds the fixed material file bound")
+            snapshot_paths = _copy_snapshot_blobs(
+                source,
+                clone,
+                candidate,
+                material_paths,
+                empty_hooks,
+            )
+            if snapshot_paths["head"] != material_paths:
+                raise ValueError("hydration plan is not present at the exact head")
+            for role in roots:
+                _set_sparse_worktree_paths(
+                    roots[role],
+                    snapshot_paths[role],
+                    empty_hooks,
+                )
+                status = _run_git(
+                    roots[role],
+                    (
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=all",
+                        "--ignore-submodules=none",
+                    ),
+                    empty_hooks=empty_hooks,
+                )
+                if status:
+                    raise ValueError("hydrated disposable snapshot is dirty")
+
+            inputs = ReviewInputs(
+                repository_root=roots["head"],
+                base_root=roots["comparison_base"],
+                pr_title=title,
+                pr_description=body,
+                requested_base=snapshot_identities["requested_base"],
+                comparison_base=snapshot_identities["comparison_base"],
+                head=snapshot_identities["head"],
+                inventory=candidate.inventory,
+                coordinates=None,
+                inventory_failure=None,
+                exact_material_omissions=hydration_plan.omissions,
+            )
+            review = run_review(inputs, config, preflight_only=True)
+            if (
+                review.provider_lifecycle is not ProviderLifecycle.NOT_ATTEMPTED
+                or review.provider_attempt_count != 0
+                or review.provider_calls
+                or review.preflight is None
+            ):
+                raise ValueError("provider-free replay returned an invalid review envelope")
+            preflight = review.preflight
         finally:
             after = _source_identity(source, empty_hooks)
             if after != before:
@@ -1218,7 +1413,8 @@ def replay_study(
         DEFAULT_INPUT_LAYOUTS
     ):
         raise ValueError("replay requires exactly the five frozen A-E manifests")
-    config = _review_config()
+    runtime_code = _runtime_code_identity()
+    config, config_provenance = _review_config()
     results = [
         replay_candidate(
             study,
@@ -1230,6 +1426,12 @@ def replay_study(
         for candidate in manifests
     ]
     ready_count = sum(bool(result["ready"]) for result in results)
+    runtime_code_after = _runtime_code_identity()
+    config_after, config_provenance_after = _review_config()
+    if runtime_code_after != runtime_code:
+        raise RuntimeError("runtime Core identity changed during replay")
+    if config_after != config or config_provenance_after != config_provenance:
+        raise RuntimeError("review configuration changed during replay")
     payload = {
         "schema_version": 1,
         "mode": "provider_free_frozen_local_replay",
@@ -1245,6 +1447,8 @@ def replay_study(
             "total_tokens": 0,
             "estimated_cost_usd": 0,
         },
+        "runtime_code": runtime_code,
+        "review_config": config_provenance,
         "candidates": results,
     }
     rendered = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"

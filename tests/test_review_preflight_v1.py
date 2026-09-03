@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
@@ -38,7 +39,11 @@ from claimci.review.inventory import (
     build_git_change_inventory,
 )
 from claimci.review.orchestrator import ReviewInputs, run_review
-from claimci.review.preflight import build_review_scope, preflight_review, scope_source_bundle
+from claimci.review.preflight import (
+    _plan_preflight_review as preflight_review,
+    build_review_scope,
+    scope_source_bundle,
+)
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.sources import (
     validate_claim_candidates,
@@ -57,6 +62,18 @@ from claimci.review.request_budget import (
 
 SHA = "1" * 40
 OTHER_SHA = "2" * 40
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_declared_git_blob_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner/runtime unit fixtures use synthetic SHAs, unlike integration tests."""
+
+    monkeypatch.setattr(
+        "claimci.review.orchestrator.verify_git_material_identities",
+        lambda *_args, **_kwargs: None,
+    )
 
 
 def _inventory(
@@ -1081,6 +1098,8 @@ def test_gate_2_locality_unavailable_sole_route_is_unavailable_before_provider(
 
     root = (tmp_path / "repo").resolve()
     root.mkdir()
+    base_root = (tmp_path / "base").resolve()
+    base_root.mkdir()
     (root / "results.json").write_text("x" * 101, encoding="utf-8")
     inventory = _inventory((ChangeEntry("results.json", ChangeStatus.ADDED),))
     monkeypatch.setattr(
@@ -1095,6 +1114,7 @@ def test_gate_2_locality_unavailable_sole_route_is_unavailable_before_provider(
             "and https://example.invalid/report"
         ),
         description="",
+        base_root=base_root,
     )
     limits = ReviewLimits(max_file_chars=100)
 
@@ -1138,9 +1158,11 @@ def test_gate_2_empty_or_locality_unavailable_sole_route_never_constructs_provid
 
     root = (tmp_path / "repo").resolve()
     root.mkdir()
+    base_root = (tmp_path / "base").resolve()
+    base_root.mkdir()
     (root / "results.json").write_text(text, encoding="utf-8")
     inventory = _inventory((ChangeEntry("results.json", ChangeStatus.ADDED),))
-    inputs = _declared_inputs(root, inventory)
+    inputs = _declared_inputs(root, inventory, base_root=base_root)
     monkeypatch.setattr(
         "claimci.review.preflight.build_git_change_inventory",
         lambda *_args, **_kwargs: inventory,
@@ -1571,6 +1593,213 @@ def test_synthesis_reserve_covers_the_enforced_all_input_allocator_envelope(
 
     assert worst_valid_synthesis_request_chars(scope, config.limits) >= actual_chars
     assert any(allocation.omitted_counts.values())
+
+
+def test_synthesis_reserve_covers_corroborated_cardinality_constraints() -> None:
+    import claimci.review.request_budget as budget_module
+
+    java_path = "tests/C.java"
+    evidence_id = "evidence-ffffffffffffffff"
+    source = SourceRecord(
+        source_id="source-0000000000000000",
+        kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+        path=None,
+        text="C has one test case.",
+        sha256="0" * 64,
+    )
+    scope = ReviewScope(
+        mode="declared_changed_v1",
+        inventory=_inventory((ChangeEntry(java_path, ChangeStatus.ADDED),)),
+        issued_paths=(java_path,),
+        issued_changed_paths=(java_path,),
+        selected_paths=(java_path,),
+        sources=(source,),
+        seeds=(),
+        complete=True,
+        issues=(),
+        materialized_chars=len(source.text) + 6,
+        materialized_path_chars=((java_path, 6),),
+    )
+    claims = budget_module._reserved_claims(16, 24_000, scope.sources)
+    claim_ids = tuple(claim["claim_id"] for claim in claims)
+    evidence = (
+        {
+            "evidence_id": evidence_id,
+            "claim_ids": claim_ids,
+            "kind": "test",
+            "path": java_path,
+            "start_line": 1,
+            "end_line": 2,
+            "sha256": "f" * 64,
+            "size": 6,
+            "excerpt": "@Test\n",
+            "provenance": "supporting_artifact",
+            "excerpt_complete": True,
+            "excerpt_locality": "complete_file",
+        },
+    )
+    owners = {claim_id: (evidence_id,) for claim_id in claim_ids}
+    constraints = {
+        claim_id: {
+            "kind": "java_test_cardinality",
+            "state": "corroborated",
+            "claimed_count": 1,
+            "observed_count": 1,
+            "evidence_id": evidence_id,
+            "required_interpretation": (
+                "The complete source contains 1 standalone @Test annotation lines, "
+                "matching the claimed count of 1 test cases; this is source support, "
+                "not evidence that the tests were executed."
+            ),
+            "required_citations": [evidence_id],
+        }
+        for claim_id in claim_ids
+    }
+    parts = build_synthesis_request_parts(
+        claims,
+        evidence,
+        owners,
+        constraints,
+        (),
+        (),
+    )
+    actual_chars = logical_request_chars(parts.task, parts.payload, parts.schema)
+    limits = ReviewLimits(max_context_chars=actual_chars - 1)
+
+    reserved = worst_valid_synthesis_request_chars(scope, limits)
+
+    assert reserved >= actual_chars
+
+
+def test_synthesis_reserve_covers_cross_claim_java_evidence_ownership() -> None:
+    from claimci.review.evidence import (
+        EvidenceBundle,
+        EvidenceKind,
+        EvidenceLocality,
+        EvidenceProvenance,
+        EvidenceReference,
+    )
+    from claimci.review.orchestrator import (
+        _evidence_ids_by_claim_id,
+        _interpretation_constraints,
+    )
+    import claimci.review.request_budget as budget_module
+
+    source_text = "The suite has one test case per class."
+    source = SourceRecord(
+        source_id="source-0000000000000000",
+        kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+        path=None,
+        text=source_text,
+        sha256=hashlib.sha256(source_text.encode()).hexdigest(),
+    )
+    source_bundle = SourceBundle(
+        sources=(source,),
+        repository_paths=(),
+        changed_paths=(),
+        total_chars=len(source_text),
+    )
+    paths = tuple(f"tests/C{index:02}.java" for index in range(16))
+    raw_claims = [
+        {
+            "source_text": source_text,
+            "claim_type": "implementation_claim",
+            "subject": f"C{index:02}",
+            "metric": "test cases",
+            "direction": "not_applicable",
+            "claimed_magnitude": {
+                "raw": "one test case",
+                "value": 1,
+                "unit": "cases",
+                "kind": "absolute",
+            },
+            "qualifiers": [f"unique-{index}"],
+            "source": {
+                "source_id": source.source_id,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            "confidence": 1,
+            "evidence_hints": [paths[index]],
+        }
+        for index in range(16)
+    ]
+    for claim in raw_claims:
+        while True:
+            claim["qualifiers"].append("z" * 1_024)
+            wire = json.dumps({"claims": raw_claims}, separators=(",", ":"))
+            if len(wire) > 24_000:
+                claim["qualifiers"].pop()
+                break
+    wire = json.dumps({"claims": raw_claims}, separators=(",", ":"))
+    remaining = 24_000 - len(wire)
+    if remaining > 3:
+        raw_claims[0]["qualifiers"].append("z" * (remaining - 3))
+    wire = json.dumps({"claims": raw_claims}, separators=(",", ":"))
+    assert len(wire) == 24_000
+
+    claims = validate_claim_candidates(
+        json.loads(wire),
+        source_bundle,
+        max_claims=16,
+    )
+    all_claim_ids = tuple(claim.claim_id for claim in claims)
+    references = tuple(
+        EvidenceReference(
+            evidence_id=f"evidence-{index:016x}",
+            claim_ids=all_claim_ids,
+            kind=EvidenceKind.TEST,
+            path=path,
+            start_line=1,
+            end_line=1,
+            sha256="f" * 64,
+            size=6,
+            excerpt="@Test\n",
+            provenance=EvidenceProvenance.SUPPORTING_ARTIFACT,
+            excerpt_complete=True,
+            excerpt_locality=EvidenceLocality.COMPLETE_FILE,
+        )
+        for index, path in enumerate(paths)
+    )
+    evidence = EvidenceBundle(
+        references=references,
+        total_chars=16 * 6,
+    )
+    owners = _evidence_ids_by_claim_id(claims, evidence)
+    constraints = _interpretation_constraints(claims, evidence, owners)
+    parts = build_synthesis_request_parts(
+        claims,
+        references,
+        owners,
+        constraints,
+        (),
+        (),
+    )
+    actual_chars = logical_request_chars(parts.task, parts.payload, parts.schema)
+    inventory = _inventory(
+        tuple(ChangeEntry(path, ChangeStatus.MODIFIED) for path in sorted(paths))
+    )
+    scope = ReviewScope(
+        mode="declared_changed_v1",
+        inventory=inventory,
+        issued_paths=paths,
+        issued_changed_paths=paths,
+        selected_paths=paths,
+        sources=(source,),
+        seeds=(),
+        complete=True,
+        issues=(),
+        materialized_chars=len(source_text) + (16 * 6),
+        materialized_path_chars=tuple((path, 6) for path in paths),
+    )
+
+    reserved = worst_valid_synthesis_request_chars(
+        scope,
+        ReviewLimits(max_context_chars=1),
+    )
+
+    assert actual_chars > ReviewLimits().max_context_chars
+    assert reserved >= actual_chars
 
 
 def test_synthesis_reserve_covers_mandatory_claim_identity_and_source_augmentation() -> None:
@@ -2178,6 +2407,8 @@ def test_synthesis_reserve_uses_worst_actual_source_augmentation_before_provider
 
     root = tmp_path / "repo"
     root.mkdir()
+    base_root = tmp_path / "base"
+    base_root.mkdir()
     (root / "a.py").write_text("x", encoding="utf-8")
     constructions = 0
 
@@ -2203,11 +2434,19 @@ def test_synthesis_reserve_uses_worst_actual_source_augmentation_before_provider
 
     monkeypatch.setattr(preflight_module, "build_review_scope", lambda *_args: scope)
     monkeypatch.setattr(
+        preflight_module,
+        "build_git_change_inventory",
+        lambda *_args, **_kwargs: scope.inventory,
+    )
+    monkeypatch.setattr(
         orchestrator_module,
         "OpenAIReviewerProvider",
         provider_sentinel,
     )
-    result = run_review(ReviewInputs(repository_root=root), config)
+    result = run_review(
+        _declared_inputs(root, scope.inventory, base_root=base_root),
+        config,
+    )
 
     assert result.status is ReviewStatus.UNAVAILABLE
     assert result.error_code == "PREFLIGHT_G3_SYNTHESIS_RESERVED_CONTEXT_LIMIT"
@@ -2533,6 +2772,8 @@ def test_run_review_gate_failures_never_import_or_construct_a_provider(
 ) -> None:
     root = tmp_path / "repo"
     root.mkdir()
+    base_root = tmp_path / "base"
+    base_root.mkdir()
     inventory: ChangeInventory | None = None
     title = "Benchmark accuracy improves by 5% in results.json"
     config = ReviewConfig(enabled=True)
@@ -2547,7 +2788,13 @@ def test_run_review_gate_failures_never_import_or_construct_a_provider(
         title = "Documentation cleanup"
     if setup == "gate3":
         config = ReviewConfig(enabled=True, limits=ReviewLimits(max_calls=1))
-    inputs = _declared_inputs(root, inventory, title=title, description="")
+    inputs = _declared_inputs(
+        root,
+        inventory,
+        title=title,
+        description="",
+        base_root=base_root,
+    )
 
     original_import = builtins.__import__
 

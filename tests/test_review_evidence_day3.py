@@ -176,6 +176,55 @@ def test_provider_hint_must_still_match_the_trusted_claim_route(
 
 
 @pytest.mark.parametrize(
+    "path",
+    (
+        "score.pem",
+        "benchmark/private.pem",
+        "config/credentials.txt",
+        "artifacts/manifest.pem",
+    ),
+)
+def test_changed_hint_cannot_promote_an_arbitrary_suffix_to_evidence(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """Path/category tokens must not turn an arbitrary file type into evidence."""
+
+    _write(tmp_path, path, "PRIVATE_KEY_MATERIAL_NEVER_EGRESS\n")
+    claim = ScientificClaim(
+        claim_id="claim-arbitrary-suffix",
+        source_text="The benchmark accuracy score improves by five percent.",
+        claim_type=ClaimType.METRIC_IMPROVEMENT,
+        subject="benchmark accuracy",
+        metric="score",
+        source=SourceLocation(
+            source_id="pr-description",
+            kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+            path=None,
+            start_line=1,
+            end_line=1,
+        ),
+        evidence_hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (claim,),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    assert bundle.references == ()
+    assert any(
+        item.claim_id == claim.claim_id
+        and item.requested_path == path
+        and item.reason == "route_mismatch"
+        for item in bundle.missing
+    )
+
+
+@pytest.mark.parametrize(
     ("path", "expected_kind"),
     [
         ("configs/opaque.ini", EvidenceKind.CONFIG),
