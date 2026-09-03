@@ -560,6 +560,70 @@ def test_legacy_inventory_surfaces_base_only_material_deletion(
     assert inventory.entries == (ChangeEntry(deleted_path, ChangeStatus.DELETED),)
 
 
+def test_legacy_case_only_rename_is_a_typed_gate1_duplicate_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(head, "README.md", "new\n")
+    _write(base, "readme.md", "old\n")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "OpenAIReviewerProvider",
+        lambda **_kwargs: pytest.fail("provider factory must remain untouched"),
+    )
+    review = orchestrator.run_review(
+        ReviewInputs(repository_root=head, base_root=base),
+        ReviewConfig(enabled=True),
+    )
+    result = review.preflight
+
+    assert result is not None
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert {reason.code for reason in result.gates[0].reasons} == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_DUPLICATE_PATH"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.ready_for_provider is False
+    assert result.scope is None
+    assert review.status is ReviewStatus.UNAVAILABLE
+    assert review.provider_calls == ()
+
+
+def test_legacy_invalid_generated_path_is_a_typed_gate1_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    monkeypatch.setattr(
+        preflight_module,
+        "_legacy_regular_paths",
+        lambda *_args, **_kwargs: (("../result.json",), ()),
+    )
+
+    result = preflight_review(
+        ReviewInputs(repository_root=root),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert {reason.code for reason in result.gates[0].reasons} == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.ready_for_provider is False
+    assert result.scope is None
+
+
 def test_legacy_deleted_material_with_modified_route_is_partial(tmp_path: Path) -> None:
     head = tmp_path / "head"
     base = tmp_path / "base"

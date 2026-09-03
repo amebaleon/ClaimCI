@@ -806,13 +806,26 @@ def _legacy_inventory(
     paths, traversal_issues = _legacy_regular_paths(head, base_root=base)
     if traversal_issues:
         return None, traversal_issues
+    material_paths: list[str] = []
+    for path in paths:
+        if classify_review_material(path) is ReviewMaterialKind.OTHER:
+            continue
+        try:
+            material_paths.append(ChangeEntry(path, ChangeStatus.ADDED).path)
+        except ReviewError:
+            return None, (
+                ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH"),
+            )
+    folded_paths = tuple(path.casefold() for path in material_paths)
+    if len(set(folded_paths)) != len(folded_paths):
+        return None, (
+            ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_DUPLICATE_PATH"),
+        )
     comparison_files = 0
     comparison_bytes = 0
     entries: list[ChangeEntry] = []
     issues: list[ScopeIssue] = []
-    for path in paths:
-        if classify_review_material(path) is ReviewMaterialKind.OTHER:
-            continue
+    for path in material_paths:
         if base is None:
             entries.append(ChangeEntry(path, ChangeStatus.ADDED))
             continue
@@ -894,17 +907,24 @@ def _legacy_inventory(
             entries.append(ChangeEntry(path, ChangeStatus.MODIFIED))
     if any(issue.code.startswith("PREFLIGHT_G1_") for issue in issues):
         return None, tuple(sorted(set(issues), key=_issue_sort_key))
-    inventory = ChangeInventory(
-        schema_version=1,
-        requested_base_sha="0" * 40,
-        comparison_base_sha="0" * 40,
-        head_sha="0" * 40,
-        comparison_basis=ComparisonBasis.DIRECT_BASE,
-        source=ChangeInventorySource.LEGACY_PAIRWISE,
-        declared_entry_count=len(entries),
-        complete=True,
-        entries=tuple(sorted(entries, key=lambda item: (item.path, item.status.value))),
-    )
+    try:
+        inventory = ChangeInventory(
+            schema_version=1,
+            requested_base_sha="0" * 40,
+            comparison_base_sha="0" * 40,
+            head_sha="0" * 40,
+            comparison_basis=ComparisonBasis.DIRECT_BASE,
+            source=ChangeInventorySource.LEGACY_PAIRWISE,
+            declared_entry_count=len(entries),
+            complete=True,
+            entries=tuple(
+                sorted(entries, key=lambda item: (item.path, item.status.value))
+            ),
+        )
+    except ReviewError:
+        return None, (
+            ScopeIssue(code="PREFLIGHT_G1_CHANGE_INVENTORY_MALFORMED"),
+        )
     return inventory, tuple(sorted(set(issues), key=_issue_sort_key))
 
 
