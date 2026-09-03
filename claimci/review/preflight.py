@@ -398,6 +398,19 @@ def build_review_scope(
     selected: list[str] = []
     materialized_path_chars: dict[str, int] = {}
     issues: list[ScopeIssue] = []
+    eligible_deleted = tuple(
+        entry
+        for entry, kind in classified
+        if entry.status is ChangeStatus.DELETED
+        and kind is not ReviewMaterialKind.OTHER
+    )
+    for entry in eligible_deleted:
+        issues.append(
+            ScopeIssue(
+                code="PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+                path=entry.path,
+            )
+        )
     materialized_chars = sum(len(record.text) for record in records)
     if not inventory.complete:
         issues.append(ScopeIssue(code="PREFLIGHT_G1_CHANGESET_INCOMPLETE"))
@@ -579,11 +592,6 @@ def build_review_scope(
     nondeleted_entries = tuple(
         entry for entry, _kind in classified if entry.status is not ChangeStatus.DELETED
     )
-    eligible_deleted = tuple(
-        entry
-        for entry, kind in classified
-        if entry.status is ChangeStatus.DELETED and kind is not ReviewMaterialKind.OTHER
-    )
     if not seeds:
         issues.append(ScopeIssue(code="PREFLIGHT_G2_NO_MATERIAL_CLAIM_SEED"))
     if seeds and not citable_paths:
@@ -656,15 +664,25 @@ def scope_source_bundle(scope: ReviewScope) -> SourceBundle:
     return source_bundle_from_scope(scope)
 
 
-def _legacy_regular_paths(root: Path) -> tuple[tuple[str, ...], tuple[ScopeIssue, ...]]:
+def _legacy_regular_paths(
+    root: Path,
+    *,
+    base_root: Path | None = None,
+) -> tuple[tuple[str, ...], tuple[ScopeIssue, ...]]:
     """Enumerate a complete legacy index while surfacing every fixed bound."""
 
-    paths: list[str] = []
+    paths: set[str] = set()
     entry_count = 0
     issues: list[ScopeIssue] = []
-    seen = {root}
+    seen: set[Path] = set()
 
-    def visit(directory: Path, depth: int) -> bool:
+    def visit(
+        traversal_root: Path,
+        directory: Path,
+        depth: int,
+        *,
+        root_error_code: str,
+    ) -> bool:
         nonlocal entry_count
         if depth > MAX_REPOSITORY_DEPTH:
             issues.append(
@@ -691,7 +709,7 @@ def _legacy_regular_paths(root: Path) -> tuple[tuple[str, ...], tuple[ScopeIssue
                         return False
                     entries.append(entry)
         except OSError:
-            issues.append(ScopeIssue(code="PREFLIGHT_G1_HEAD_ROOT_INVALID"))
+            issues.append(ScopeIssue(code=root_error_code))
             return False
         for entry in sorted(entries, key=lambda item: (item.name.casefold(), item.name)):
             candidate = Path(entry.path)
@@ -702,18 +720,29 @@ def _legacy_regular_paths(root: Path) -> tuple[tuple[str, ...], tuple[ScopeIssue
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     resolved = candidate.resolve(strict=True)
-                    resolved.relative_to(root)
+                    resolved.relative_to(traversal_root)
                     if resolved not in seen:
                         seen.add(resolved)
-                        if not visit(candidate, depth + 1):
+                        if not visit(
+                            traversal_root,
+                            candidate,
+                            depth + 1,
+                            root_error_code=root_error_code,
+                        ):
                             return False
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                relative = candidate.resolve(strict=True).relative_to(root).as_posix()
+                relative = (
+                    candidate.resolve(strict=True)
+                    .relative_to(traversal_root)
+                    .as_posix()
+                )
                 if "\\" in relative:
                     continue
             except (OSError, RuntimeError, ValueError):
+                continue
+            if relative in paths:
                 continue
             if len(paths) >= MAX_REPOSITORY_PATHS:
                 issues.append(
@@ -724,10 +753,24 @@ def _legacy_regular_paths(root: Path) -> tuple[tuple[str, ...], tuple[ScopeIssue
                     )
                 )
                 return False
-            paths.append(relative)
+            paths.add(relative)
         return True
 
-    visit(root, 0)
+    seen.add(root)
+    complete = visit(
+        root,
+        root,
+        0,
+        root_error_code="PREFLIGHT_G1_HEAD_ROOT_INVALID",
+    )
+    if complete and base_root is not None and base_root != root:
+        seen.add(base_root)
+        visit(
+            base_root,
+            base_root,
+            0,
+            root_error_code="PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID",
+        )
     return tuple(sorted(paths)), tuple(sorted(set(issues), key=_issue_sort_key))
 
 
@@ -760,7 +803,7 @@ def _legacy_inventory(
                 ScopeIssue(code="PREFLIGHT_G1_REQUESTED_BASE_ROOT_INVALID"),
                 ScopeIssue(code="PREFLIGHT_G1_COMPARISON_BASE_ROOT_INVALID"),
             )
-    paths, traversal_issues = _legacy_regular_paths(head)
+    paths, traversal_issues = _legacy_regular_paths(head, base_root=base)
     if traversal_issues:
         return None, traversal_issues
     comparison_files = 0
@@ -776,8 +819,23 @@ def _legacy_inventory(
         head_path = head / Path(path)
         base_path = base / Path(path)
         try:
+            if head_path.is_symlink():
+                issues.append(
+                    ScopeIssue(code="PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN", path=path)
+                )
+                continue
+            head_is_file = head_path.is_file()
+            if base_path.is_symlink():
+                if head_is_file:
+                    entries.append(ChangeEntry(path, ChangeStatus.ADDED))
+                continue
+            base_is_file = base_path.is_file()
+            if not head_is_file:
+                if base_is_file:
+                    entries.append(ChangeEntry(path, ChangeStatus.DELETED))
+                continue
             head_size = head_path.stat().st_size
-            if not base_path.is_file() or base_path.is_symlink():
+            if not base_is_file:
                 entries.append(ChangeEntry(path, ChangeStatus.ADDED))
                 continue
             base_size = base_path.stat().st_size
@@ -1198,6 +1256,14 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
     hard_failure = any(
         issue.code == "PREFLIGHT_G2_CHANGE_STATUS_UNKNOWN" for issue in reasons
     )
+    deleted_material_unavailable_count = len(
+        {
+            issue.path
+            for issue in reasons
+            if issue.code == "PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE"
+            and issue.path is not None
+        }
+    )
     disposition = (
         GateDisposition.FAIL
         if hard_failure or not routable
@@ -1212,6 +1278,9 @@ def _gate2(scope: ReviewScope) -> PreflightGateResult:
             "material_seed_count": len(scope.seeds),
             "material_seed_omitted_count": max(
                 0, seed_candidate_count - len(scope.seeds)
+            ),
+            "deleted_material_unavailable_count": (
+                deleted_material_unavailable_count
             ),
             "routed_seed_count": routed_seed_count,
             "selected_path_count": len(scope.selected_paths),

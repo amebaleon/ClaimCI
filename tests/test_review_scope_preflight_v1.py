@@ -403,6 +403,82 @@ def test_prose_seed_without_a_validated_local_changed_candidate_is_incomplete(
     }
 
 
+def test_deleted_material_with_another_citable_route_forces_partial_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "tests/test_result_check.py", "def test_result():\n    pass\n")
+    inventory = _inventory(
+        ("results/deleted.json", ChangeStatus.DELETED),
+        ("tests/test_result_check.py", ChangeStatus.MODIFIED),
+    )
+
+    scope = _scope(
+        root,
+        inventory,
+        title="Reproducibility improves with deterministic tests",
+    )
+    result = preflight_module._evaluate_material_gates(
+        scope,
+        ReviewConfig(enabled=True),
+        requested_sha=BASE,
+        comparison_sha=BASE,
+        head_sha=HEAD,
+    )
+
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+        path="results/deleted.json",
+    ) in scope.issues
+    assert scope.complete is False
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.gates[1].metrics["deleted_material_unavailable_count"] == 1
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
+
+
+def test_exactly_mentioned_deleted_material_remains_out_of_scope_and_unavailable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    scope = _scope(
+        root,
+        _inventory(("results/deleted.json", ChangeStatus.DELETED)),
+        title="Benchmark improves according to results/deleted.json",
+    )
+    issue_codes = {issue.code for issue in scope.issues}
+    gate2 = preflight_module._gate2(scope)
+
+    assert issue_codes >= {
+        "PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+        "PREFLIGHT_G2_ONLY_DELETED_ROUTABLE_PATH",
+        "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+    }
+    assert gate2.disposition is GateDisposition.FAIL
+    assert gate2.metrics["deleted_material_unavailable_count"] == 1
+
+
+def test_other_deletion_does_not_reduce_complete_material_scope(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "tests/test_result_check.py", "def test_result():\n    pass\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("assets/old.bin", ChangeStatus.DELETED),
+            ("tests/test_result_check.py", ChangeStatus.MODIFIED),
+        ),
+        title="Reproducibility improves with deterministic tests",
+    )
+
+    assert "PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE" not in {
+        issue.code for issue in scope.issues
+    }
+    assert scope.complete is True
+
+
 def test_external_only_required_route_is_explicit_and_cannot_complete(
     tmp_path: Path,
 ) -> None:
@@ -462,6 +538,178 @@ def test_changed_entries_survive_a_legacy_2048_path_lexical_prefix(tmp_path: Pat
         title="GLM model accuracy improves by 9%",
     )
     assert scope.issued_changed_paths == targets
+
+
+@pytest.mark.parametrize("deleted_path", ["results/deleted.json", "src/deleted.py"])
+def test_legacy_inventory_surfaces_base_only_material_deletion(
+    tmp_path: Path,
+    deleted_path: str,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(base, deleted_path, "old material\n")
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert issues == ()
+    assert inventory is not None
+    assert inventory.entries == (ChangeEntry(deleted_path, ChangeStatus.DELETED),)
+
+
+def test_legacy_deleted_material_with_modified_route_is_partial(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(base, "results/deleted.json", '{"accuracy": 0.8}\n')
+    _write(base, "tests/test_result_check.py", "old = 1\n")
+    _write(head, "tests/test_result_check.py", "new_result = 2\n")
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Reproducibility improves with deterministic tests",
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.scope is not None
+    assert ChangeEntry(
+        "results/deleted.json", ChangeStatus.DELETED
+    ) in result.scope.inventory.entries
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+        path="results/deleted.json",
+    ) in result.scope.issues
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
+
+
+@pytest.mark.parametrize(
+    ("constant", "reason"),
+    [
+        ("MAX_REPOSITORY_PATHS", "PREFLIGHT_G1_REPOSITORY_PATH_LIMIT"),
+        ("MAX_REPOSITORY_ENTRIES", "PREFLIGHT_G1_REPOSITORY_ENTRY_LIMIT"),
+    ],
+)
+def test_legacy_head_and_base_share_one_traversal_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    reason: str,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(head, "live.py", "value = 1\n")
+    _write(base, "deleted.json", "{}\n")
+    monkeypatch.setattr(preflight_module, constant, 1)
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert inventory is None
+    assert reason in {issue.code for issue in issues}
+
+
+def test_legacy_identical_paths_do_not_spuriously_exhaust_union_path_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(head, "results/same.json", "{}\n")
+    _write(base, "results/same.json", "{}\n")
+    monkeypatch.setattr(preflight_module, "MAX_REPOSITORY_PATHS", 1)
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert issues == ()
+    assert inventory is not None
+    assert inventory.entries == ()
+
+
+def test_legacy_base_only_symlink_is_never_reported_as_deleted_material(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    outside = tmp_path / "outside.json"
+    head.mkdir()
+    base.mkdir()
+    outside.write_text("{}\n", encoding="utf-8")
+    link = base / "results" / "linked.json"
+    link.parent.mkdir()
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert issues == ()
+    assert inventory is not None
+    assert inventory.entries == ()
+
+
+def test_legacy_rename_like_delete_add_is_deterministic_partial(
+    tmp_path: Path,
+) -> None:
+    pairs = (
+        (tmp_path / "head-one", tmp_path / "base-one"),
+        (tmp_path / "head-two", tmp_path / "base-two"),
+    )
+    inventories = []
+    for index, (head, base) in enumerate(pairs):
+        head.mkdir()
+        base.mkdir()
+        head_paths = ("results/new.json", "tests/same.py")
+        base_paths = ("results/old.json", "tests/same.py")
+        if index:
+            head_paths = tuple(reversed(head_paths))
+            base_paths = tuple(reversed(base_paths))
+        for path in head_paths:
+            _write(head, path, "same\n" if path == "tests/same.py" else "new\n")
+        for path in base_paths:
+            _write(base, path, "same\n" if path == "tests/same.py" else "old\n")
+        inventory, issues = preflight_module._legacy_inventory(
+            ReviewInputs(repository_root=head, base_root=base)
+        )
+        assert issues == ()
+        assert inventory is not None
+        inventories.append(inventory)
+
+    expected = (
+        ChangeEntry("results/new.json", ChangeStatus.ADDED),
+        ChangeEntry("results/old.json", ChangeStatus.DELETED),
+    )
+    assert inventories[0].entries == expected
+    assert inventories[1].entries == expected
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=pairs[0][0],
+            base_root=pairs[0][1],
+            pr_title="Benchmark improves in results/new.json",
+        ),
+        ReviewConfig(enabled=True),
+    )
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
 
 
 def test_huge_unchanged_repository_file_is_never_touched(
