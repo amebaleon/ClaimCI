@@ -8,6 +8,7 @@ observability cannot become a scientific decision.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from dataclasses import asdict, is_dataclass
@@ -2100,6 +2101,94 @@ def test_extraction_time_same_path_drift_discards_pre_provider_audit(
     assert result.status is ReviewStatus.PARTIAL
     assert result.error_code == "AUDIT_PLANS_INVALIDATED"
     assert len(provider.calls) == 1
+
+
+def test_extraction_time_selected_material_drift_cannot_reach_evidence_or_synthesis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selected evidence bytes stay bound to the pre-provider materialization."""
+
+    import claimci.review.orchestrator as orchestrator
+
+    inputs, inventory = _declared_run_inputs(tmp_path)
+    monkeypatch.setattr(
+        "claimci.review.preflight.build_git_change_inventory",
+        lambda *_args, **_kwargs: inventory,
+    )
+    evidence_path = inputs.repository_root / "results.json"
+    original_sha = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    mutated_bytes = b'{"accuracy": 0.05}\n'
+    mutated_sha = hashlib.sha256(mutated_bytes).hexdigest()
+    assert mutated_sha != original_sha
+
+    discover_calls: list[object] = []
+    synthesis_payloads: list[dict[str, Any]] = []
+    original_discover = orchestrator.discover_evidence
+
+    def traced_discover(*args: Any, **kwargs: Any) -> EvidenceBundle:
+        discover_calls.append((args, kwargs))
+        return original_discover(*args, **kwargs)
+
+    def extraction(request: StructuredRequest) -> str:
+        # This runs after preflight materialization and the pre-provider Audit
+        # stage, but before the normal evidence-discovery stage.
+        evidence_path.write_bytes(mutated_bytes)
+        return _extraction_output(request, title=inputs.pr_title)
+
+    def synthesis(request: StructuredRequest) -> str:
+        synthesis_payloads.append(request.payload)
+        claim = _mapping(request.payload["claims"][0])
+        citations = [
+            item["evidence_id"]
+            for item in request.payload["evidence"]
+            if claim["claim_id"] in item["claim_ids"]
+        ]
+        return json.dumps(
+            {
+                "interpretations": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "interpretation": "The bounded result is supported.",
+                        "citations": citations,
+                        "missing_evidence": [],
+                        "unsupported_inferences": [],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(orchestrator, "discover_evidence", traced_discover)
+    provider = FakeProvider(extraction=extraction, synthesis=synthesis)
+    result = run_review(inputs, _config(), provider=provider)
+
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.selected_paths == ("results.json",)
+    assert result.preflight.scope.materialized_path_chars == (("results.json", 19),)
+    assert hashlib.sha256(evidence_path.read_bytes()).hexdigest() == mutated_sha
+
+    # A post-extraction identity race must invalidate the materialized scope
+    # before reopening evidence or allowing the second provider call.  The
+    # current implementation fails these assertions by citing mutated bytes.
+    mutated_evidence = [
+        (item["path"], item["sha256"], item["excerpt"])
+        for payload in synthesis_payloads
+        for item in payload["evidence"]
+        if item["sha256"] == mutated_sha
+    ]
+    assert mutated_evidence == []
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.error_code == "MATERIAL_SCOPE_INVALIDATED"
+    assert [call.task for call in result.provider_calls] == ["extract_claims"]
+    assert discover_calls == []
+    assert synthesis_payloads == []
+    assert result.interpretations == ()
+    assert result.evidence.references == ()
+    assert all(
+        reference.sha256 != mutated_sha
+        for reference in result.evidence.references
+    )
 
 
 def test_timeout_and_refusal_are_controlled_unavailable_without_retry(tmp_path: Path) -> None:
