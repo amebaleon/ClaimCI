@@ -765,6 +765,16 @@ def _build_review_scope(
         raise ReviewError("pull-request title and description must be strings")
 
     limits = config.limits
+    # Reserve half of the configured average per-file context for breadth and
+    # leave the other half available to deepen higher-ranked candidates.  The
+    # live reserve below shrinks further when PR metadata leaves less context.
+    ranked_candidate_reserve = max(
+        1,
+        min(
+            limits.max_file_chars,
+            (limits.max_context_chars // limits.max_files) // 2,
+        ),
+    )
     records: list[SourceRecord] = []
     remaining_chars = limits.max_context_chars
     for kind, value in (
@@ -933,6 +943,27 @@ def _build_review_scope(
                     )
                 )
                 continue
+            # Preserve evidence breadth inside the existing ranked file cap
+            # without flattening exact or higher-ranked files to an equal
+            # share. Failed/short reads donate their unused depth downstream.
+            attempted_set = set(attempted)
+            remaining_attempt_slots = min(
+                limits.max_files - len(attempted),
+                sum(
+                    1
+                    for candidate_entry, _candidate_kind in candidates
+                    if candidate_entry.path not in attempted_set
+                ),
+            )
+            reserved_candidate_count = remaining_attempt_slots + 1
+            live_reserve = min(
+                ranked_candidate_reserve,
+                remaining_chars // reserved_candidate_count,
+            )
+            excerpt_limit = min(
+                limits.max_file_chars,
+                remaining_chars - (remaining_attempt_slots * live_reserve),
+            )
             try:
                 encoded = (
                     _read_exact_git_material(exact_head, entry.path)
@@ -979,7 +1010,6 @@ def _build_review_scope(
                 continue
 
             normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
-            excerpt_limit = min(limits.max_file_chars, remaining_chars)
             text = normalized[:excerpt_limit]
             if len(normalized) > len(text):
                 changed_region = (

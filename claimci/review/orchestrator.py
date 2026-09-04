@@ -20,6 +20,7 @@ from claimci.passive_files import (
 from claimci.parsing import unique_json_object
 
 from .evidence import (
+    _safe_relative,
     changed_region_excerpt_from_text,
     EvidenceBundle,
     EvidenceKind,
@@ -502,6 +503,99 @@ def _evidence_ids_by_claim_id(
         )
         for claim in claims
     }
+
+
+def _order_synthesis_evidence(
+    claims: Sequence[ScientificClaim],
+    references: Sequence[EvidenceReference],
+    *,
+    priority_paths: Mapping[str, Sequence[str]],
+    selected_paths: Sequence[str],
+) -> tuple[EvidenceReference, ...]:
+    """Rank already-authorized evidence for bounded synthesis first-fit.
+
+    Discovery remains the authority for reference ownership and routing.  This
+    ordering only gives bounded synthesis its strongest existing references
+    first: claim-owned trusted audit inputs, exact SOURCE/TEST hints, and then
+    SOURCE references owned by implementation claims.  Prioritized ties follow
+    the frozen preflight rank; all other references retain producer order.
+    """
+
+    claims_by_id = {claim.claim_id: claim for claim in claims}
+    trusted_paths_by_claim = {
+        claim_id: frozenset(paths)
+        for claim_id, paths in priority_paths.items()
+    }
+    exact_paths_by_claim = {
+        claim.claim_id: frozenset(
+            normalized
+            for hint in claim.evidence_hints
+            if (normalized := _safe_relative(hint)) is not None
+        )
+        for claim in claims
+    }
+    implementation_claim_ids = {
+        claim.claim_id
+        for claim in claims
+        if claim.claim_type is ClaimType.IMPLEMENTATION_CLAIM
+    }
+    selected_rank = {path: index for index, path in enumerate(selected_paths)}
+    unranked = len(selected_rank)
+    prioritized: tuple[list[tuple[int, EvidenceReference]], ...] = (
+        [],
+        [],
+        [],
+    )
+    remaining: list[EvidenceReference] = []
+
+    for producer_index, reference in enumerate(references):
+        owned_claim_ids = tuple(
+            claim_id
+            for claim_id in reference.claim_ids
+            if claim_id in claims_by_id
+        )
+        if any(
+            reference.path in trusted_paths_by_claim.get(claim_id, ())
+            for claim_id in owned_claim_ids
+        ):
+            tier = 0
+        elif reference.kind in {EvidenceKind.SOURCE, EvidenceKind.TEST} and any(
+            reference.path in exact_paths_by_claim[claim_id]
+            for claim_id in owned_claim_ids
+        ):
+            tier = 1
+        elif (
+            reference.kind is EvidenceKind.SOURCE
+            and bool(set(owned_claim_ids) & implementation_claim_ids)
+        ):
+            tier = 2
+        else:
+            remaining.append(reference)
+            continue
+        prioritized[tier].append((producer_index, reference))
+
+    def ranked(
+        values: list[tuple[int, EvidenceReference]],
+    ) -> tuple[EvidenceReference, ...]:
+        return tuple(
+            reference
+            for _producer_index, reference in sorted(
+                values,
+                key=lambda item: (
+                    selected_rank.get(item[1].path, unranked),
+                    item[0],
+                    item[1].path,
+                    item[1].evidence_id,
+                ),
+            )
+        )
+
+    return (
+        *ranked(prioritized[0]),
+        *ranked(prioritized[1]),
+        *ranked(prioritized[2]),
+        *remaining,
+    )
 
 
 def _synthesis_schema(
@@ -3658,13 +3752,23 @@ def run_review(
             evidence,
             evidence_ids_by_claim_id,
         )
-        synthesis_allocation = allocate_synthesis_inputs(
+        synthesis_evidence = _order_synthesis_evidence(
             claims,
             tuple(
                 reference
                 for reference in evidence.references
                 if _citable_reference(reference)
             ),
+            priority_paths=priority_paths,
+            selected_paths=(
+                preflight.scope.selected_paths
+                if preflight is not None and preflight.scope is not None
+                else tuple(sorted(selected_paths))
+            ),
+        )
+        synthesis_allocation = allocate_synthesis_inputs(
+            claims,
+            synthesis_evidence,
             evidence_ids_by_claim_id,
             interpretation_constraints_by_claim_id,
             evidence.missing,

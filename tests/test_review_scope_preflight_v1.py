@@ -6,10 +6,17 @@ from pathlib import Path
 
 import pytest
 
+import claimci.review.orchestrator as orchestrator_module
 import claimci.review.preflight as preflight_module
 from claimci.passive_files import PassiveFileError
-from claimci.review.evidence import EvidenceKind, _kind
+from claimci.review.evidence import (
+    EvidenceKind,
+    EvidenceReference,
+    _kind,
+    discover_evidence,
+)
 from claimci.review.models import (
+    ClaimType,
     ChangeEntry,
     ChangeInventory,
     ChangeInventorySource,
@@ -25,12 +32,18 @@ from claimci.review.models import (
     SnapshotIdentity,
     SnapshotRole,
     SourceKind,
+    SourceLocation,
 )
 from claimci.review.orchestrator import ReviewInputs
 from claimci.review.preflight import (
     build_review_scope,
     preflight_review,
     scope_source_bundle,
+)
+from claimci.review.request_budget import (
+    allocate_synthesis_inputs,
+    build_synthesis_request_parts,
+    logical_request_chars,
 )
 
 
@@ -87,6 +100,93 @@ def _scope(
     )
 
 
+def _claim(
+    *,
+    claim_id: str = "claim-scope-allocation",
+    claim_type: ClaimType = ClaimType.IMPLEMENTATION_CLAIM,
+    hints: tuple[str, ...] = (),
+) -> ScientificClaim:
+    return ScientificClaim(
+        claim_id=claim_id,
+        source_text="The bounded implementation evidence supports this claim.",
+        claim_type=claim_type,
+        subject="bounded implementation evidence",
+        source=SourceLocation(
+            source_id="source-pr-description",
+            kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+            path=None,
+            start_line=1,
+            end_line=1,
+        ),
+        confidence=1.0,
+        evidence_hints=hints,
+    )
+
+
+def _discover_and_allocate_scope_evidence(
+    root: Path,
+    scope,
+    claims: tuple[ScientificClaim, ...],
+    limits: ReviewLimits,
+    *,
+    priority_paths: dict[str, tuple[str, ...]] | None = None,
+):
+    sources = scope_source_bundle(scope)
+    evidence = discover_evidence(
+        root,
+        claims,
+        sources.repository_paths,
+        limits=limits,
+        priority_paths=priority_paths,
+        selected_paths=scope.selected_paths,
+        changed_paths=sources.changed_paths,
+        materialized_path_chars=scope.materialized_path_chars,
+    )
+    owners = {
+        claim.claim_id: tuple(
+            reference.evidence_id
+            for reference in evidence.references
+            if claim.claim_id in reference.claim_ids
+        )
+        for claim in claims
+    }
+    ordered_references = orchestrator_module._order_synthesis_evidence(
+        claims,
+        evidence.references,
+        priority_paths=priority_paths or {},
+        selected_paths=scope.selected_paths,
+    )
+    allocation = allocate_synthesis_inputs(
+        claims,
+        ordered_references,
+        owners,
+        {},
+        evidence.missing,
+        (),
+        max_chars=limits.max_context_chars,
+    )
+    return evidence, allocation
+
+
+def _reference(
+    evidence_id: str,
+    path: str,
+    kind: EvidenceKind,
+    *claim_ids: str,
+) -> EvidenceReference:
+    return EvidenceReference(
+        evidence_id=evidence_id,
+        claim_ids=tuple(claim_ids),
+        kind=kind,
+        path=path,
+        start_line=1,
+        end_line=1,
+        sha256="0" * 64,
+        size=1,
+        excerpt="x",
+    )
+
+
 def test_material_seed_contract_is_routing_metadata_not_a_scientific_claim() -> None:
     seed = MaterialClaimSeed(
         origin_source_id="source-1234567890abcdef",
@@ -95,6 +195,566 @@ def test_material_seed_contract_is_routing_metadata_not_a_scientific_claim() -> 
     )
     assert seed.category == "benchmark"
     assert not isinstance(seed, ScientificClaim)
+
+
+def test_synthesis_order_exact_test_beats_generic_implementation_source() -> None:
+    exact_path = "tests/exact_behavior.py"
+    generic_path = "src/generic.py"
+    exact_claim = _claim(
+        claim_id="claim-exact-test",
+        hints=(r"tests\exact_behavior.py",),
+    )
+    generic_claim = _claim(claim_id="claim-generic-source")
+    references = (
+        _reference(
+            "evidence-generic",
+            generic_path,
+            EvidenceKind.SOURCE,
+            generic_claim.claim_id,
+        ),
+        _reference(
+            "evidence-exact",
+            exact_path,
+            EvidenceKind.TEST,
+            exact_claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (exact_claim, generic_claim),
+        references,
+        priority_paths={},
+        selected_paths=(generic_path, exact_path),
+    )
+
+    assert tuple(reference.path for reference in ordered) == (
+        exact_path,
+        generic_path,
+    )
+
+
+def test_synthesis_order_keeps_claim_owned_trusted_priority_first() -> None:
+    trusted_path = "audit/research.yaml"
+    exact_path = "tests/exact_behavior.py"
+    unowned_priority_path = "config/unowned.yaml"
+    trusted_claim = _claim(
+        claim_id="claim-trusted",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+        hints=(exact_path,),
+    )
+    other_claim = _claim(
+        claim_id="claim-other",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+    )
+    references = (
+        _reference(
+            "evidence-unowned-priority",
+            unowned_priority_path,
+            EvidenceKind.CONFIG,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-exact-test",
+            exact_path,
+            EvidenceKind.TEST,
+            trusted_claim.claim_id,
+        ),
+        _reference(
+            "evidence-trusted",
+            trusted_path,
+            EvidenceKind.MANIFEST,
+            trusted_claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (trusted_claim, other_claim),
+        references,
+        priority_paths={
+            trusted_claim.claim_id: (trusted_path, unowned_priority_path),
+        },
+        selected_paths=(unowned_priority_path, exact_path, trusted_path),
+    )
+
+    assert tuple(reference.path for reference in ordered) == (
+        trusted_path,
+        exact_path,
+        unowned_priority_path,
+    )
+    full_owners = {
+        claim.claim_id: tuple(
+            reference.evidence_id
+            for reference in references
+            if claim.claim_id in reference.claim_ids
+        )
+        for claim in (trusted_claim, other_claim)
+    }
+    trusted_only_owners = {
+        trusted_claim.claim_id: ("evidence-trusted",),
+        other_claim.claim_id: (),
+    }
+    trusted_only = build_synthesis_request_parts(
+        (trusted_claim, other_claim),
+        (ordered[0],),
+        trusted_only_owners,
+        {},
+        (),
+        (),
+    )
+    allocation = allocate_synthesis_inputs(
+        (trusted_claim, other_claim),
+        ordered,
+        full_owners,
+        {},
+        (),
+        (),
+        max_chars=logical_request_chars(
+            trusted_only.task,
+            trusted_only.payload,
+            trusted_only.schema,
+        ),
+    )
+    assert tuple(
+        row["path"] for row in allocation.parts.payload["evidence"]
+    ) == (trusted_path,)
+
+
+def test_synthesis_order_does_not_promote_nonimplementation_sources() -> None:
+    claim = _claim(
+        claim_id="claim-nonimplementation",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+    )
+    test_path = "tests/first.py"
+    source_path = "src/second.py"
+    references = (
+        _reference("evidence-test", test_path, EvidenceKind.TEST, claim.claim_id),
+        _reference(
+            "evidence-source",
+            source_path,
+            EvidenceKind.SOURCE,
+            claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (claim,),
+        references,
+        priority_paths={},
+        selected_paths=(source_path, test_path),
+    )
+
+    assert ordered == references
+
+
+def test_synthesis_order_promotes_only_implementation_owned_sources_in_scope_rank() -> None:
+    implementation_claim = _claim(claim_id="claim-implementation")
+    other_claim = _claim(
+        claim_id="claim-mixed-other",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+    )
+    first_ranked_source = "src/first_ranked.py"
+    later_ranked_source = "src/later_ranked.py"
+    other_test = "tests/producer_first.py"
+    other_source = "src/nonimplementation.py"
+    references = (
+        _reference(
+            "evidence-other-test",
+            other_test,
+            EvidenceKind.TEST,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-later-implementation",
+            later_ranked_source,
+            EvidenceKind.SOURCE,
+            implementation_claim.claim_id,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-other-source",
+            other_source,
+            EvidenceKind.SOURCE,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-first-implementation",
+            first_ranked_source,
+            EvidenceKind.SOURCE,
+            implementation_claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (implementation_claim, other_claim),
+        references,
+        priority_paths={},
+        selected_paths=(
+            first_ranked_source,
+            other_source,
+            other_test,
+            later_ranked_source,
+        ),
+    )
+
+    assert tuple(reference.path for reference in ordered) == (
+        first_ranked_source,
+        later_ranked_source,
+        other_test,
+        other_source,
+    )
+
+
+def test_b05_exact_migration_sql_is_selected_as_bounded_source_material(
+    tmp_path: Path,
+) -> None:
+    """B05 break: migration 044 was rejected before bounded source ranking."""
+
+    migration = (
+        "weave/trace_server/migrations/"
+        "044_add_failure_current_trace_id_index.up.sql"
+    )
+    test_path = "tests/trace_server/test_clickhouse_trace_server_migrator.py"
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(
+        root,
+        migration,
+        (
+            "ALTER TABLE failure_signatures ADD INDEX idx_current_trace_id "
+            "current_trace_id TYPE bloom_filter;\n"
+        ),
+    )
+    _write(root, test_path, "def test_migration():\n    pass\n")
+
+    scope = _scope(
+        root,
+        _inventory(
+            (migration, ChangeStatus.ADDED),
+            (test_path, ChangeStatus.MODIFIED),
+        ),
+        description=(
+            "Benchmark latency improves because migration 044 adds a bloom "
+            "index; inspect "
+            f"{migration}."
+        ),
+    )
+
+    assert scope.selected_paths[0] == migration
+    assert migration in scope.issued_changed_paths
+    assert _kind(migration) is EvidenceKind.SOURCE
+
+
+def test_b07_implementation_files_are_not_starved_by_earlier_changed_tests(
+    tmp_path: Path,
+) -> None:
+    """B07 break: greedy excerpts left the ranked production implementation out."""
+
+    paths = (
+        "tests/v1/attention/test_indexer_tp_row_shard.py",
+        "tests/kernels/mamba/test_gdn_prefill_flashinfer.py",
+        "tests/v1/attention/test_sparse_indexer_decode_seq_lens.py",
+        "vllm/model_executor/layers/sparse_attn_indexer.py",
+        "vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+        "vllm/v1/attention/backends/mla/indexer.py",
+    )
+    implementation_paths = paths[3:]
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in paths:
+        _write(root, path, (f"# {path}\n" + "x" * 1_000))
+    limits = ReviewLimits(
+        max_context_chars=1_200,
+        max_file_chars=500,
+        max_files=len(paths),
+    )
+
+    scope = _scope(
+        root,
+        _inventory(*((path, ChangeStatus.MODIFIED) for path in paths)),
+        title="Shard long-context sparse indexer prefill rows across TP",
+        description=(
+            "The implementation improves long MQA prefill by using a "
+            "cost-balanced query-row shard and an all_gatherv per indexer layer."
+        ),
+        limits=limits,
+    )
+
+    allocations = dict(scope.materialized_path_chars)
+    assert set(scope.issued_changed_paths) == set(paths)
+    assert all(allocations[path] > 0 for path in implementation_paths)
+    path_allocations = tuple(allocations[path] for path in paths)
+    assert min(path_allocations) >= 100
+    assert max(path_allocations) > min(path_allocations)
+    assert scope.materialized_chars <= 1_200
+
+
+def test_b07_recovered_implementation_reaches_bounded_synthesis(
+    tmp_path: Path,
+) -> None:
+    """B07 break: synthesis first-fit dropped the recovered key implementation."""
+
+    paths = (
+        "tests/kernels/mamba/test_gdn_prefill_flashinfer.py",
+        "tests/v1/attention/test_indexer_tp_row_shard.py",
+        "tests/v1/attention/test_sparse_indexer_decode_seq_lens.py",
+        "vllm/model_executor/layers/sparse_attn_indexer.py",
+        "vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+        "vllm/v1/attention/backends/mla/indexer.py",
+    )
+    key_implementation = paths[3]
+    implementation_paths = set(paths[3:])
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in paths:
+        _write(root, path, (f"# {path}\n" + "x" * 20_000))
+    limits = ReviewLimits()
+    scope = _scope(
+        root,
+        _inventory(*((path, ChangeStatus.MODIFIED) for path in paths)),
+        title="Shard long-context sparse indexer prefill rows across TP",
+        description=(
+            "The implementation improves long MQA prefill by using a "
+            "cost-balanced query-row shard and an all_gatherv per indexer layer."
+        ),
+        limits=limits,
+    )
+    claim = _claim()
+
+    evidence, allocation = _discover_and_allocate_scope_evidence(
+        root,
+        scope,
+        (claim,),
+        limits,
+    )
+
+    discovered_paths = {reference.path for reference in evidence.references}
+    retained_paths = {
+        row["path"] for row in allocation.parts.payload["evidence"]
+    }
+    assert key_implementation in discovered_paths
+    assert implementation_paths <= retained_paths
+    assert logical_request_chars(
+        allocation.parts.task,
+        allocation.parts.payload,
+        allocation.parts.schema,
+    ) <= limits.max_context_chars
+
+
+def test_exact_ranked_source_keeps_complete_depth_while_reserving_bounded_breadth(
+    tmp_path: Path,
+) -> None:
+    """An exact 10.8k source must not be flattened to the 24-file average."""
+
+    exact_path = "tests/CardinalityTest.java"
+    other_paths = tuple(f"src/noise_{index:02d}.py" for index in range(23))
+    root = tmp_path / "head"
+    root.mkdir()
+    exact_prefix = "final class CardinalityTest { @Test void one() {} }\n"
+    exact_content = exact_prefix + "x" * (10_800 - len(exact_prefix))
+    _write(root, exact_path, exact_content)
+    for path in other_paths:
+        _write(root, path, (f"# {path}\n" + "x" * 20_000))
+
+    scope = _scope(
+        root,
+        _inventory(
+            (exact_path, ChangeStatus.ADDED),
+            *((path, ChangeStatus.ADDED) for path in other_paths),
+        ),
+        title="Benchmark accuracy improves by 5%",
+        description=f"The exact implementation is in {exact_path}.",
+    )
+
+    allocations = dict(scope.materialized_path_chars)
+    assert scope.selected_paths[0] == exact_path
+    assert allocations[exact_path] == len(exact_content)
+    assert min(allocations[path] for path in other_paths) >= 1_250
+    assert scope.materialized_chars <= 60_000
+    assert not any(
+        issue.path == exact_path
+        and issue.code == "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+        for issue in scope.issues
+    )
+
+    claim = _claim(hints=(exact_path,))
+    evidence, allocation = _discover_and_allocate_scope_evidence(
+        root,
+        scope,
+        (claim,),
+        ReviewLimits(),
+    )
+    exact_reference = next(
+        reference for reference in evidence.references if reference.path == exact_path
+    )
+    retained_paths = {
+        row["path"] for row in allocation.parts.payload["evidence"]
+    }
+    assert exact_reference.excerpt_complete is True
+    assert exact_path in retained_paths
+    assert logical_request_chars(
+        allocation.parts.task,
+        allocation.parts.payload,
+        allocation.parts.schema,
+    ) <= 60_000
+
+
+def test_b08_changed_implementation_budget_is_complete_deterministic_and_confined(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B08 break: pp_utils.py and gpu_worker.py received zero-byte evidence."""
+
+    paths = (
+        "tests/distributed/test_comm_ops.py",
+        "tests/test_envs.py",
+        "tests/v1/worker/test_pp_utils.py",
+        "vllm/distributed/parallel_state.py",
+        "vllm/envs.py",
+        "vllm/v1/worker/gpu/model_runner.py",
+        "vllm/v1/worker/gpu/pp_utils.py",
+        "vllm/v1/worker/gpu_worker.py",
+    )
+    roots = (tmp_path / "first", tmp_path / "second")
+    for root, creation_order in zip(
+        roots,
+        (paths, tuple(reversed(paths))),
+        strict=True,
+    ):
+        root.mkdir()
+        for path in creation_order:
+            _write(root, path, (f"# {path}\n" + "x" * 1_000))
+        _write(root, "private/unlisted.py", "UNLISTED_SENTINEL_MUST_NOT_BE_READ\n")
+
+    opened: list[tuple[str, str]] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append((root_path.name, relative))
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(
+        preflight_module,
+        "capture_confined_regular_file",
+        traced_capture,
+    )
+    inventory = _inventory(*((path, ChangeStatus.MODIFIED) for path in paths))
+    limits = ReviewLimits(
+        max_context_chars=1_600,
+        max_file_chars=500,
+        max_files=len(paths),
+    )
+    scopes = tuple(
+        _scope(
+            root,
+            inventory,
+            title="Add V2 BF16 streamed PP transport",
+            description=(
+                "Preallocate a bounded sender ring on a dedicated stream, receive "
+                "full chunks into a fixed buffer, and preserve fallback behavior. "
+                "Tests cover tests/distributed/test_comm_ops.py, tests/test_envs.py, "
+                "and tests/v1/worker/test_pp_utils.py."
+            ),
+            limits=limits,
+        )
+        for root in roots
+    )
+
+    allocations = tuple(dict(scope.materialized_path_chars) for scope in scopes)
+    assert scopes[0].selected_paths == scopes[1].selected_paths
+    assert scopes[0].issues == scopes[1].issues
+    assert allocations[0] == allocations[1]
+    assert set(scopes[0].issued_changed_paths) == set(paths)
+    assert all(allocations[0][path] > 0 for path in paths)
+    path_allocations = tuple(allocations[0][path] for path in paths)
+    assert min(path_allocations) >= 100
+    assert max(path_allocations) > min(path_allocations)
+    assert all(scope.materialized_chars <= 1_600 for scope in scopes)
+    assert set(relative for _root, relative in opened) == set(paths)
+    assert all(relative != "private/unlisted.py" for _root, relative in opened)
+
+
+def test_failed_candidate_redistributes_its_share_without_backfilling_file_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable early path donates context, but never an extra file attempt."""
+
+    missing = "results/a_missing.json"
+    selected_paths = ("src/b.py", "src/c.py")
+    outside_cap = "src/z_not_attempted.py"
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in (*selected_paths, outside_cap):
+        _write(root, path, (f"# {path}\n" + "x" * 2_000))
+
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(
+        preflight_module,
+        "capture_confined_regular_file",
+        traced_capture,
+    )
+    scope = _scope(
+        root,
+        _inventory(
+            (missing, ChangeStatus.MODIFIED),
+            *(
+                (path, ChangeStatus.MODIFIED)
+                for path in (*selected_paths, outside_cap)
+            ),
+        ),
+        title="Benchmark accuracy improves by 5%",
+        limits=ReviewLimits(
+            max_context_chars=1_000,
+            max_file_chars=800,
+            max_files=3,
+        ),
+    )
+
+    allocations = tuple(
+        dict(scope.materialized_path_chars)[path] for path in selected_paths
+    )
+    assert allocations == (800, 167)
+    assert scope.materialized_chars == 1_000
+    assert opened == [missing, *selected_paths]
+    assert outside_cap not in scope.selected_paths
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        and issue.path == outside_cap
+        for issue in scope.issues
+    )
+
+
+def test_ranked_reserve_degrades_to_live_share_under_tiny_context_cap(
+    tmp_path: Path,
+) -> None:
+    """Tiny budgets remain bounded while rank order receives the only surplus."""
+
+    paths = tuple(f"src/{name}.py" for name in "abcd")
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in paths:
+        _write(root, path, "x" * 100)
+
+    scope = _scope(
+        root,
+        _inventory(*((path, ChangeStatus.MODIFIED) for path in paths)),
+        title="benchmark",
+        limits=ReviewLimits(
+            max_context_chars=15,
+            max_file_chars=3,
+            max_files=4,
+        ),
+    )
+
+    allocations = dict(scope.materialized_path_chars)
+    assert tuple(allocations[path] for path in paths) == (3, 1, 1, 1)
+    assert scope.materialized_chars == 15
 
 
 def test_quantitative_comparative_benchmark_reproducibility_and_model_dataset_seeds(

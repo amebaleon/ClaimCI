@@ -320,7 +320,7 @@ def _kind(path: str) -> EvidenceKind:
         or is_test_source_file(path)
     ):
         return EvidenceKind.TEST
-    if is_source_file(path):
+    if material_kind is ReviewMaterialKind.SOURCE or is_source_file(path):
         return EvidenceKind.SOURCE
     if tokens & {"result", "results", "metric", "metrics", "score", "scores"}:
         return EvidenceKind.RESULTS

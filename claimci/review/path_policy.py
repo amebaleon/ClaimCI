@@ -9,6 +9,7 @@ from .models import ReviewMaterialKind
 
 SOURCE_SUFFIXES = frozenset({".py", ".js", ".ts", ".rs", ".go", ".java"})
 _TEST_SEGMENTS = frozenset({"test", "tests"})
+_MIGRATION_SEGMENTS = frozenset({"migration", "migrations"})
 _SUBMISSION_SHELL_TOKENS = frozenset(
     {"submit", "submission", "job", "launch", "eval", "evaluation", "benchmark"}
 )
@@ -104,6 +105,8 @@ def classify_review_material(path: str) -> ReviewMaterialKind:
         and suffix in _CONFIG_MATERIAL_SUFFIXES
     ):
         return ReviewMaterialKind.CONFIG
+    if suffix == ".sql" and bool(set(lowered_parts) & _MIGRATION_SEGMENTS):
+        return ReviewMaterialKind.SOURCE
     if is_source_file(portable):
         return ReviewMaterialKind.SOURCE
     return ReviewMaterialKind.OTHER

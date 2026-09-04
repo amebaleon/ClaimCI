@@ -1709,7 +1709,9 @@ def test_gate3_trim_drops_unbound_path_scoped_locality_facts(
     assert review.preflight is not None and review.preflight.ready_for_provider
     assert review.preflight.scope is not None
     scope = review.preflight.scope
-    trimmed = {"docs/d2.md", "docs/d3.md"}
+    document_paths = {f"docs/d{index}.md" for index in range(4)}
+    trimmed = document_paths - set(scope.selected_paths)
+    assert trimmed
     assert trimmed.isdisjoint(scope.selected_paths)
     assert {
         issue.code for issue in scope.issues if issue.path in trimmed

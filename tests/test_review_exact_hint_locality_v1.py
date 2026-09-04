@@ -30,12 +30,14 @@ from claimci.review.models import (
     ReviewConfig,
     ReviewError,
     ReviewLimits,
+    ReviewMaterialKind,
     ReviewStatus,
     ScientificClaim,
     SourceKind,
     SourceLocation,
 )
 from claimci.review.orchestrator import ReviewInputs, run_review
+from claimci.review.path_policy import classify_review_material
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.sources import collect_review_sources
 
@@ -367,6 +369,79 @@ def test_exact_changed_source_hint_routes_despite_semantically_unrelated_filenam
     reference = _reference_for(bundle.references, SERVICE)
     assert reference.claim_ids == (claim.claim_id,)
     assert not any(item.reason == "route_mismatch" for item in bundle.missing)
+
+
+def test_exact_changed_migration_hint_routes_as_source_without_semantic_guessing(
+    tmp_path: Path,
+) -> None:
+    """B05 break: migration SQL classified OTHER could not use exact source routing."""
+
+    path = (
+        "weave/trace_server/migrations/"
+        "044_add_failure_current_trace_id_index.up.sql"
+    )
+    _write(
+        tmp_path,
+        path,
+        (
+            "ALTER TABLE failure_signatures ADD INDEX idx_current_trace_id "
+            "current_trace_id TYPE bloom_filter;\n"
+        ),
+    )
+    claim = _claim(
+        "claim-migration-044",
+        ClaimType.IMPLEMENTATION_CLAIM,
+        "The production change preserves the declared behavior.",
+        "declared behavior",
+        hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (claim,),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    reference = _reference_for(bundle.references, path)
+    assert reference.claim_ids == (claim.claim_id,)
+    assert reference.kind is EvidenceKind.SOURCE
+    assert reference.provenance is EvidenceProvenance.SUPPORTING_ARTIFACT
+    assert not any(item.reason == "route_mismatch" for item in bundle.missing)
+
+
+def test_sql_outside_migration_paths_stays_other_and_cannot_use_source_bypass(
+    tmp_path: Path,
+) -> None:
+    """Migration support must not promote arbitrary SQL into source evidence."""
+
+    path = "queries/opaque.sql"
+    _write(tmp_path, path, "SELECT secret_value FROM private_table;\n")
+    claim = _claim(
+        "claim-ordinary-sql",
+        ClaimType.IMPLEMENTATION_CLAIM,
+        "The production change preserves the declared behavior.",
+        "declared behavior",
+        hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (claim,),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    assert classify_review_material(path) is ReviewMaterialKind.OTHER
+    assert bundle.references == ()
+    assert any(
+        item.claim_id == claim.claim_id
+        and item.requested_path == path
+        and item.reason == "route_mismatch"
+        for item in bundle.missing
+    )
 
 
 @pytest.mark.parametrize(
