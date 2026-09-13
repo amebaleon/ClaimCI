@@ -1,5 +1,71 @@
 # ClaimCI
 
+Experimental CI for verifying quantitative, experimental, and behavioral claims in AI/ML pull requests.
+
+**Status: Maintenance mode**
+
+Commercial development has ended.
+The project remains available as open-source software.
+
+## What ClaimCI does
+
+ClaimCI checks whether a pull request's claims are supported by its available
+code, experiment configuration, datasets, and result artifacts. Its local CLI
+provides deterministic auditing; optional model-assisted review is advisory.
+Hosted accounts, login, dashboard, billing, and managed analysis are deprecated.
+There is no hosted-service availability or commercial support commitment.
+Automated model review is disabled in this repository by default.
+
+- [Architecture](docs/architecture.md)
+- [Case studies and attribution limits](docs/case-studies/README.md)
+- [Apache-2.0 license](LICENSE)
+
+## Local CLI quick start
+
+Requires Python 3.11 or newer. Deterministic audits need no API key or backend.
+
+```sh
+python -m pip install -e .
+claimci audit examples/valid/research.yaml --json
+```
+
+## GitHub Actions example
+
+This read-only example runs a pinned version of ClaimCI on passive PR artifacts.
+Review and update the immutable installer revision deliberately.
+
+```yaml
+name: ClaimCI local audit
+on: [pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          path: artifacts
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: amebaleon/ClaimCI@7d64a3957a3d0b0a6712f0d89d1ba6497208822c
+      - run: claimci audit artifacts/research.yaml --artifact-root artifacts --markdown
+```
+
+## Limitations and maintenance status
+
+Evidence support is limited to the supplied artifacts and supported adapters.
+A finding about missing evidence is not proof that a claim is false.
+Model-assisted review may miss issues or produce incorrect interpretations and
+requires human review. Optional API use is billed by the user's provider.
+ClaimCI does not reproduce arbitrary GPU experiments or guarantee scientific
+correctness, security, or merge readiness. No new commercial features or
+response-time guarantees are planned; fixes are best effort.
+
+## Detailed usage
+
 > ClaimCI independently verifies whether scientific claims are supported by the underlying experiments.
 
 ClaimCI is a deterministic command-line auditor for experiment configs, raw run results, seed evidence, and exact train/eval data leakage.
@@ -114,7 +180,10 @@ VERIFIED
 
 Exit codes are `0` for `SUPPORTED`, `1` for `NOT_SUPPORTED`, and `2` for `INSUFFICIENT_EVIDENCE` or invalid input.
 
-## GitHub pull-request integration
+## GitHub pull-request integration (self-managed)
+
+The project owner's hosted workflows are disabled in maintenance mode. The
+source remains available for users to configure in their own repositories.
 
 The checked-in [ClaimCI workflow](.github/workflows/claimci.yml) runs automatically when a pull request is opened, updated, reopened, or marked ready for review. It audits the root `research.yaml`, appends the Markdown report to the Actions job summary, and creates a `ClaimCI Audit` Check Run on the pull-request head commit, including for fork pull requests.
 
@@ -272,7 +341,10 @@ claimci audit examples/day2_demo/research.yaml --json > day2-demo.json
 
 The command intentionally exits `1`; open `day2-demo.md` in a Markdown preview to show the PR-ready view. See [the demo guide](examples/day2_demo/README.md) for the exact story and limitations.
 
-## External private-repository pilot
+## Historical external private-repository pilot
+
+This describes the former private pilot. Core is now public; the old access
+sharing setup is not required for the public action.
 
 ClaimCI v0 can be consumed from a separate private repository owned by the same
 GitHub user through a full-SHA-pinned reusable workflow. The consumer contains

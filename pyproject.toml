@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Deterministic CI auditing for research claims"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "ClaimCI contributors" }]
 dependencies = ["PyYAML==6.0.3"]
 
