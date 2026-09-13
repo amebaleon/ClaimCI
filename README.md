@@ -375,6 +375,7 @@ authenticity/provenance, semantic or group leakage, or equal wall-clock/FLOP
 compute. It does not rerun experiments. JSON number spellings such as `1` and
 `1.0` remain distinct after canonical serialization, and leakage detection
 covers exact within-experiment train/eval matches only. The workflow trusts the
-base-branch ClaimCI implementation and local artifacts; it is not yet a hosted,
-centrally versioned verifier. Artifact size limits and cryptographic
-attestations are not yet implemented.
+base-branch ClaimCI implementation and local artifacts. Hosted service is
+retired. Supported adapters and configured input limits bound each analysis;
+source references and provenance checks do not certify the authenticity of
+the original experimental artifacts.
