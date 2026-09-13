@@ -11,8 +11,9 @@ An independent [Claude review](https://github.com/NVIDIA/Model-Optimizer/pull/22
 explicitly cited @amebaleon's missing-artifact finding. A subsequent
 [re-review](https://github.com/NVIDIA/Model-Optimizer/pull/2207#pullrequestreview-5145962678)
 again cited it and required the PR body and changelog to describe the current
-implementation before approval. The review discussion called for current-head
-measurement evidence or withdrawal of unsupported headline numbers.
+implementation before approval. An [inline review request](https://github.com/NVIDIA/Model-Optimizer/pull/2207#discussion_r3961356082)
+explicitly called for current-head remeasurement or removal of the specific
+figures from the changelog, citing @amebaleon's two comments.
 
 The [final PR description](https://github.com/NVIDIA/Model-Optimizer/pull/2207)
 removed the old 19.9x comparison and used new export measurements (168.6 seconds
