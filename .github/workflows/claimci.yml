@@ -124,6 +124,7 @@ jobs:
     name: ClaimCI research review
     if: github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    continue-on-error: true
     # The provider can inspect repository contents but cannot create or update
     # Checks. The job-level map narrows the inherited workflow permissions.
     permissions:
@@ -137,6 +138,16 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           path: claimci-trusted
           persist-credentials: false
+          fetch-depth: 0
+
+      # Installation can create ignored build metadata. Keep it outside the
+      # immutable checkout whose Git identity is verified by preflight.
+      - name: Check out trusted ClaimCI runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: claimci-runtime
+          persist-credentials: false
 
       - name: Check out pull-request artifacts as passive review data
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,26 +155,77 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pull-request
           persist-credentials: false
+          fetch-depth: 0
           # checkout v7 requires this acknowledgement outside GITHUB_WORKSPACE.
           # No file from this tree is imported, installed, or executed.
           allow-unsafe-pr-checkout: true
+
+      - name: Resolve trusted review coordinates
+        id: coordinates
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          full_sha='^([0-9a-f]{40}|[0-9a-f]{64})$'
+          if [[ ! "$requested_sha" =~ $full_sha ]] || [[ ! "$head_sha" =~ $full_sha ]]; then
+            exit 1
+          fi
+          if [ "$(git -C claimci-trusted rev-parse --verify 'HEAD^{commit}')" != "$requested_sha" ] || \
+             [ "$(git -C pull-request rev-parse --verify 'HEAD^{commit}')" != "$head_sha" ]; then
+            exit 1
+          fi
+          # The exact base and fork head are separate passive checkouts. Expose
+          # the head object store read-only while deriving from the trusted repo.
+          pull_request_git_dir="$(git -C pull-request rev-parse --absolute-git-dir)"
+          export GIT_ALTERNATE_OBJECT_DIRECTORIES="$pull_request_git_dir/objects"
+          mapfile -t merge_bases < <(git -C claimci-trusted merge-base --all "$requested_sha" "$head_sha")
+          if [ "${#merge_bases[@]}" -ne 1 ] || [[ ! "${merge_bases[0]}" =~ $full_sha ]]; then
+            exit 1
+          fi
+          comparison_sha="${merge_bases[0]}"
+          if [ "$comparison_sha" = "$requested_sha" ]; then
+            comparison_basis=direct_base
+            comparison_root=claimci-trusted
+          else
+            comparison_basis=merge_base
+            comparison_root=comparison-base
+          fi
+          echo "requested_sha=$requested_sha" >> "$GITHUB_OUTPUT"
+          echo "comparison_sha=$comparison_sha" >> "$GITHUB_OUTPUT"
+          echo "comparison_basis=$comparison_basis" >> "$GITHUB_OUTPUT"
+          echo "comparison_root=$comparison_root" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out explicit comparison base
+        if: steps.coordinates.outputs.comparison_basis == 'merge_base'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.coordinates.outputs.comparison_sha }}
+          path: comparison-base
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Set up Python for trusted review
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
 
-      - name: Install trusted ClaimCI and conditional review SDK
+      - name: Install trusted ClaimCI
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: python -m pip install ./claimci-runtime
+
+      - name: Probe trusted review configuration
+        id: review_config
         if: always()
         shell: bash
         run: |
-          set +e
-          python -m pip install ./claimci-trusted
-          install_status=$?
-          set -e
           review_enabled=false
-          if [ "$install_status" -eq 0 ]; then
-            review_enabled="$(python - <<'PY'
+          review_enabled="$(python - <<'PY'
           from pathlib import Path
 
           from claimci.review.config import load_review_config
@@ -174,20 +236,62 @@ jobs:
               enabled = False
           print("true" if enabled else "false")
           PY
-          )"
+          )" || review_enabled=false
+          case "$review_enabled" in true|false) ;; *) review_enabled=false ;; esac
+          echo "enabled=$review_enabled" >> "$GITHUB_OUTPUT"
+
+      - name: Run free ClaimCI Research Review preflight
+        id: preflight
+        if: always() && steps.review_config.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          rm -f claimci-review-preflight.json claimci-review-preflight.md
+          set +e
+          claimci review pull-request \
+            --requested-base-root claimci-trusted \
+            --comparison-base-root "${{ steps.coordinates.outputs.comparison_root || 'claimci-trusted' }}" \
+            --requested-base-sha "${{ steps.coordinates.outputs.requested_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-base-sha "${{ steps.coordinates.outputs.comparison_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-basis "${{ steps.coordinates.outputs.comparison_basis || 'direct_base' }}" \
+            --head-sha "${{ steps.coordinates.outputs.head_sha || '0000000000000000000000000000000000000000' }}" \
+            --config-root claimci-trusted \
+            --config .claimci/review.yaml \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --preflight-only \
+            --json-output claimci-review-preflight.json \
+            --markdown-output claimci-review-preflight.md
+          preflight_status=$?
+          set -e
+          ready=false
+          if [ "$preflight_status" -eq 0 ] && [ -s claimci-review-preflight.json ]; then
+            ready="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          try:
+              value = json.loads(Path("claimci-review-preflight.json").read_text(encoding="utf-8"))
+              ready = value.get("preflight", {}).get("ready_for_provider") is True
+          except Exception:
+              ready = False
+          print("true" if ready else "false")
+          PY
+          )" || ready=false
           fi
-          if [ "$review_enabled" = "true" ]; then
-            # The optional SDK is installed only from the trusted base.  A
-            # missing SDK remains an advisory review failure.
-            python -m pip install "./claimci-trusted[llm]" || true
-          fi
-          # Keep a failed base install visible to the job while allowing the
-          # always-running fallback/output steps to hand off a neutral Check.
-          exit "$install_status"
+          case "$ready" in true|false) ;; *) ready=false ;; esac
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "preflight_status=$preflight_status" >> "$GITHUB_OUTPUT"
+
+      - name: Install optional review SDK after passed preflight
+        id: review_sdk
+        if: always() && steps.preflight.outputs.ready == 'true'
+        continue-on-error: true
+        shell: bash
+        run: python -m pip install "./claimci-runtime[llm]"
 
       - name: Run optional ClaimCI Research Review
         id: review
-        if: always()
+        if: always() && steps.preflight.outputs.ready == 'true' && steps.review_sdk.outcome == 'success'
         continue-on-error: true
         shell: bash
         env:
@@ -196,23 +300,58 @@ jobs:
           # it in either report or the handoff payload.
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          rm -f claimci-review-paid.json claimci-review-paid.md
           set +e
           claimci review pull-request \
-            --base-root claimci-trusted \
+            --requested-base-root claimci-trusted \
+            --comparison-base-root "${{ steps.coordinates.outputs.comparison_root || 'claimci-trusted' }}" \
+            --requested-base-sha "${{ steps.coordinates.outputs.requested_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-base-sha "${{ steps.coordinates.outputs.comparison_sha || '0000000000000000000000000000000000000000' }}" \
+            --comparison-basis "${{ steps.coordinates.outputs.comparison_basis || 'direct_base' }}" \
+            --head-sha "${{ steps.coordinates.outputs.head_sha || '0000000000000000000000000000000000000000' }}" \
             --config-root claimci-trusted \
             --config .claimci/review.yaml \
             --event-json "$GITHUB_EVENT_PATH" \
-            --json-output claimci-review.json \
-            --markdown-output claimci-review.md
+            --json-output claimci-review-paid.json \
+            --markdown-output claimci-review-paid.md
           review_status=$?
           set -e
 
-          # Disabled, unavailable, or malformed reviews remain advisory. Keep
-          # both views present so the payload builder can fail closed.
-          if [ ! -s claimci-review.json ]; then
-            printf '%s\n' '{"schema_version":1,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json
+          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure advisory review artifacts
+        if: always()
+        shell: bash
+        env:
+          PREFLIGHT_READY: ${{ steps.preflight.outputs.ready }}
+          PREFLIGHT_STATUS: ${{ steps.preflight.outputs.preflight_status }}
+          REVIEW_SDK_OUTCOME: ${{ steps.review_sdk.outcome }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          PAID_STATUS: ${{ steps.review.outputs.review_status }}
+        run: |
+          set -euo pipefail
+          rm -f claimci-review.json claimci-review.md
+          selected=false
+          if [ "${PREFLIGHT_READY:-}" = "true" ]; then
+            if [ "${PREFLIGHT_STATUS:-}" = "0" ] && \
+               [ "${REVIEW_SDK_OUTCOME:-}" = "success" ] && \
+               [ "${REVIEW_OUTCOME:-}" = "success" ] && \
+               [ "${PAID_STATUS:-}" = "0" ] && \
+               [ -s claimci-review-paid.json ] && \
+               [ -s claimci-review-paid.md ]; then
+              cp claimci-review-paid.json claimci-review.json
+              cp claimci-review-paid.md claimci-review.md
+              selected=true
+            fi
+          elif [ "${PREFLIGHT_STATUS:-}" = "0" ] && \
+               [ -s claimci-review-preflight.json ] && \
+               [ -s claimci-review-preflight.md ]; then
+            cp claimci-review-preflight.json claimci-review.json
+            cp claimci-review-preflight.md claimci-review.md
+            selected=true
           fi
-          if [ ! -s claimci-review.md ]; then
+          if [ "$selected" != "true" ]; then
+            printf '%s\n' '{"schema_version":2,"review":{"status":"UNAVAILABLE","policy":"advisory","blocking":false}}' > claimci-review.json
             {
               echo '## ClaimCI Research Review (Advisory)'
               echo
@@ -222,7 +361,6 @@ jobs:
             } > claimci-review.md
           fi
           cat claimci-review.md >> "$GITHUB_STEP_SUMMARY"
-          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
 
       - name: Build ClaimCI Research Review Check payload
         if: always()

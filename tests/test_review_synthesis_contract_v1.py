@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -20,11 +21,25 @@ PROVIDER_TEXT = "ATTACKER_PROVIDER_TEXT_MUST_NOT_LEAK"
 
 
 def _inputs(tmp_path: Path) -> ReviewInputs:
-    (tmp_path / "README.md").write_text("# Synthesis fixture\n", encoding="utf-8")
+    result = tmp_path / "results" / "metrics.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "rows_read_reduction": "4.0x fewer rows",
+                "training_budget": "unchanged",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return ReviewInputs(
         repository_root=tmp_path,
         pr_title="Synthesis contract fixture",
-        pr_description=f"{FIRST_CLAIM}\n{SECOND_CLAIM}",
+        pr_description=(
+            f"{FIRST_CLAIM}\n{SECOND_CLAIM}\n"
+            "Benchmark evidence: 1 run in results/metrics.json"
+        ),
     )
 
 
@@ -89,28 +104,30 @@ def _extraction_output(request: StructuredRequest) -> str:
 
 
 def _asymmetric_evidence(
-    _root: Path,
+    root: Path,
     claims: Any,
     _paths: Any,
     **_kwargs: Any,
 ) -> EvidenceBundle:
     """Issue one globally valid reference owned only by the first claim."""
 
+    material = (root / "results" / "metrics.json").read_bytes()
+    excerpt = material.decode("utf-8").strip()
     return EvidenceBundle(
         references=(
             EvidenceReference(
                 evidence_id="evidence-first-only",
                 claim_ids=(claims[0].claim_id,),
                 kind=EvidenceKind.RESULTS,
-                path="results.json",
+                path="results/metrics.json",
                 start_line=1,
                 end_line=1,
-                sha256="a" * 64,
-                size=2,
-                excerpt="{}",
+                sha256=hashlib.sha256(material).hexdigest(),
+                size=len(material),
+                excerpt=excerpt,
             ),
         ),
-        total_chars=2,
+        total_chars=len(excerpt),
     )
 
 

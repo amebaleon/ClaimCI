@@ -78,12 +78,21 @@ class _InvalidSynthesisProvider:
 def test_invalid_synthesis_is_partial_and_preserves_trusted_extraction(
     tmp_path: Path,
 ) -> None:
+    result_file = tmp_path / "results" / "rollup.json"
+    result_file.parent.mkdir(parents=True)
+    result_file.write_text(
+        '{"runs": [{"rows_read": 25}]}\n',
+        encoding="utf-8",
+    )
     provider = _InvalidSynthesisProvider()
 
     result = run_review(
         ReviewInputs(
             repository_root=tmp_path,
-            pr_description="The rollup reads 4.0x fewer rows for the 90-day benchmark.",
+            pr_description=(
+                "The rollup reads 4.0x fewer rows for the 90-day benchmark; "
+                "see results/rollup.json."
+            ),
         ),
         ReviewConfig(enabled=True, limits=ReviewLimits()),
         provider=provider,

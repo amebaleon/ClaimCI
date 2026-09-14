@@ -14,8 +14,19 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from claimci.passive_files import PassiveFileError, capture_confined_regular_file
 
-from .models import ClaimType, ReviewError, ReviewLimits, ScientificClaim
-from .path_policy import is_source_file, is_test_source_file
+from .models import (
+    ClaimType,
+    ReviewError,
+    ReviewLimits,
+    ReviewMaterialKind,
+    ScientificClaim,
+)
+from .path_policy import (
+    classify_review_material,
+    is_source_file,
+    is_supported_review_evidence_path,
+    is_test_source_file,
+)
 
 
 MAX_EVIDENCE_FILE_BYTES = 16 * 1024 * 1024
@@ -80,6 +91,66 @@ class EvidenceBundle:
     missing: tuple[MissingEvidence, ...] = ()
     total_chars: int = 0
     routing_incomplete: bool = False
+
+
+@dataclass(frozen=True)
+class EvidenceMaterialIdentity:
+    """Expected selected head/base identities authorized before provider use."""
+
+    path: str
+    head_sha256: str
+    head_size: int
+    base_sha256: str | None
+    base_size: int | None
+    base_bound: bool
+    base_absent: bool
+
+    def __post_init__(self) -> None:
+        normalized = _safe_relative(self.path)
+        if normalized is None or normalized != self.path:
+            raise ReviewError("expected evidence material path is invalid")
+        hexadecimal = frozenset("0123456789abcdef")
+        if (
+            not isinstance(self.head_sha256, str)
+            or len(self.head_sha256) != 64
+            or not set(self.head_sha256).issubset(hexadecimal)
+            or isinstance(self.head_size, bool)
+            or not isinstance(self.head_size, int)
+            or not 0 <= self.head_size <= MAX_EVIDENCE_FILE_BYTES
+        ):
+            raise ReviewError("expected head evidence identity is invalid")
+        if not isinstance(self.base_bound, bool) or not isinstance(
+            self.base_absent, bool
+        ):
+            raise ReviewError("expected base evidence state is invalid")
+        if not self.base_bound:
+            if (
+                self.base_absent
+                or self.base_sha256 is not None
+                or self.base_size is not None
+            ):
+                raise ReviewError("unbound base evidence has an identity")
+        elif self.base_absent:
+            if self.base_sha256 is not None or self.base_size is not None:
+                raise ReviewError("absent base evidence has a present identity")
+        elif (
+            not isinstance(self.base_sha256, str)
+            or len(self.base_sha256) != 64
+            or not set(self.base_sha256).issubset(hexadecimal)
+            or isinstance(self.base_size, bool)
+            or not isinstance(self.base_size, int)
+            or not 0 <= self.base_size <= MAX_EVIDENCE_FILE_BYTES
+        ):
+            raise ReviewError("expected base evidence identity is invalid")
+
+
+class EvidenceMaterialInvalidated(ReviewError):
+    """A descriptor-bound evidence read differed from its authorized identity."""
+
+    def __init__(self, path: str, *, head: bool) -> None:
+        self.path = path
+        self.head = head
+        super().__init__("selected evidence material identity changed")
 
 
 _ROUTES: dict[ClaimType, tuple[str, ...]] = {
@@ -235,8 +306,11 @@ def _kind(path: str) -> EvidenceKind:
     name = PurePosixPath(path).name.casefold()
     tokens = _tokens(lowered)
     segments = set(PurePosixPath(lowered).parts)
+    material_kind = classify_review_material(path)
     if name in {"research.yaml", "research.yml"}:
         return EvidenceKind.MANIFEST
+    if material_kind is ReviewMaterialKind.SUBMISSION_CONFIG:
+        return EvidenceKind.CONFIG
     # File format is authoritative for implementation evidence.  A source
     # filename such as ``config.py`` must not bypass the changed-file policy
     # merely because its stem also names another evidence category.
@@ -246,13 +320,21 @@ def _kind(path: str) -> EvidenceKind:
         or is_test_source_file(path)
     ):
         return EvidenceKind.TEST
-    if is_source_file(path):
+    if material_kind is ReviewMaterialKind.SOURCE or is_source_file(path):
         return EvidenceKind.SOURCE
     if tokens & {"result", "results", "metric", "metrics", "score", "scores"}:
         return EvidenceKind.RESULTS
     if tokens & {"config", "configs", "configuration", "configurations"} or name.endswith((".yaml", ".yml", ".toml")):
         return EvidenceKind.CONFIG
     if tokens & {"benchmark", "benchmarks", "latency", "memory", "cost", "costs"}:
+        return EvidenceKind.BENCHMARK
+    if material_kind is ReviewMaterialKind.MANIFEST:
+        return EvidenceKind.MANIFEST
+    if material_kind is ReviewMaterialKind.RESULT:
+        return EvidenceKind.RESULTS
+    if material_kind is ReviewMaterialKind.CONFIG:
+        return EvidenceKind.CONFIG
+    if material_kind is ReviewMaterialKind.BENCHMARK:
         return EvidenceKind.BENCHMARK
     if tokens & {"data", "dataset", "datasets"} or "data" in segments or name.endswith(".jsonl"):
         return EvidenceKind.DATASET
@@ -553,6 +635,15 @@ def _matches(
     tokens = _tokens(lowered)
     kind = _kind(path)
 
+    material_kind = classify_review_material(path)
+    if not is_supported_review_evidence_path(path):
+        return False
+    if PurePosixPath(path).suffix.casefold() in {".sh", ".bash"}:
+        if material_kind is not ReviewMaterialKind.SUBMISSION_CONFIG:
+            return False
+        if path not in changed_paths:
+            return False
+
     if (
         claim.claim_type in _CHANGED_SOURCE_CLAIMS
         and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
@@ -719,6 +810,27 @@ def _changed_line_window(
     return excerpt, left + 1, right
 
 
+def changed_region_excerpt_from_text(
+    head_text: str,
+    base_text: str | None,
+    *,
+    char_limit: int,
+) -> tuple[str, int, int] | None:
+    """Apply the shared changed-region rule to already-bound normalized text."""
+
+    if not isinstance(head_text, str) or (
+        base_text is not None and not isinstance(base_text, str)
+    ):
+        raise TypeError("changed-region inputs must be text")
+    if isinstance(char_limit, bool) or not isinstance(char_limit, int):
+        raise TypeError("changed-region character limit must be an integer")
+    return _changed_line_window(
+        head_text,
+        base_text,
+        char_limit=char_limit,
+    )
+
+
 def _changed_region_excerpt(
     base_root: Path | None,
     relative: str,
@@ -745,7 +857,28 @@ def _changed_region_excerpt(
         base_text = base_text.replace("\r\n", "\n").replace("\r", "\n")
     except (PassiveFileError, UnicodeError, ValueError, RecursionError):
         return None
-    return _changed_line_window(head_text, base_text, char_limit=char_limit)
+    return changed_region_excerpt_from_text(
+        head_text,
+        base_text,
+        char_limit=char_limit,
+    )
+
+
+def changed_region_excerpt(
+    base_root: Path | None,
+    relative: str,
+    head_text: str,
+    *,
+    char_limit: int,
+) -> tuple[str, int, int] | None:
+    """Expose the passive changed-region locality decision to free preflight."""
+
+    return _changed_region_excerpt(
+        base_root,
+        relative,
+        head_text,
+        char_limit=char_limit,
+    )
 
 
 def _regular_excerpt(
@@ -755,8 +888,9 @@ def _regular_excerpt(
     kind: EvidenceKind,
     char_limit: int,
     changed: set[str],
-    exact_source_test_paths: set[str],
+    exact_localized_paths: set[str],
     base_root: Path | None,
+    material_identity: EvidenceMaterialIdentity | None = None,
 ) -> tuple[str, int, int, bool, EvidenceLocality]:
     """Issue one bounded excerpt with an explicit, deterministic locality."""
 
@@ -765,16 +899,50 @@ def _regular_excerpt(
         return text, start_line, end_line, True, EvidenceLocality.COMPLETE_FILE
 
     if (
-        relative in exact_source_test_paths
-        and kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+        relative in exact_localized_paths
     ):
         if relative in changed:
-            region = _changed_region_excerpt(
-                base_root,
-                relative,
-                text,
-                char_limit=char_limit,
-            )
+            if material_identity is None or not material_identity.base_bound:
+                region = _changed_region_excerpt(
+                    base_root,
+                    relative,
+                    text,
+                    char_limit=char_limit,
+                )
+            elif material_identity.base_absent:
+                region = _changed_line_window(
+                    text,
+                    None,
+                    char_limit=char_limit,
+                )
+            else:
+                try:
+                    assert base_root is not None
+                    base_capture = capture_confined_regular_file(
+                        base_root,
+                        relative,
+                        max_bytes=MAX_EVIDENCE_FILE_BYTES,
+                    )
+                    if (
+                        base_capture.sha256 != material_identity.base_sha256
+                        or base_capture.size != material_identity.base_size
+                    ):
+                        raise EvidenceMaterialInvalidated(relative, head=False)
+                    frozen_base_text = base_capture.content.decode("utf-8")
+                    frozen_base_text = frozen_base_text.replace(
+                        "\r\n", "\n"
+                    ).replace("\r", "\n")
+                    region = _changed_line_window(
+                        text,
+                        frozen_base_text,
+                        char_limit=char_limit,
+                    )
+                except EvidenceMaterialInvalidated:
+                    raise
+                except PassiveFileError as exc:
+                    raise EvidenceMaterialInvalidated(relative, head=False) from exc
+                except (UnicodeError, ValueError, RecursionError):
+                    region = None
             if region is not None:
                 excerpt, start_line, end_line = region
                 return (
@@ -816,6 +984,8 @@ def discover_evidence(
     selected_paths: Sequence[str] = (),
     changed_paths: Sequence[str] | None = None,
     base_root: Path | None = None,
+    materialized_path_chars: tuple[tuple[str, int], ...] | None = None,
+    material_identities: Sequence[EvidenceMaterialIdentity] | None = None,
 ) -> EvidenceBundle:
     """Select bounded indexed paths within one audit-wide unique-file budget.
 
@@ -824,6 +994,8 @@ def discover_evidence(
     evidence path consumes one of the same ``limits.max_files`` slots.
     ``priority_paths`` is trusted deterministic routing data, never a provider
     hint; those paths are issued before broader heuristic matches.
+    ``materialized_path_chars`` freezes preflight's exact sorted path allowlist
+    and per-path character allocations.  Legacy callers may omit it.
     """
 
     root = _root(repository_root)
@@ -852,6 +1024,66 @@ def discover_evidence(
     if len(selected) > limits.max_files:
         raise ReviewError("selected evidence paths exceed the global file limit")
     sorted_index = tuple(sorted(normalized_index))
+    expected_by_path: dict[str, EvidenceMaterialIdentity] | None = None
+    if material_identities is not None:
+        if not isinstance(material_identities, Sequence) or isinstance(
+            material_identities, (str, bytes)
+        ):
+            raise ReviewError("expected evidence material must be a sequence")
+        if not all(
+            isinstance(item, EvidenceMaterialIdentity) for item in material_identities
+        ):
+            raise ReviewError("expected evidence material contains an invalid value")
+        expected_by_path = {item.path: item for item in material_identities}
+        if (
+            len(expected_by_path) != len(material_identities)
+            or tuple(sorted(expected_by_path)) != sorted_index
+        ):
+            raise ReviewError(
+                "expected evidence material must exactly match the indexed paths"
+            )
+    path_char_limits: dict[str, int] | None = None
+    if materialized_path_chars is not None:
+        if not isinstance(materialized_path_chars, tuple):
+            raise ReviewError("materialized path character limits must be a tuple")
+        normalized_limits: list[tuple[str, int]] = []
+        for item in materialized_path_chars:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ReviewError("materialized path character limit is malformed")
+            raw_path, char_limit = item
+            normalized = _safe_relative(raw_path)
+            if (
+                not isinstance(raw_path, str)
+                or normalized is None
+                or normalized != raw_path
+                or normalized not in normalized_index
+            ):
+                raise ReviewError(
+                    "materialized path character limit is unsafe or not indexed"
+                )
+            if (
+                isinstance(char_limit, bool)
+                or not isinstance(char_limit, int)
+                or not 0 <= char_limit <= limits.max_file_chars
+            ):
+                raise ReviewError(
+                    "materialized path character limit is outside the file bound"
+                )
+            normalized_limits.append((normalized, char_limit))
+        if (
+            tuple(sorted(normalized_limits)) != materialized_path_chars
+            or len({path for path, _chars in normalized_limits})
+            != len(normalized_limits)
+            or {path for path, _chars in normalized_limits} != normalized_index
+        ):
+            raise ReviewError(
+                "materialized path character limits must exactly match the indexed paths"
+            )
+        if sum(chars for _path, chars in normalized_limits) > limits.max_context_chars:
+            raise ReviewError(
+                "materialized path character limits exceed the context bound"
+            )
+        path_char_limits = dict(normalized_limits)
     if changed_paths is None:
         changed: set[str] = set(sorted_index)
     else:
@@ -879,7 +1111,7 @@ def discover_evidence(
     priority_order: list[str] = []
     missing: list[MissingEvidence] = []
     provider_hint_claim_ids: set[str] = set()
-    exact_source_test_claim_ids: dict[str, set[str]] = defaultdict(set)
+    exact_localized_claim_ids: dict[str, set[str]] = defaultdict(set)
 
     claims_by_id = {claim.claim_id: claim for claim in claims}
     claim_ids = set(claims_by_id)
@@ -941,9 +1173,11 @@ def discover_evidence(
                     )
                 )
                 continue
-            kind = _kind(normalized)
-            exact_source_test = kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
-            if not exact_source_test and not _matches(claim, normalized, changed):
+            material_kind = classify_review_material(normalized)
+            if PurePosixPath(normalized).suffix.casefold() in {".sh", ".bash"} and (
+                material_kind is not ReviewMaterialKind.SUBMISSION_CONFIG
+                or normalized not in changed
+            ):
                 missing.append(
                     MissingEvidence(
                         claim_id=claim.claim_id,
@@ -956,7 +1190,38 @@ def discover_evidence(
                     )
                 )
                 continue
-            resolved, reason = _validate_regular(root, normalized)
+            kind = _kind(normalized)
+            exact_source_test = kind in {EvidenceKind.SOURCE, EvidenceKind.TEST}
+            exact_changed_supporting = (
+                normalized in changed
+                and material_kind
+                in {
+                    ReviewMaterialKind.CONFIG,
+                    ReviewMaterialKind.RESULT,
+                    ReviewMaterialKind.MANIFEST,
+                    ReviewMaterialKind.BENCHMARK,
+                    ReviewMaterialKind.SUBMISSION_CONFIG,
+                }
+            )
+            exact_localized = exact_source_test or exact_changed_supporting
+            if not exact_localized and not _matches(claim, normalized, changed):
+                missing.append(
+                    MissingEvidence(
+                        claim_id=claim.claim_id,
+                        requested_path=str(raw_hint),
+                        reason="route_mismatch",
+                        description=(
+                            "Suggested evidence path does not match the trusted "
+                            "routing rules for this claim type."
+                        ),
+                    )
+                )
+                continue
+            resolved, reason = (
+                (root / Path(normalized), "")
+                if expected_by_path is not None
+                else _validate_regular(root, normalized)
+            )
             if resolved is None:
                 missing.append(
                     MissingEvidence(
@@ -971,8 +1236,8 @@ def discover_evidence(
                 )
                 continue
             by_path[normalized].add(claim.claim_id)
-            if exact_source_test:
-                exact_source_test_claim_ids[normalized].add(claim.claim_id)
+            if exact_localized:
+                exact_localized_claim_ids[normalized].add(claim.claim_id)
 
     markdown_candidates: dict[str, set[str]] = {
         path: {
@@ -998,7 +1263,7 @@ def discover_evidence(
     file_limit_counts: dict[str, int] = defaultdict(int)
     remaining = limits.max_context_chars
     priority_set = set(priority_order)
-    exact_source_test_paths = set(exact_source_test_claim_ids)
+    exact_localized_paths = set(exact_localized_claim_ids)
     routed_paths = set(by_path) | set(markdown_candidates)
     ordinarily_routed = set(by_path) - priority_set
     markdown_only = routed_paths - set(by_path) - priority_set
@@ -1019,7 +1284,14 @@ def discover_evidence(
             for claim_id in sorted(by_path.get(relative, ())):
                 file_limit_counts[claim_id] += 1
             continue
-        resolved, reason = _validate_regular(root, relative)
+        material_identity = (
+            None if expected_by_path is None else expected_by_path[relative]
+        )
+        resolved, reason = (
+            (root / Path(relative), "")
+            if material_identity is not None
+            else _validate_regular(root, relative)
+        )
         if resolved is None:
             for claim_id in sorted(routed_claim_ids):
                 missing.append(
@@ -1031,10 +1303,13 @@ def discover_evidence(
                     )
                 )
             continue
-        try:
-            size = resolved.stat().st_size
-        except OSError:
-            size = -1
+        if material_identity is not None:
+            size = material_identity.head_size
+        else:
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                size = -1
         if size < 0 or size > MAX_EVIDENCE_FILE_BYTES:
             for claim_id in sorted(routed_claim_ids):
                 missing.append(
@@ -1048,19 +1323,47 @@ def discover_evidence(
                     )
                 )
             continue
-        char_limit = min(limits.max_file_chars, remaining)
+        path_char_limit = (
+            limits.max_file_chars
+            if path_char_limits is None
+            else path_char_limits[relative]
+        )
+        char_limit = min(path_char_limit, remaining)
+        if char_limit <= 0:
+            continue
         try:
             capture = capture_confined_regular_file(
                 root,
                 relative,
                 max_bytes=MAX_EVIDENCE_FILE_BYTES,
             )
-            text = capture.content.decode("utf-8")
-            text = text.replace("\r\n", "\n").replace("\r", "\n")
-            excerpt = text[:char_limit]
+            if material_identity is not None and (
+                capture.sha256 != material_identity.head_sha256
+                or capture.size != material_identity.head_size
+            ):
+                raise EvidenceMaterialInvalidated(relative, head=True)
+            content = capture.content
             digest = capture.sha256
             size = capture.size
-        except (PassiveFileError, UnicodeError, ValueError, RecursionError) as exc:
+            text = content.decode("utf-8")
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            excerpt = text[:char_limit]
+        except EvidenceMaterialInvalidated:
+            raise
+        except PassiveFileError as exc:
+            if material_identity is not None:
+                raise EvidenceMaterialInvalidated(relative, head=True) from exc
+            for claim_id in sorted(routed_claim_ids):
+                missing.append(
+                    MissingEvidence(
+                        claim_id=claim_id,
+                        requested_path=relative,
+                        reason="unreadable",
+                        description=f"Evidence file could not be read: {type(exc).__name__}.",
+                    )
+                )
+            continue
+        except (UnicodeError, ValueError, RecursionError) as exc:
             for claim_id in sorted(routed_claim_ids):
                 missing.append(
                     MissingEvidence(
@@ -1075,7 +1378,7 @@ def discover_evidence(
         if not excerpt:
             continue
         table_claim_ids: set[str] = set()
-        table_chars = 0
+        path_remaining = char_limit
         if relative in markdown_candidates:
             for table in _markdown_tables(excerpt):
                 matching_ids = {
@@ -1087,7 +1390,11 @@ def discover_evidence(
                         path=relative,
                     )
                 }
-                if not matching_ids or len(table.excerpt) > remaining:
+                if (
+                    not matching_ids
+                    or len(table.excerpt) > remaining
+                    or len(table.excerpt) > path_remaining
+                ):
                     continue
                 provenance = EvidenceProvenance.REPORTED_MEASUREMENT
                 evidence_id = "evidence-" + hashlib.sha256(
@@ -1113,14 +1420,11 @@ def discover_evidence(
                     )
                 )
                 table_claim_ids.update(matching_ids)
-                table_chars += len(table.excerpt)
+                path_remaining -= len(table.excerpt)
                 remaining -= len(table.excerpt)
 
         regular_claim_ids = set(by_path.get(relative, ())) - table_claim_ids
-        regular_limit = min(
-            max(0, limits.max_file_chars - table_chars),
-            remaining,
-        )
+        regular_limit = min(path_remaining, remaining)
         if regular_claim_ids and regular_limit > 0:
             kind = _kind(relative)
             (
@@ -1135,8 +1439,9 @@ def discover_evidence(
                 kind=kind,
                 char_limit=regular_limit,
                 changed=changed,
-                exact_source_test_paths=exact_source_test_paths,
+                exact_localized_paths=exact_localized_paths,
                 base_root=base,
+                material_identity=material_identity,
             )
         else:
             regular_excerpt = ""
@@ -1168,7 +1473,7 @@ def discover_evidence(
             )
             if excerpt_locality is EvidenceLocality.UNLOCALIZED_PREFIX:
                 for claim_id in sorted(
-                    exact_source_test_claim_ids.get(relative, set())
+                    exact_localized_claim_ids.get(relative, set())
                     & regular_claim_ids
                 ):
                     missing.append(
@@ -1177,7 +1482,7 @@ def discover_evidence(
                             requested_path=relative,
                             reason="excerpt_locality_unavailable",
                             description=(
-                                "The exact source/test path was available in the "
+                                "The exact evidence path was available in the "
                                 "analyzed snapshot, but its bounded excerpt could not "
                                 "be localized to the material region and cannot "
                                 "independently verify the claim."

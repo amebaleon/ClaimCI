@@ -24,16 +24,20 @@ from claimci.review.evidence import (
 from claimci.review.models import (
     ClaimMagnitude,
     ClaimType,
+    GateDisposition,
     MagnitudeKind,
     ProviderUsage,
     ReviewConfig,
+    ReviewError,
     ReviewLimits,
+    ReviewMaterialKind,
     ReviewStatus,
     ScientificClaim,
     SourceKind,
     SourceLocation,
 )
 from claimci.review.orchestrator import ReviewInputs, run_review
+from claimci.review.path_policy import classify_review_material
 from claimci.review.provider import ProviderResponse, StructuredRequest
 from claimci.review.sources import collect_review_sources
 
@@ -367,6 +371,79 @@ def test_exact_changed_source_hint_routes_despite_semantically_unrelated_filenam
     assert not any(item.reason == "route_mismatch" for item in bundle.missing)
 
 
+def test_exact_changed_migration_hint_routes_as_source_without_semantic_guessing(
+    tmp_path: Path,
+) -> None:
+    """B05 break: migration SQL classified OTHER could not use exact source routing."""
+
+    path = (
+        "weave/trace_server/migrations/"
+        "044_add_failure_current_trace_id_index.up.sql"
+    )
+    _write(
+        tmp_path,
+        path,
+        (
+            "ALTER TABLE failure_signatures ADD INDEX idx_current_trace_id "
+            "current_trace_id TYPE bloom_filter;\n"
+        ),
+    )
+    claim = _claim(
+        "claim-migration-044",
+        ClaimType.IMPLEMENTATION_CLAIM,
+        "The production change preserves the declared behavior.",
+        "declared behavior",
+        hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (claim,),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    reference = _reference_for(bundle.references, path)
+    assert reference.claim_ids == (claim.claim_id,)
+    assert reference.kind is EvidenceKind.SOURCE
+    assert reference.provenance is EvidenceProvenance.SUPPORTING_ARTIFACT
+    assert not any(item.reason == "route_mismatch" for item in bundle.missing)
+
+
+def test_sql_outside_migration_paths_stays_other_and_cannot_use_source_bypass(
+    tmp_path: Path,
+) -> None:
+    """Migration support must not promote arbitrary SQL into source evidence."""
+
+    path = "queries/opaque.sql"
+    _write(tmp_path, path, "SELECT secret_value FROM private_table;\n")
+    claim = _claim(
+        "claim-ordinary-sql",
+        ClaimType.IMPLEMENTATION_CLAIM,
+        "The production change preserves the declared behavior.",
+        "declared behavior",
+        hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (claim,),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    assert classify_review_material(path) is ReviewMaterialKind.OTHER
+    assert bundle.references == ()
+    assert any(
+        item.claim_id == claim.claim_id
+        and item.requested_path == path
+        and item.reason == "route_mismatch"
+        for item in bundle.missing
+    )
+
+
 @pytest.mark.parametrize(
     ("hint", "reason"),
     [
@@ -485,6 +562,44 @@ def test_changed_exact_source_uses_bounded_contiguous_changed_region_not_prefix(
     )
     assert getattr(reference, "excerpt_complete", None) is False
     assert _locality(reference) == "changed_region"
+
+
+def test_changed_exact_config_without_comparison_locality_is_non_citable(
+    tmp_path: Path,
+) -> None:
+    """A changed supporting artifact cannot turn an arbitrary prefix into proof."""
+
+    path = "configs/opaque.ini"
+    prefix = "PREFIX_IS_NOT_THE_CHANGED_CONFIGURATION\n" + ("x" * 20_000) + "\n"
+    _write(tmp_path, path, prefix + "MATERIAL_CONFIG_AT_END=true\n")
+    claim = _claim(
+        "claim-config-locality",
+        ClaimType.METRIC_IMPROVEMENT,
+        "The candidate improves accuracy by five percent.",
+        "candidate accuracy",
+        hints=(path,),
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        [claim],
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+    )
+
+    reference = _reference_for(bundle.references, path)
+    assert reference.kind is EvidenceKind.CONFIG
+    assert reference.provenance is EvidenceProvenance.SUPPORTING_ARTIFACT
+    assert _locality(reference) == "unlocalized_prefix"
+    assert "MATERIAL_CONFIG_AT_END" not in reference.excerpt
+    assert any(
+        item.claim_id == claim.claim_id
+        and item.requested_path == path
+        and item.reason == "excerpt_locality_unavailable"
+        for item in bundle.missing
+    )
+    assert bundle.routing_incomplete is True
 
 
 def test_oversized_unchanged_exact_source_is_explicitly_unlocalized_and_incomplete(
@@ -673,7 +788,14 @@ def test_changed_region_alone_surfaces_sentinel_behavior_in_final_interpretation
         provider=provider,
     )
 
-    assert result.status is ReviewStatus.COMPLETE
+    assert result.status is ReviewStatus.PARTIAL
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.scope.mode == "legacy_pairwise_v1"
+    assert result.preflight.scope.complete is False
+    assert any(
+        issue.code == "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+        for issue in result.preflight.scope.issues
+    )
     assert result.error_code is None
     assert len(result.interpretations) == 1
     interpretation = result.interpretations[0]
@@ -691,21 +813,227 @@ def test_changed_region_alone_surfaces_sentinel_behavior_in_final_interpretation
     ]
 
 
+def test_preflight_path_allocations_preserve_changed_region_after_earlier_exact_hints(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    earlier_paths = (
+        "aa/oversized.py",
+        "ab/oversized.py",
+        "ac/oversized.py",
+    )
+    target = "zz/zz_target.py"
+    for path in earlier_paths:
+        _write(head, path, "x" * 17_000)
+    unchanged_prefix = "".join(
+        f"unchanged_{index:04d} = {index}\n" for index in range(150)
+    )
+    base_line = "target = '" + ("a" * 13_900) + "'\n"
+    head_line = "target = '" + ("b" * 13_900) + "'\n"
+    _write(base, target, unchanged_prefix + base_line)
+    _write(head, target, unchanged_prefix + head_line)
+    claim_text = (
+        "Accuracy improves by 5% because the changed implementation in "
+        f"{target} preserves the bounded target region."
+    )
+
+    class FourPathProvider:
+        def __init__(self) -> None:
+            self.calls: list[StructuredRequest] = []
+
+        def _response(
+            self, request: StructuredRequest, payload: dict[str, object]
+        ) -> ProviderResponse:
+            self.calls.append(request)
+            return ProviderResponse(
+                output_text=json.dumps(payload),
+                provider="fake",
+                model="fake-model",
+            )
+
+        def extract_claims(self, request: StructuredRequest) -> ProviderResponse:
+            source = next(
+                item
+                for item in request.payload["sources"]
+                if item["kind"] == "pull_request_description"
+            )
+            return self._response(
+                request,
+                {
+                    "claims": [
+                        {
+                            "source_text": claim_text,
+                            "claim_type": "implementation_claim",
+                            "subject": "bounded target region",
+                            "metric": "accuracy",
+                            "direction": "higher",
+                            "claimed_magnitude": {
+                                "raw": "5%",
+                                "value": 5.0,
+                                "unit": "%",
+                                "kind": "relative",
+                            },
+                            "qualifiers": [],
+                            "source": {
+                                "source_id": source["source_id"],
+                                "start_line": 1,
+                                "end_line": 1,
+                            },
+                            "confidence": 0.9,
+                            "evidence_hints": [*earlier_paths, target],
+                        }
+                    ]
+                },
+            )
+
+        def synthesize_review(self, request: StructuredRequest) -> ProviderResponse:
+            claim_id = request.payload["claims"][0]["claim_id"]
+            target_evidence = next(
+                (
+                    item
+                    for item in request.payload["evidence"]
+                    if item["path"] == target
+                ),
+                None,
+            )
+            return self._response(
+                request,
+                {
+                    "interpretations": [
+                        {
+                            "claim_id": claim_id,
+                            "interpretation": "The bounded changed region is citable.",
+                            "citations": (
+                                []
+                                if target_evidence is None
+                                else [target_evidence["evidence_id"]]
+                            ),
+                            "missing_evidence": [],
+                            "unsupported_inferences": [],
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+            )
+
+    provider = FourPathProvider()
+    result = run_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_description=claim_text,
+        ),
+        _review_config(),
+        provider=provider,
+    )
+
+    assert result.preflight is not None and result.preflight.scope is not None
+    assert result.preflight.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.preflight.gates[2].disposition is GateDisposition.PASS_PARTIAL
+    allocated_chars = dict(result.preflight.scope.materialized_path_chars)[target]
+    assert 0 < allocated_chars <= 16_000
+    target_reference = _reference_for(result.evidence.references, target)
+    assert _locality(target_reference) == "changed_region"
+    assert len(target_reference.excerpt) == allocated_chars
+    assert [request.task for request in provider.calls] == [
+        "extract_claims",
+        "synthesize_review",
+    ]
+    synthesis = provider.calls[1]
+    assert [item["path"] for item in synthesis.payload["evidence"]] == [target]
+    assert result.interpretations[0].citations == (target_reference.evidence_id,)
+    assert result.status is ReviewStatus.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "allocation",
+    [
+        [],
+        (),
+        ((1, 1),),
+        (("other.py", 1),),
+        (("evidence.py", True),),
+        (("evidence.py", 16_001),),
+    ],
+)
+def test_evidence_rejects_non_frozen_or_out_of_bounds_path_allocations(
+    tmp_path: Path,
+    allocation: object,
+) -> None:
+    _write(tmp_path, "evidence.py", "value = 1\n")
+
+    with pytest.raises(ReviewError):
+        discover_evidence(
+            tmp_path,
+            (),
+            ("evidence.py",),
+            materialized_path_chars=allocation,  # type: ignore[arg-type]
+        )
+
+
+def test_table_and_regular_excerpts_share_one_frozen_path_allowance(
+    tmp_path: Path,
+) -> None:
+    path = "benchmarks/results.md"
+    table = (
+        "| Benchmark | Metric | Value |\n"
+        "| --- | --- | ---: |\n"
+        "| Rollup | Rows read | 4.0x |\n"
+    )
+    _write(tmp_path, path, table + ("supporting implementation detail\n" * 40))
+    table_claim = _claim(
+        "claim-table-budget",
+        ClaimType.RESOURCE_REDUCTION,
+        "The rollup reads 4.0x fewer rows.",
+        "rollup",
+        metric="rows read",
+        magnitude=ClaimMagnitude(
+            raw="4.0x",
+            value=4.0,
+            unit="x",
+            kind=MagnitudeKind.RELATIVE,
+        ),
+    )
+    regular_claim = _claim(
+        "claim-regular-budget",
+        ClaimType.RESOURCE_REDUCTION,
+        "The benchmark implementation reduces rows read.",
+        "benchmark implementation",
+        metric="rows read",
+    )
+
+    bundle = discover_evidence(
+        tmp_path,
+        (table_claim, regular_claim),
+        (path,),
+        selected_paths=(path,),
+        changed_paths=(path,),
+        materialized_path_chars=((path, 200),),
+    )
+
+    path_references = tuple(
+        reference for reference in bundle.references if reference.path == path
+    )
+    assert len(path_references) == 2
+    assert sum(len(reference.excerpt) for reference in path_references) <= 200
+
+
 def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
     tmp_path: Path,
 ) -> None:
     """An owned citation is insufficient when its material locality is unknown."""
 
-    base = tmp_path / "base"
     head = tmp_path / "head"
     oversized = (
         "// UNRELATED_PREFIX\n"
         + ("x" * 20_000)
         + "\nlong materialCountContract(); // MATERIAL_AT_END\n"
     )
-    _write(base, DAO, oversized)
     _write(head, DAO, oversized)
-    claim_text = "The unchanged DAO establishes the material count contract."
+    routed_artifact = "scripts/run-eval.sh"
+    _write(head, routed_artifact, "#!/bin/sh\nexit 0\n")
+    claim_text = "The DAO establishes the material count contract."
     provider = _EvidenceAwareFakeProvider(
         claim_text=claim_text,
         claim_type=ClaimType.RESOURCE_REDUCTION,
@@ -713,12 +1041,14 @@ def test_positive_synthesis_citation_to_unlocalized_prefix_fails_closed(
         hint=DAO,
         synthesis_mode="affirm_unlocalized_prefix",
     )
+    routed_description = (
+        f"{claim_text}\nEvaluation configuration: {routed_artifact}"
+    )
 
     result = run_review(
         ReviewInputs(
             repository_root=head,
-            base_root=base,
-            pr_description=claim_text,
+            pr_description=routed_description,
         ),
         _review_config(),
         provider=provider,

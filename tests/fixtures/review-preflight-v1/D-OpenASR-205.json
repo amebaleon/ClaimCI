@@ -1,0 +1,3 @@
+{"schema_version":1,"candidate":"D-OpenASR-205","repository":"huggingface/open_asr_leaderboard","pull_request":205,"requested_base_sha":"d1e99b25524814332d6868a5645e568670834cfb","comparison_base_sha":"d1e99b25524814332d6868a5645e568670834cfb","head_sha":"9e7a2dfeda0eb3284a87a0105e8dedd45f7967d6","comparison_basis":"direct_base","declared_entry_count":1,"entries":[
+  {"path":"transformers/submit_jobs_qwen3asr.sh","status":"modified"}
+]}

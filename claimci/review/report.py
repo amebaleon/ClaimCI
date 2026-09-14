@@ -20,8 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from .evidence import EvidenceBundle
-from .models import ProviderUsage, ReviewStatus
+from .models import (
+    ChangeStatus,
+    ProviderLifecycle,
+    ProviderUsage,
+    ReviewMaterialKind,
+)
 from .orchestrator import ClaimInterpretation, ResearchReview
+from .path_policy import classify_review_material
 
 
 MAX_REPORT_DEPTH = 128
@@ -123,7 +129,26 @@ def _json_safe(value: Any, *, depth: int = 0, active: set[int] | None = None) ->
         return f"<{type(value).__name__}>"
 
 
-def _usage_dict(usage: ProviderUsage) -> dict[str, Any]:
+def _usage_dict(
+    usage: ProviderUsage,
+    *,
+    provider_call_count: int,
+    provider_lifecycle: ProviderLifecycle,
+) -> dict[str, Any]:
+    if provider_lifecycle is ProviderLifecycle.FAILED_BEFORE_RESPONSE:
+        return {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "estimated_cost_usd": None,
+        }
+    if provider_call_count == 0:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        }
     return {
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
@@ -148,6 +173,100 @@ def _sorted_interpretations(review: ResearchReview) -> list[dict[str, Any]]:
     ]
 
 
+def _issue_sort_key(issue: object) -> tuple[object, ...]:
+    return (
+        getattr(issue, "code", ""),
+        getattr(issue, "path", None) or "",
+        -1 if getattr(issue, "observed", None) is None else getattr(issue, "observed"),
+        -1 if getattr(issue, "limit", None) is None else getattr(issue, "limit"),
+    )
+
+
+def _preflight_payload(review: ResearchReview) -> dict[str, Any] | None:
+    preflight = review.preflight
+    if preflight is None:
+        return None
+    scope = preflight.scope
+    inventory = None if scope is None else scope.inventory
+    comparison_basis = preflight.comparison_basis
+    if comparison_basis is None and inventory is not None:
+        comparison_basis = inventory.comparison_basis
+    gate_rows = []
+    for gate in sorted(preflight.gates, key=lambda item: item.gate):
+        gate_rows.append(
+            {
+                "gate": gate.gate,
+                "disposition": gate.disposition.value,
+                "reasons": [
+                    reason.as_dict()
+                    for reason in sorted(gate.reasons, key=_issue_sort_key)
+                ],
+                "metrics": dict(sorted(gate.metrics.items())),
+            }
+        )
+    gate3 = next((gate for gate in preflight.gates if gate.gate == 3), None)
+    projection = {} if gate3 is None else dict(sorted(gate3.metrics.items()))
+
+    scope_payload: dict[str, Any] | None = None
+    if scope is not None:
+        available_changed = sum(
+            1
+            for entry in scope.inventory.entries
+            if entry.status is not ChangeStatus.DELETED
+        )
+        submission_count = sum(
+            1
+            for path in scope.selected_paths
+            if classify_review_material(path) is ReviewMaterialKind.SUBMISSION_CONFIG
+        )
+        scope_payload = {
+            "mode": scope.mode,
+            "scope_complete": scope.complete,
+            "issued_path_count": len(scope.issued_paths),
+            "issued_changed_path_count": len(scope.issued_changed_paths),
+            "selected_path_count": len(scope.selected_paths),
+            "omitted_changed_path_count": max(
+                0, available_changed - len(scope.issued_changed_paths)
+            ),
+            "issue_count": len(scope.issues),
+            "issues": [
+                issue.as_dict()
+                for issue in sorted(scope.issues, key=_issue_sort_key)
+            ],
+            "materialized_chars": scope.materialized_chars,
+            "materialized_file_count": len(scope.materialized_path_chars),
+            "submission_config_path_count": submission_count,
+            "submission_config_authority": "passive_supporting_configuration",
+        }
+
+    return {
+        "schema_version": preflight.schema_version,
+        "coordinates": {
+            "requested_base_sha": preflight.requested_base_sha,
+            "comparison_base_sha": preflight.comparison_base_sha,
+            "head_sha": preflight.head_sha,
+            "comparison_basis": (
+                None if comparison_basis is None else comparison_basis.value
+            ),
+        },
+        "inventory": (
+            None
+            if inventory is None
+            else {
+                "source": inventory.source.value,
+                "declared_entry_count": inventory.declared_entry_count,
+                "entry_count": len(inventory.entries),
+                "complete": inventory.complete,
+            }
+        ),
+        "gates": gate_rows,
+        "scope": scope_payload,
+        "projection": projection,
+        "ready_for_provider": preflight.ready_for_provider,
+        "review_status_ceiling": preflight.review_status_ceiling.value,
+    }
+
+
 def _review_payload(review: ResearchReview) -> dict[str, Any]:
     if not isinstance(review, ResearchReview):
         raise TypeError("review must be a ResearchReview")
@@ -159,7 +278,7 @@ def _review_payload(review: ResearchReview) -> dict[str, Any]:
         key=lambda call: (call.task, call.request_id or "", call.model),
     )
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "review": {
             "status": review.status.value,
             "policy": "advisory",
@@ -167,6 +286,7 @@ def _review_payload(review: ResearchReview) -> dict[str, Any]:
         },
         "claims": _sorted_claims(review),
         "interpretations": _sorted_interpretations(review),
+        "preflight": _preflight_payload(review),
         "evidence": {
             "references": [
                 _json_safe(reference)
@@ -196,11 +316,18 @@ def _review_payload(review: ResearchReview) -> dict[str, Any]:
             )
         ],
         "provider": {
+            "lifecycle": review.provider_lifecycle.value,
+            "attempted_call_count": review.provider_attempt_count,
+            "completed_response_count": len(calls),
             "calls": [
                 _json_safe(item)
                 for item in calls
             ],
-            "usage": _usage_dict(review.usage),
+            "usage": _usage_dict(
+                review.usage,
+                provider_call_count=len(calls),
+                provider_lifecycle=review.provider_lifecycle,
+            ),
         },
         "error": (
             None
@@ -375,6 +502,70 @@ def _unsupported_lines(review: ResearchReview) -> list[str]:
     return rows or ["- No unsupported inferences were recorded."]
 
 
+def _preflight_lines(review: ResearchReview) -> list[str]:
+    preflight = review.preflight
+    if preflight is None:
+        return [
+            "- No provider-free preflight record is attached to this legacy or disabled review.",
+            "- Scope complete: unavailable.",
+        ]
+    scope = preflight.scope
+    comparison_basis = preflight.comparison_basis
+    if comparison_basis is None and scope is not None:
+        comparison_basis = scope.inventory.comparison_basis
+    basis = "unavailable" if comparison_basis is None else comparison_basis.value
+    lines = [
+        f"- Requested base: `{_markdown_text(preflight.requested_base_sha)}`.",
+        f"- Comparison base: `{_markdown_text(preflight.comparison_base_sha)}` "
+        f"({_markdown_text(basis)}).",
+        f"- Head: `{_markdown_text(preflight.head_sha)}`.",
+        "- Ready for provider: "
+        f"{'yes' if preflight.ready_for_provider else 'no'}.",
+        "- Final review status ceiling: "
+        f"**{_markdown_text(preflight.review_status_ceiling.value)}**.",
+        "- Scope complete: "
+        f"{'unavailable' if scope is None else ('yes' if scope.complete else 'no')}.",
+    ]
+    if scope is not None:
+        available_changed = sum(
+            1
+            for entry in scope.inventory.entries
+            if entry.status is not ChangeStatus.DELETED
+        )
+        lines.extend(
+            (
+                f"- Scope mode: `{_markdown_text(scope.mode)}`; issued paths: "
+                f"{len(scope.issued_paths)}; selected paths: {len(scope.selected_paths)}; "
+                f"omitted changed paths: {max(0, available_changed - len(scope.issued_changed_paths))}.",
+                "- Submission runners are passive supporting configuration only; "
+                "they are never executed and never treated as source or results.",
+            )
+        )
+    lines.append("- Gates:")
+    for gate in sorted(preflight.gates, key=lambda item: item.gate):
+        lines.append(
+            f"  - Gate {gate.gate}: **{_markdown_text(gate.disposition.value)}**."
+        )
+        for reason in sorted(gate.reasons, key=_issue_sort_key):
+            details = []
+            if reason.path is not None:
+                details.append(f"path={reason.path}")
+            if reason.observed is not None:
+                details.append(f"observed={reason.observed}")
+            if reason.limit is not None:
+                details.append(f"limit={reason.limit}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(
+                f"    - `{_markdown_text(reason.code)}`{_markdown_text(suffix)}"
+            )
+        if gate.metrics:
+            metrics = ", ".join(
+                f"{key}={value}" for key, value in sorted(gate.metrics.items())
+            )
+            lines.append(f"    - Metrics: {_markdown_text(metrics)}")
+    return lines
+
+
 def render_review_markdown(review: ResearchReview) -> str:
     """Render a safe GitHub review/job-summary view.
 
@@ -385,6 +576,11 @@ def render_review_markdown(review: ResearchReview) -> str:
 
     if not isinstance(review, ResearchReview):
         raise TypeError("review must be a ResearchReview")
+    usage = _usage_dict(
+        review.usage,
+        provider_call_count=len(review.provider_calls),
+        provider_lifecycle=review.provider_lifecycle,
+    )
     lines = [
         "## ClaimCI Research Review (Advisory)",
         "",
@@ -394,6 +590,10 @@ def render_review_markdown(review: ResearchReview) -> str:
         ),
         "",
         f"**Status:** `{_markdown_text(review.status.value)}`",
+        "",
+        "### Provider-free preflight",
+        "",
+        *_preflight_lines(review),
         "",
         "### Claims",
         "",
@@ -421,6 +621,9 @@ def render_review_markdown(review: ResearchReview) -> str:
         "",
         "### Evidence and provider usage",
         "",
+        f"- Provider lifecycle: {_markdown_text(review.provider_lifecycle.value)}.",
+        f"- Provider attempts: {review.provider_attempt_count}; completed "
+        f"response records: {len(review.provider_calls)}.",
         f"- Evidence references: {len(review.evidence.references)}; "
         f"bounded characters: {review.evidence.total_chars}.",
         "- Routing incomplete: "
@@ -441,11 +644,11 @@ def render_review_markdown(review: ResearchReview) -> str:
         )
     lines.extend(
         (
-        f"- Provider calls: {len(review.provider_calls)}; input tokens: "
-        f"{_markdown_text(review.usage.input_tokens if review.usage.input_tokens is not None else 'unavailable')}; "
-        f"output tokens: {_markdown_text(review.usage.output_tokens if review.usage.output_tokens is not None else 'unavailable')}; "
-        f"total tokens: {_markdown_text(review.usage.total_tokens if review.usage.total_tokens is not None else 'unavailable')}; "
-        f"estimated cost USD: {_markdown_text(review.usage.estimated_cost_usd if review.usage.estimated_cost_usd is not None else 'unavailable')}.",
+        f"- Completed provider responses: {len(review.provider_calls)}; input tokens: "
+        f"{_markdown_text(usage['input_tokens'] if usage['input_tokens'] is not None else 'unavailable')}; "
+        f"output tokens: {_markdown_text(usage['output_tokens'] if usage['output_tokens'] is not None else 'unavailable')}; "
+        f"total tokens: {_markdown_text(usage['total_tokens'] if usage['total_tokens'] is not None else 'unavailable')}; "
+        f"estimated cost USD: {_markdown_text(usage['estimated_cost_usd'] if usage['estimated_cost_usd'] is not None else 'unavailable')}.",
         )
     )
     if review.error_message:

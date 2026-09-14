@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from claimci.review.models import ClaimType, ReviewLimits, SourceKind
+from claimci.review.models import ClaimType, ReviewLimits, ReviewMaterialKind, SourceKind
+from claimci.review.path_policy import classify_review_material, is_source_file
 from claimci.review.sources import collect_review_sources, validate_claim_candidates
 
 
@@ -53,6 +54,40 @@ def _candidate(
     }
     candidate.update(updates)
     return candidate
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("docs/study.md", ReviewMaterialKind.DOCUMENT),
+        ("paper.tex", ReviewMaterialKind.DOCUMENT),
+        ("src/model.py", ReviewMaterialKind.SOURCE),
+        ("tests/test_model.py", ReviewMaterialKind.TEST),
+        ("config/train.yaml", ReviewMaterialKind.CONFIG),
+        ("results/metrics.jsonl", ReviewMaterialKind.RESULT),
+        ("artifacts/manifest.json", ReviewMaterialKind.MANIFEST),
+        ("benchmarks/latency.py", ReviewMaterialKind.BENCHMARK),
+        ("transformers/submit_jobs_qwen3asr.sh", ReviewMaterialKind.SUBMISSION_CONFIG),
+        ("scripts/launch_eval.bash", ReviewMaterialKind.SUBMISSION_CONFIG),
+        ("scripts/install.sh", ReviewMaterialKind.OTHER),
+        ("benchmarks/install.sh", ReviewMaterialKind.OTHER),
+        ("benchmarks/helpers.bash", ReviewMaterialKind.OTHER),
+        ("score.pem", ReviewMaterialKind.OTHER),
+        ("benchmark/private.pem", ReviewMaterialKind.OTHER),
+        ("config/credentials.txt", ReviewMaterialKind.OTHER),
+        ("artifacts/manifest.pem", ReviewMaterialKind.OTHER),
+        ("assets/logo.png", ReviewMaterialKind.OTHER),
+    ],
+)
+def test_review_material_classification_is_fixed_and_metadata_only(
+    path: str,
+    expected: ReviewMaterialKind,
+) -> None:
+    assert classify_review_material(path) is expected
+
+
+def test_submission_shell_scripts_do_not_expand_the_source_suffix_policy() -> None:
+    assert not is_source_file("transformers/submit_jobs_qwen3asr.sh")
 
 
 def test_collect_review_sources_includes_pr_metadata_and_changed_research_files(tmp_path: Path) -> None:

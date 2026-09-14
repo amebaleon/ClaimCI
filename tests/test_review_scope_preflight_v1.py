@@ -1,0 +1,2218 @@
+"""Deterministic bounded material-scope regressions."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import claimci.review.orchestrator as orchestrator_module
+import claimci.review.preflight as preflight_module
+from claimci.passive_files import PassiveFileError
+from claimci.review.evidence import (
+    EvidenceKind,
+    EvidenceReference,
+    _kind,
+    discover_evidence,
+)
+from claimci.review.models import (
+    ClaimType,
+    ChangeEntry,
+    ChangeInventory,
+    ChangeInventorySource,
+    ChangeStatus,
+    ComparisonBasis,
+    GateDisposition,
+    MaterialClaimSeed,
+    ReviewConfig,
+    ReviewLimits,
+    ReviewStatus,
+    ScopeIssue,
+    ScientificClaim,
+    SnapshotIdentity,
+    SnapshotRole,
+    SourceKind,
+    SourceLocation,
+)
+from claimci.review.orchestrator import ReviewInputs
+from claimci.review.preflight import (
+    build_review_scope,
+    preflight_review,
+    scope_source_bundle,
+)
+from claimci.review.request_budget import (
+    allocate_synthesis_inputs,
+    build_synthesis_request_parts,
+    logical_request_chars,
+)
+
+
+BASE = "a" * 40
+HEAD = "b" * 40
+
+
+def _write(root: Path, relative: str, content: str | bytes) -> Path:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _inventory(*entries: tuple[str, ChangeStatus]) -> ChangeInventory:
+    changes = tuple(
+        sorted(
+            (ChangeEntry(path, status) for path, status in entries),
+            key=lambda entry: (entry.path, entry.status.value),
+        )
+    )
+    return ChangeInventory(
+        schema_version=1,
+        requested_base_sha=BASE,
+        comparison_base_sha=BASE,
+        head_sha=HEAD,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH,
+        declared_entry_count=len(changes),
+        complete=True,
+        entries=changes,
+    )
+
+
+def _scope(
+    root: Path,
+    inventory: ChangeInventory,
+    *,
+    title: str = "",
+    description: str = "",
+    limits: ReviewLimits = ReviewLimits(),
+):
+    return build_review_scope(
+        ReviewInputs(
+            repository_root=root,
+            pr_title=title,
+            pr_description=description,
+        ),
+        ReviewConfig(enabled=True, limits=limits),
+        inventory,
+    )
+
+
+def _claim(
+    *,
+    claim_id: str = "claim-scope-allocation",
+    claim_type: ClaimType = ClaimType.IMPLEMENTATION_CLAIM,
+    hints: tuple[str, ...] = (),
+) -> ScientificClaim:
+    return ScientificClaim(
+        claim_id=claim_id,
+        source_text="The bounded implementation evidence supports this claim.",
+        claim_type=claim_type,
+        subject="bounded implementation evidence",
+        source=SourceLocation(
+            source_id="source-pr-description",
+            kind=SourceKind.PULL_REQUEST_DESCRIPTION,
+            path=None,
+            start_line=1,
+            end_line=1,
+        ),
+        confidence=1.0,
+        evidence_hints=hints,
+    )
+
+
+def _discover_and_allocate_scope_evidence(
+    root: Path,
+    scope,
+    claims: tuple[ScientificClaim, ...],
+    limits: ReviewLimits,
+    *,
+    priority_paths: dict[str, tuple[str, ...]] | None = None,
+):
+    sources = scope_source_bundle(scope)
+    evidence = discover_evidence(
+        root,
+        claims,
+        sources.repository_paths,
+        limits=limits,
+        priority_paths=priority_paths,
+        selected_paths=scope.selected_paths,
+        changed_paths=sources.changed_paths,
+        materialized_path_chars=scope.materialized_path_chars,
+    )
+    owners = {
+        claim.claim_id: tuple(
+            reference.evidence_id
+            for reference in evidence.references
+            if claim.claim_id in reference.claim_ids
+        )
+        for claim in claims
+    }
+    ordered_references = orchestrator_module._order_synthesis_evidence(
+        claims,
+        evidence.references,
+        priority_paths=priority_paths or {},
+        selected_paths=scope.selected_paths,
+    )
+    allocation = allocate_synthesis_inputs(
+        claims,
+        ordered_references,
+        owners,
+        {},
+        evidence.missing,
+        (),
+        max_chars=limits.max_context_chars,
+    )
+    return evidence, allocation
+
+
+def _reference(
+    evidence_id: str,
+    path: str,
+    kind: EvidenceKind,
+    *claim_ids: str,
+) -> EvidenceReference:
+    return EvidenceReference(
+        evidence_id=evidence_id,
+        claim_ids=tuple(claim_ids),
+        kind=kind,
+        path=path,
+        start_line=1,
+        end_line=1,
+        sha256="0" * 64,
+        size=1,
+        excerpt="x",
+    )
+
+
+def test_material_seed_contract_is_routing_metadata_not_a_scientific_claim() -> None:
+    seed = MaterialClaimSeed(
+        origin_source_id="source-1234567890abcdef",
+        category="benchmark",
+        route_terms=("accuracy", "benchmark"),
+    )
+    assert seed.category == "benchmark"
+    assert not isinstance(seed, ScientificClaim)
+
+
+def test_synthesis_order_exact_test_beats_generic_implementation_source() -> None:
+    exact_path = "tests/exact_behavior.py"
+    generic_path = "src/generic.py"
+    exact_claim = _claim(
+        claim_id="claim-exact-test",
+        hints=(r"tests\exact_behavior.py",),
+    )
+    generic_claim = _claim(claim_id="claim-generic-source")
+    references = (
+        _reference(
+            "evidence-generic",
+            generic_path,
+            EvidenceKind.SOURCE,
+            generic_claim.claim_id,
+        ),
+        _reference(
+            "evidence-exact",
+            exact_path,
+            EvidenceKind.TEST,
+            exact_claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (exact_claim, generic_claim),
+        references,
+        priority_paths={},
+        selected_paths=(generic_path, exact_path),
+    )
+
+    assert tuple(reference.path for reference in ordered) == (
+        exact_path,
+        generic_path,
+    )
+
+
+def test_synthesis_order_keeps_claim_owned_trusted_priority_first() -> None:
+    trusted_path = "audit/research.yaml"
+    exact_path = "tests/exact_behavior.py"
+    unowned_priority_path = "config/unowned.yaml"
+    trusted_claim = _claim(
+        claim_id="claim-trusted",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+        hints=(exact_path,),
+    )
+    other_claim = _claim(
+        claim_id="claim-other",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+    )
+    references = (
+        _reference(
+            "evidence-unowned-priority",
+            unowned_priority_path,
+            EvidenceKind.CONFIG,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-exact-test",
+            exact_path,
+            EvidenceKind.TEST,
+            trusted_claim.claim_id,
+        ),
+        _reference(
+            "evidence-trusted",
+            trusted_path,
+            EvidenceKind.MANIFEST,
+            trusted_claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (trusted_claim, other_claim),
+        references,
+        priority_paths={
+            trusted_claim.claim_id: (trusted_path, unowned_priority_path),
+        },
+        selected_paths=(unowned_priority_path, exact_path, trusted_path),
+    )
+
+    assert tuple(reference.path for reference in ordered) == (
+        trusted_path,
+        exact_path,
+        unowned_priority_path,
+    )
+    full_owners = {
+        claim.claim_id: tuple(
+            reference.evidence_id
+            for reference in references
+            if claim.claim_id in reference.claim_ids
+        )
+        for claim in (trusted_claim, other_claim)
+    }
+    trusted_only_owners = {
+        trusted_claim.claim_id: ("evidence-trusted",),
+        other_claim.claim_id: (),
+    }
+    trusted_only = build_synthesis_request_parts(
+        (trusted_claim, other_claim),
+        (ordered[0],),
+        trusted_only_owners,
+        {},
+        (),
+        (),
+    )
+    allocation = allocate_synthesis_inputs(
+        (trusted_claim, other_claim),
+        ordered,
+        full_owners,
+        {},
+        (),
+        (),
+        max_chars=logical_request_chars(
+            trusted_only.task,
+            trusted_only.payload,
+            trusted_only.schema,
+        ),
+    )
+    assert tuple(
+        row["path"] for row in allocation.parts.payload["evidence"]
+    ) == (trusted_path,)
+
+
+def test_synthesis_order_does_not_promote_nonimplementation_sources() -> None:
+    claim = _claim(
+        claim_id="claim-nonimplementation",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+    )
+    test_path = "tests/first.py"
+    source_path = "src/second.py"
+    references = (
+        _reference("evidence-test", test_path, EvidenceKind.TEST, claim.claim_id),
+        _reference(
+            "evidence-source",
+            source_path,
+            EvidenceKind.SOURCE,
+            claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (claim,),
+        references,
+        priority_paths={},
+        selected_paths=(source_path, test_path),
+    )
+
+    assert ordered == references
+
+
+def test_synthesis_order_promotes_only_implementation_owned_sources_in_scope_rank() -> None:
+    implementation_claim = _claim(claim_id="claim-implementation")
+    other_claim = _claim(
+        claim_id="claim-mixed-other",
+        claim_type=ClaimType.OTHER_SCIENTIFIC,
+    )
+    first_ranked_source = "src/first_ranked.py"
+    later_ranked_source = "src/later_ranked.py"
+    other_test = "tests/producer_first.py"
+    other_source = "src/nonimplementation.py"
+    references = (
+        _reference(
+            "evidence-other-test",
+            other_test,
+            EvidenceKind.TEST,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-later-implementation",
+            later_ranked_source,
+            EvidenceKind.SOURCE,
+            implementation_claim.claim_id,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-other-source",
+            other_source,
+            EvidenceKind.SOURCE,
+            other_claim.claim_id,
+        ),
+        _reference(
+            "evidence-first-implementation",
+            first_ranked_source,
+            EvidenceKind.SOURCE,
+            implementation_claim.claim_id,
+        ),
+    )
+
+    ordered = orchestrator_module._order_synthesis_evidence(
+        (implementation_claim, other_claim),
+        references,
+        priority_paths={},
+        selected_paths=(
+            first_ranked_source,
+            other_source,
+            other_test,
+            later_ranked_source,
+        ),
+    )
+
+    assert tuple(reference.path for reference in ordered) == (
+        first_ranked_source,
+        later_ranked_source,
+        other_test,
+        other_source,
+    )
+
+
+def test_b05_exact_migration_sql_is_selected_as_bounded_source_material(
+    tmp_path: Path,
+) -> None:
+    """B05 break: migration 044 was rejected before bounded source ranking."""
+
+    migration = (
+        "weave/trace_server/migrations/"
+        "044_add_failure_current_trace_id_index.up.sql"
+    )
+    test_path = "tests/trace_server/test_clickhouse_trace_server_migrator.py"
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(
+        root,
+        migration,
+        (
+            "ALTER TABLE failure_signatures ADD INDEX idx_current_trace_id "
+            "current_trace_id TYPE bloom_filter;\n"
+        ),
+    )
+    _write(root, test_path, "def test_migration():\n    pass\n")
+
+    scope = _scope(
+        root,
+        _inventory(
+            (migration, ChangeStatus.ADDED),
+            (test_path, ChangeStatus.MODIFIED),
+        ),
+        description=(
+            "Benchmark latency improves because migration 044 adds a bloom "
+            "index; inspect "
+            f"{migration}."
+        ),
+    )
+
+    assert scope.selected_paths[0] == migration
+    assert migration in scope.issued_changed_paths
+    assert _kind(migration) is EvidenceKind.SOURCE
+
+
+def test_b07_implementation_files_are_not_starved_by_earlier_changed_tests(
+    tmp_path: Path,
+) -> None:
+    """B07 break: greedy excerpts left the ranked production implementation out."""
+
+    paths = (
+        "tests/v1/attention/test_indexer_tp_row_shard.py",
+        "tests/kernels/mamba/test_gdn_prefill_flashinfer.py",
+        "tests/v1/attention/test_sparse_indexer_decode_seq_lens.py",
+        "vllm/model_executor/layers/sparse_attn_indexer.py",
+        "vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+        "vllm/v1/attention/backends/mla/indexer.py",
+    )
+    implementation_paths = paths[3:]
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in paths:
+        _write(root, path, (f"# {path}\n" + "x" * 1_000))
+    limits = ReviewLimits(
+        max_context_chars=1_200,
+        max_file_chars=500,
+        max_files=len(paths),
+    )
+
+    scope = _scope(
+        root,
+        _inventory(*((path, ChangeStatus.MODIFIED) for path in paths)),
+        title="Shard long-context sparse indexer prefill rows across TP",
+        description=(
+            "The implementation improves long MQA prefill by using a "
+            "cost-balanced query-row shard and an all_gatherv per indexer layer."
+        ),
+        limits=limits,
+    )
+
+    allocations = dict(scope.materialized_path_chars)
+    assert set(scope.issued_changed_paths) == set(paths)
+    assert all(allocations[path] > 0 for path in implementation_paths)
+    path_allocations = tuple(allocations[path] for path in paths)
+    assert min(path_allocations) >= 100
+    assert max(path_allocations) > min(path_allocations)
+    assert scope.materialized_chars <= 1_200
+
+
+def test_b07_recovered_implementation_reaches_bounded_synthesis(
+    tmp_path: Path,
+) -> None:
+    """B07 break: synthesis first-fit dropped the recovered key implementation."""
+
+    paths = (
+        "tests/kernels/mamba/test_gdn_prefill_flashinfer.py",
+        "tests/v1/attention/test_indexer_tp_row_shard.py",
+        "tests/v1/attention/test_sparse_indexer_decode_seq_lens.py",
+        "vllm/model_executor/layers/sparse_attn_indexer.py",
+        "vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+        "vllm/v1/attention/backends/mla/indexer.py",
+    )
+    key_implementation = paths[3]
+    implementation_paths = set(paths[3:])
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in paths:
+        _write(root, path, (f"# {path}\n" + "x" * 20_000))
+    limits = ReviewLimits()
+    scope = _scope(
+        root,
+        _inventory(*((path, ChangeStatus.MODIFIED) for path in paths)),
+        title="Shard long-context sparse indexer prefill rows across TP",
+        description=(
+            "The implementation improves long MQA prefill by using a "
+            "cost-balanced query-row shard and an all_gatherv per indexer layer."
+        ),
+        limits=limits,
+    )
+    claim = _claim()
+
+    evidence, allocation = _discover_and_allocate_scope_evidence(
+        root,
+        scope,
+        (claim,),
+        limits,
+    )
+
+    discovered_paths = {reference.path for reference in evidence.references}
+    retained_paths = {
+        row["path"] for row in allocation.parts.payload["evidence"]
+    }
+    assert key_implementation in discovered_paths
+    assert implementation_paths <= retained_paths
+    assert logical_request_chars(
+        allocation.parts.task,
+        allocation.parts.payload,
+        allocation.parts.schema,
+    ) <= limits.max_context_chars
+
+
+def test_exact_ranked_source_keeps_complete_depth_while_reserving_bounded_breadth(
+    tmp_path: Path,
+) -> None:
+    """An exact 10.8k source must not be flattened to the 24-file average."""
+
+    exact_path = "tests/CardinalityTest.java"
+    other_paths = tuple(f"src/noise_{index:02d}.py" for index in range(23))
+    root = tmp_path / "head"
+    root.mkdir()
+    exact_prefix = "final class CardinalityTest { @Test void one() {} }\n"
+    exact_content = exact_prefix + "x" * (10_800 - len(exact_prefix))
+    _write(root, exact_path, exact_content)
+    for path in other_paths:
+        _write(root, path, (f"# {path}\n" + "x" * 20_000))
+
+    scope = _scope(
+        root,
+        _inventory(
+            (exact_path, ChangeStatus.ADDED),
+            *((path, ChangeStatus.ADDED) for path in other_paths),
+        ),
+        title="Benchmark accuracy improves by 5%",
+        description=f"The exact implementation is in {exact_path}.",
+    )
+
+    allocations = dict(scope.materialized_path_chars)
+    assert scope.selected_paths[0] == exact_path
+    assert allocations[exact_path] == len(exact_content)
+    assert min(allocations[path] for path in other_paths) >= 1_250
+    assert scope.materialized_chars <= 60_000
+    assert not any(
+        issue.path == exact_path
+        and issue.code == "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+        for issue in scope.issues
+    )
+
+    claim = _claim(hints=(exact_path,))
+    evidence, allocation = _discover_and_allocate_scope_evidence(
+        root,
+        scope,
+        (claim,),
+        ReviewLimits(),
+    )
+    exact_reference = next(
+        reference for reference in evidence.references if reference.path == exact_path
+    )
+    retained_paths = {
+        row["path"] for row in allocation.parts.payload["evidence"]
+    }
+    assert exact_reference.excerpt_complete is True
+    assert exact_path in retained_paths
+    assert logical_request_chars(
+        allocation.parts.task,
+        allocation.parts.payload,
+        allocation.parts.schema,
+    ) <= 60_000
+
+
+def test_b08_changed_implementation_budget_is_complete_deterministic_and_confined(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B08 break: pp_utils.py and gpu_worker.py received zero-byte evidence."""
+
+    paths = (
+        "tests/distributed/test_comm_ops.py",
+        "tests/test_envs.py",
+        "tests/v1/worker/test_pp_utils.py",
+        "vllm/distributed/parallel_state.py",
+        "vllm/envs.py",
+        "vllm/v1/worker/gpu/model_runner.py",
+        "vllm/v1/worker/gpu/pp_utils.py",
+        "vllm/v1/worker/gpu_worker.py",
+    )
+    roots = (tmp_path / "first", tmp_path / "second")
+    for root, creation_order in zip(
+        roots,
+        (paths, tuple(reversed(paths))),
+        strict=True,
+    ):
+        root.mkdir()
+        for path in creation_order:
+            _write(root, path, (f"# {path}\n" + "x" * 1_000))
+        _write(root, "private/unlisted.py", "UNLISTED_SENTINEL_MUST_NOT_BE_READ\n")
+
+    opened: list[tuple[str, str]] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append((root_path.name, relative))
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(
+        preflight_module,
+        "capture_confined_regular_file",
+        traced_capture,
+    )
+    inventory = _inventory(*((path, ChangeStatus.MODIFIED) for path in paths))
+    limits = ReviewLimits(
+        max_context_chars=1_600,
+        max_file_chars=500,
+        max_files=len(paths),
+    )
+    scopes = tuple(
+        _scope(
+            root,
+            inventory,
+            title="Add V2 BF16 streamed PP transport",
+            description=(
+                "Preallocate a bounded sender ring on a dedicated stream, receive "
+                "full chunks into a fixed buffer, and preserve fallback behavior. "
+                "Tests cover tests/distributed/test_comm_ops.py, tests/test_envs.py, "
+                "and tests/v1/worker/test_pp_utils.py."
+            ),
+            limits=limits,
+        )
+        for root in roots
+    )
+
+    allocations = tuple(dict(scope.materialized_path_chars) for scope in scopes)
+    assert scopes[0].selected_paths == scopes[1].selected_paths
+    assert scopes[0].issues == scopes[1].issues
+    assert allocations[0] == allocations[1]
+    assert set(scopes[0].issued_changed_paths) == set(paths)
+    assert all(allocations[0][path] > 0 for path in paths)
+    path_allocations = tuple(allocations[0][path] for path in paths)
+    assert min(path_allocations) >= 100
+    assert max(path_allocations) > min(path_allocations)
+    assert all(scope.materialized_chars <= 1_600 for scope in scopes)
+    assert set(relative for _root, relative in opened) == set(paths)
+    assert all(relative != "private/unlisted.py" for _root, relative in opened)
+
+
+def test_failed_candidate_redistributes_its_share_without_backfilling_file_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable early path donates context, but never an extra file attempt."""
+
+    missing = "results/a_missing.json"
+    selected_paths = ("src/b.py", "src/c.py")
+    outside_cap = "src/z_not_attempted.py"
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in (*selected_paths, outside_cap):
+        _write(root, path, (f"# {path}\n" + "x" * 2_000))
+
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(
+        preflight_module,
+        "capture_confined_regular_file",
+        traced_capture,
+    )
+    scope = _scope(
+        root,
+        _inventory(
+            (missing, ChangeStatus.MODIFIED),
+            *(
+                (path, ChangeStatus.MODIFIED)
+                for path in (*selected_paths, outside_cap)
+            ),
+        ),
+        title="Benchmark accuracy improves by 5%",
+        limits=ReviewLimits(
+            max_context_chars=1_000,
+            max_file_chars=800,
+            max_files=3,
+        ),
+    )
+
+    allocations = tuple(
+        dict(scope.materialized_path_chars)[path] for path in selected_paths
+    )
+    assert allocations == (800, 167)
+    assert scope.materialized_chars == 1_000
+    assert opened == [missing, *selected_paths]
+    assert outside_cap not in scope.selected_paths
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        and issue.path == outside_cap
+        for issue in scope.issues
+    )
+
+
+def test_ranked_reserve_degrades_to_live_share_under_tiny_context_cap(
+    tmp_path: Path,
+) -> None:
+    """Tiny budgets remain bounded while rank order receives the only surplus."""
+
+    paths = tuple(f"src/{name}.py" for name in "abcd")
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in paths:
+        _write(root, path, "x" * 100)
+
+    scope = _scope(
+        root,
+        _inventory(*((path, ChangeStatus.MODIFIED) for path in paths)),
+        title="benchmark",
+        limits=ReviewLimits(
+            max_context_chars=15,
+            max_file_chars=3,
+            max_files=4,
+        ),
+    )
+
+    allocations = dict(scope.materialized_path_chars)
+    assert tuple(allocations[path] for path in paths) == (3, 1, 1, 1)
+    assert scope.materialized_chars == 15
+
+
+def test_quantitative_comparative_benchmark_reproducibility_and_model_dataset_seeds(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/model_eval.py", "def evaluate():\n    return 1\n")
+    scope = _scope(
+        root,
+        _inventory(("benchmarks/model_eval.py", ChangeStatus.MODIFIED)),
+        title="Qwen model benchmark improves WER by 12%",
+        description=(
+            "Evaluation is 1.5x faster in 42 seconds because batching changed. "
+            "Reproduce with dataset revision abc and batch count 16."
+        ),
+    )
+    assert {seed.category for seed in scope.seeds} == {
+        "benchmark",
+        "comparative_causal",
+        "model_dataset",
+        "quantitative",
+        "reproducibility",
+    }
+    assert all(isinstance(seed, MaterialClaimSeed) for seed in scope.seeds)
+    assert scope.selected_paths == ("benchmarks/model_eval.py",)
+
+
+@pytest.mark.parametrize(
+    ("path", "title", "seed_categories", "evidence_kind"),
+    [
+        (
+            "src/accuracy.py",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.SOURCE,
+        ),
+        (
+            "tests/test_accuracy.py",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.TEST,
+        ),
+        (
+            "config/accuracy.yaml",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.CONFIG,
+        ),
+        (
+            "results/metrics.json",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.RESULTS,
+        ),
+        (
+            "research.yaml",
+            "Candidate accuracy improves by 5%",
+            ("benchmark", "comparative_causal", "quantitative"),
+            EvidenceKind.MANIFEST,
+        ),
+        (
+            "benchmarks/accuracy.txt",
+            "Candidate accuracy reaches 5%",
+            ("benchmark", "quantitative"),
+            EvidenceKind.BENCHMARK,
+        ),
+        (
+            "benchmark/submit.sh",
+            "Benchmark improves",
+            ("benchmark", "comparative_causal"),
+            EvidenceKind.CONFIG,
+        ),
+    ],
+    ids=(
+        "source",
+        "test",
+        "config",
+        "result",
+        "research-manifest",
+        "benchmark",
+        "submission-config",
+    ),
+)
+def test_supported_changed_material_kinds_form_gate2_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    title: str,
+    seed_categories: tuple[str, ...],
+    evidence_kind: EvidenceKind,
+) -> None:
+    """Gate 2 routes material seeds without invoking evidence or a provider."""
+
+    for variable in (
+        "OPENAI_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, path, "claim:\n  metric: accuracy\n")
+    inventory = _inventory((path, ChangeStatus.ADDED))
+    scope = _scope(root, inventory, title=title)
+
+    assert scope.inventory.entries == (ChangeEntry(path, ChangeStatus.ADDED),)
+    assert scope.selected_paths == (path,)
+    assert tuple(seed.category for seed in scope.seeds) == seed_categories
+    assert _kind(path) is evidence_kind
+
+    gate2 = preflight_module._gate2(scope)
+    assert gate2.disposition is GateDisposition.PASS_COMPLETE
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" not in {
+        issue.code for issue in scope.issues
+    }
+
+
+@pytest.mark.parametrize("path", ["src/model.py", "config/train.yaml"])
+def test_generic_kind_without_exact_or_token_ownership_does_not_route_gate2(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """A safe material kind alone does not claim an unrelated numeric seed."""
+
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, path, "generic material\n")
+    scope = _scope(
+        root,
+        _inventory((path, ChangeStatus.ADDED)),
+        title="Candidate reaches 5%",
+    )
+
+    assert tuple(seed.category for seed in scope.seeds) == ("quantitative",)
+    gate2 = preflight_module._gate2(scope)
+    assert gate2.disposition is GateDisposition.FAIL
+    assert gate2.metrics["routed_seed_count"] == 0
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" in {
+        issue.code for issue in scope.issues
+    }
+
+
+def test_self_referential_document_does_not_route_gate2(
+    tmp_path: Path,
+) -> None:
+    """Prose cannot authorize itself merely by naming its own exact path."""
+
+    root = tmp_path / "head"
+    root.mkdir()
+    path = "docs/claim.md"
+    _write(
+        root,
+        path,
+        "Accuracy improves by 5 percent; see docs/claim.md.\n",
+    )
+    scope = _scope(
+        root,
+        _inventory((path, ChangeStatus.ADDED)),
+    )
+
+    assert scope.selected_paths == (path,)
+    gate2 = preflight_module._gate2(scope)
+    assert gate2.disposition is GateDisposition.FAIL
+    assert gate2.metrics["routed_seed_count"] == 0
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" in {
+        issue.code for issue in scope.issues
+    }
+
+
+@pytest.mark.parametrize(
+    ("description", "category"),
+    [
+        ("Processed 42 files in the held-out run.", "quantitative"),
+        ("Model A versus model B on the same corpus.", "comparative_causal"),
+    ],
+)
+def test_count_and_comparison_terms_create_normalized_material_seeds(
+    tmp_path: Path,
+    description: str,
+    category: str,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/eval.py", "score = 1\n")
+    scope = _scope(
+        root,
+        _inventory(("benchmarks/eval.py", ChangeStatus.MODIFIED)),
+        description=description,
+    )
+    assert category in {seed.category for seed in scope.seeds}
+
+
+def test_material_seed_truncation_is_deterministic_and_forces_partial_scope(
+    tmp_path: Path,
+) -> None:
+    roots = (tmp_path / "first", tmp_path / "second")
+    material = (
+        "Benchmark model accuracy improves by 5% with reproducible seed "
+        "configuration; see results/metric.json."
+    )
+    inventory = _inventory(
+        ("docs/one.md", ChangeStatus.MODIFIED),
+        ("docs/two.md", ChangeStatus.MODIFIED),
+        ("results/metric.json", ChangeStatus.ADDED),
+    )
+    scopes = []
+    for root in roots:
+        root.mkdir()
+        _write(root, "docs/one.md", material)
+        _write(root, "docs/two.md", material)
+        _write(root, "results/metric.json", '{"accuracy": 0.95}\n')
+        scopes.append(
+            _scope(
+                root,
+                inventory,
+                title=material,
+                description=material,
+            )
+        )
+
+    scope = scopes[0]
+    result = preflight_module._evaluate_material_gates(
+        scope,
+        ReviewConfig(enabled=True),
+        requested_sha=BASE,
+        comparison_sha=BASE,
+        head_sha=HEAD,
+    )
+    truncation = tuple(
+        issue
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED"
+    )
+
+    assert len(scope.sources) == 4
+    assert len(scope.seeds) == 16
+    assert scope.seeds == scopes[1].seeds
+    assert truncation == (
+        ScopeIssue(
+            code="PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED",
+            observed=20,
+            limit=16,
+        ),
+    )
+    assert truncation[0].as_dict() == {
+        "code": "PREFLIGHT_G2_MATERIAL_SEED_TRUNCATED",
+        "observed": 20,
+        "limit": 16,
+    }
+    assert scope.complete is False
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.gates[1].metrics["material_seed_count"] == 16
+    assert result.gates[1].metrics["material_seed_omitted_count"] == 4
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
+
+
+def test_exact_path_then_category_overlap_kind_priority_and_path_order_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    roots = (tmp_path / "first", tmp_path / "second")
+    paths = (
+        "config/train.yaml",
+        "results/final.json",
+        "src/model.py",
+        "src/z_model.py",
+    )
+    for root, creation_order in zip(roots, (paths, tuple(reversed(paths))), strict=True):
+        root.mkdir()
+        for path in creation_order:
+            _write(root, path, f"material for {path}\n")
+    inventory = _inventory(*( (path, ChangeStatus.MODIFIED) for path in paths))
+    scopes = tuple(
+        _scope(
+            root,
+            inventory,
+            description=(
+                "The benchmark result improves model accuracy by 10%; "
+                "see results/final.json and reproduce with train config."
+            ),
+        )
+        for root in roots
+    )
+    assert scopes[0].selected_paths[0] == "results/final.json"
+    assert scopes[0].issued_paths == scopes[1].issued_paths
+    assert scopes[0].selected_paths == scopes[1].selected_paths
+    assert scopes[0].seeds == scopes[1].seeds
+    assert scopes[0].issues == scopes[1].issues
+    bundles = tuple(scope_source_bundle(scope) for scope in scopes)
+    assert [record.source_id for record in bundles[0].sources] == [
+        record.source_id for record in bundles[1].sources
+    ]
+    assert bundles[0].total_chars == bundles[1].total_chars
+
+
+def test_failed_captures_consume_the_fixed_read_budget_without_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "results/z_safe.json", "{\"accuracy\": 95}\n")
+    inventory = _inventory(
+        ("results/a_missing.json", ChangeStatus.MODIFIED),
+        ("results/b_missing.json", ChangeStatus.MODIFIED),
+        ("results/z_safe.json", ChangeStatus.MODIFIED),
+    )
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", traced_capture)
+    scope = _scope(
+        root,
+        inventory,
+        title="Benchmark accuracy improves by 5%",
+        limits=ReviewLimits(max_files=2),
+    )
+    assert opened == ["results/a_missing.json", "results/b_missing.json"]
+    assert not scope.selected_paths
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        and issue.path == "results/z_safe.json"
+        for issue in scope.issues
+    )
+
+
+def test_changed_document_seeds_rerank_the_remaining_fixed_budget(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(
+        root,
+        "docs/study.md",
+        "Accuracy improves by 10%; use zz_target/result.json.\n",
+    )
+    _write(root, "aa/result.json", "{\"accuracy\": 90}\n")
+    _write(root, "zz_target/result.json", "{\"accuracy\": 95}\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("aa/result.json", ChangeStatus.MODIFIED),
+            ("docs/study.md", ChangeStatus.MODIFIED),
+            ("zz_target/result.json", ChangeStatus.MODIFIED),
+        ),
+        limits=ReviewLimits(max_files=2),
+    )
+    assert scope.selected_paths == (
+        "docs/study.md",
+        "zz_target/result.json",
+    )
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED"
+        and issue.path == "aa/result.json"
+        for issue in scope.issues
+    )
+
+
+def test_cross_metadata_exact_result_survives_document_flood_at_file_cap(
+    tmp_path: Path,
+) -> None:
+    """PR title seeds and body paths jointly route exact changed results."""
+
+    document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
+    result_path = "results/exact.json"
+    entries = tuple(
+        (path, ChangeStatus.MODIFIED) for path in (*document_paths, result_path)
+    )
+    inventory = _inventory(*entries)
+    roots = (tmp_path / "first", tmp_path / "second")
+    scopes = []
+    for root, creation_order in zip(
+        roots,
+        (document_paths + (result_path,), tuple(reversed(document_paths + (result_path,)))),
+        strict=True,
+    ):
+        root.mkdir()
+        for path in creation_order:
+            _write(
+                root,
+                path,
+                '{"accuracy": 0.95}\n'
+                if path == result_path
+                else f"supporting note for {path}\n",
+            )
+        scopes.append(
+            _scope(
+                root,
+                inventory,
+                title="Benchmark accuracy improves by 5%.",
+                description="See results/exact.json.",
+                limits=ReviewLimits(max_files=24),
+            )
+        )
+
+    gates = tuple(
+        preflight_module._evaluate_material_gates(
+            scope,
+            ReviewConfig(enabled=True, limits=ReviewLimits(max_files=24)),
+            requested_sha=BASE,
+            comparison_sha=BASE,
+            head_sha=HEAD,
+        )
+        for scope in scopes
+    )
+
+    assert scopes[0].selected_paths == scopes[1].selected_paths
+    assert result_path in scopes[0].selected_paths
+    assert len(scopes[0].selected_paths) == 24
+    assert len(set(scopes[0].selected_paths) & set(document_paths)) == 23
+    assert gates[0].gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert gates[1].gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert {
+        issue.code
+        for issue in scopes[0].issues
+        if issue.path not in scopes[0].selected_paths
+    } == {
+        "PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
+        "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+    }
+    assert any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH" and issue.path is None
+        for issue in scopes[0].issues
+    )
+
+
+def test_root_level_exact_result_mention_survives_document_flood_at_file_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root-level exact path gets the first fixed attempt, without backfill."""
+
+    document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
+    result_path = "results.json"
+    inventory = _inventory(
+        *((path, ChangeStatus.MODIFIED) for path in (*document_paths, result_path))
+    )
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in document_paths:
+        _write(root, path, f"supporting note for {path}\n")
+    _write(root, result_path, '{"accuracy": 0.95}\n')
+
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", traced_capture)
+    scope = _scope(
+        root,
+        inventory,
+        title="Benchmark accuracy improves by 5%.",
+        description="See results.json.",
+        limits=ReviewLimits(max_files=24),
+    )
+
+    assert opened[0] == result_path
+    assert len(opened) == 24
+    assert len(set(opened)) == 24
+    assert scope.selected_paths == (result_path, *document_paths[:23])
+    assert result_path in scope.selected_paths
+    assert document_paths[-1] not in scope.selected_paths
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_CANDIDATE_SELECTION_TRUNCATED",
+        path=document_paths[-1],
+        observed=25,
+        limit=24,
+    ) in scope.issues
+    assert len(scope.selected_paths) <= 24
+
+
+def test_root_basename_matching_does_not_promote_dotted_prose_to_exact_paths(
+    tmp_path: Path,
+) -> None:
+    """Root-level path support must not treat ordinary dotted prose as a path."""
+
+    document_paths = tuple(f"docs/note-{index:02d}.md" for index in range(24))
+    result_path = "results.json"
+    root = tmp_path / "head"
+    root.mkdir()
+    for path in document_paths:
+        _write(root, path, f"supporting note for {path}\n")
+    _write(root, result_path, '{"accuracy": 0.95}\n')
+
+    scope = _scope(
+        root,
+        _inventory(
+            *((path, ChangeStatus.MODIFIED) for path in (*document_paths, result_path))
+        ),
+        title="Benchmark accuracy improves by 5%.",
+        description="Version 1.2 is prose; release.v1 is a label, not an inventory path.",
+        limits=ReviewLimits(max_files=24),
+    )
+
+    assert scope.selected_paths == document_paths
+    assert result_path not in scope.selected_paths
+    assert not any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH"
+        and issue.path in {"1.2", "release.v1"}
+        for issue in scope.issues
+    )
+
+
+def test_path_prefix_is_not_an_exact_inventory_path_mention(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "config/aaa.yaml", "seed: 1\n")
+    _write(root, "config/train.yaml", "seed: 2\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("config/aaa.yaml", ChangeStatus.MODIFIED),
+            ("config/train.yaml", ChangeStatus.MODIFIED),
+        ),
+        description="Reproduce with config/train.yaml.bak.",
+        limits=ReviewLimits(max_files=1),
+    )
+    assert scope.selected_paths == ("config/aaa.yaml",)
+
+
+def test_exact_inventory_path_mention_that_is_not_issued_is_out_of_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    _write(root, "notes/claimed.bin", "not review material\n")
+
+    scope = _scope(
+        root,
+        _inventory(
+            ("benchmarks/safe.py", ChangeStatus.MODIFIED),
+            ("notes/claimed.bin", ChangeStatus.MODIFIED),
+        ),
+        description=(
+            "Benchmark accuracy improves by 5%; the exact supporting path is "
+            "notes/claimed.bin."
+        ),
+    )
+
+    assert scope.issued_paths == ("benchmarks/safe.py",)
+    assert not scope.complete
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_OUT_OF_SCOPE_PATH", path="notes/claimed.bin"
+    ) in scope.issues
+
+
+@pytest.mark.parametrize(
+    "unsafe_reference",
+    [
+        "/outside/results.json",
+        "/results.json",
+        "../../outside/results.json",
+        "../results.json",
+        r"C:\outside\results.json",
+        r"C:\results.json",
+        r"\\server\share\results.json",
+        r"outside\results.json",
+    ],
+)
+def test_absolute_traversal_and_backslash_path_references_are_never_admitted(
+    tmp_path: Path,
+    unsafe_reference: str,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    scope = _scope(
+        root,
+        _inventory(("benchmarks/safe.py", ChangeStatus.MODIFIED)),
+        description=f"Accuracy improved by 10%; see {unsafe_reference}.",
+    )
+    assert scope.issued_paths == ("benchmarks/safe.py",)
+    assert any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH" and issue.path is None
+        for issue in scope.issues
+    )
+
+
+def test_prose_seed_without_a_validated_local_changed_candidate_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    scope = _scope(
+        root,
+        _inventory(),
+        title="Accuracy improves by 20%",
+        description="External benchmark results are faster.",
+    )
+    assert scope.seeds
+    assert not scope.complete
+    assert {issue.code for issue in scope.issues} >= {
+        "PREFLIGHT_G2_NO_ROUTABLE_CHANGED_PATH"
+    }
+
+
+def test_deleted_material_with_another_citable_route_forces_partial_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "tests/test_result_check.py", "def test_result():\n    pass\n")
+    inventory = _inventory(
+        ("results/deleted.json", ChangeStatus.DELETED),
+        ("tests/test_result_check.py", ChangeStatus.MODIFIED),
+    )
+
+    scope = _scope(
+        root,
+        inventory,
+        title="Reproducibility improves with deterministic tests",
+    )
+    result = preflight_module._evaluate_material_gates(
+        scope,
+        ReviewConfig(enabled=True),
+        requested_sha=BASE,
+        comparison_sha=BASE,
+        head_sha=HEAD,
+    )
+
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+        path="results/deleted.json",
+    ) in scope.issues
+    assert scope.complete is False
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.gates[1].metrics["deleted_material_unavailable_count"] == 1
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
+
+
+def test_exactly_mentioned_deleted_material_remains_out_of_scope_and_unavailable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    scope = _scope(
+        root,
+        _inventory(("results/deleted.json", ChangeStatus.DELETED)),
+        title="Benchmark improves according to results/deleted.json",
+    )
+    issue_codes = {issue.code for issue in scope.issues}
+    gate2 = preflight_module._gate2(scope)
+
+    assert issue_codes >= {
+        "PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+        "PREFLIGHT_G2_ONLY_DELETED_ROUTABLE_PATH",
+        "PREFLIGHT_G2_OUT_OF_SCOPE_PATH",
+    }
+    assert gate2.disposition is GateDisposition.FAIL
+    assert gate2.metrics["deleted_material_unavailable_count"] == 1
+
+
+def test_other_deletion_does_not_reduce_complete_material_scope(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "tests/test_result_check.py", "def test_result():\n    pass\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("assets/old.bin", ChangeStatus.DELETED),
+            ("tests/test_result_check.py", ChangeStatus.MODIFIED),
+        ),
+        title="Reproducibility improves with deterministic tests",
+    )
+
+    assert "PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE" not in {
+        issue.code for issue in scope.issues
+    }
+    assert scope.complete is True
+
+
+def test_external_only_required_route_is_explicit_and_cannot_complete(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    scope = _scope(
+        root,
+        _inventory(),
+        description=(
+            "Accuracy improves by 20%; results are only at "
+            "https://example.invalid/results.json."
+        ),
+    )
+    assert not scope.complete
+    assert "PREFLIGHT_G2_EXTERNAL_EVIDENCE_ONLY" in {
+        issue.code for issue in scope.issues
+    }
+
+
+def test_comparison_explosion_only_opens_declared_changed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    for index in range(513):
+        _write(root, f"irrelevant/file_{index:04d}.py", "x = 1\n")
+    _write(root, "zz_target/benchmark.py", "score = 0.95\n")
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def traced_capture(root_path: Path, relative: str, *, max_bytes: int):
+        opened.append(relative)
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", traced_capture)
+    scope = _scope(
+        root,
+        _inventory(("zz_target/benchmark.py", ChangeStatus.MODIFIED)),
+        title="Benchmark score improves by 5%",
+    )
+    assert scope.issued_changed_paths == ("zz_target/benchmark.py",)
+    assert set(opened) == {"zz_target/benchmark.py"}
+
+
+def test_changed_entries_survive_a_legacy_2048_path_lexical_prefix(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    for index in range(2_049):
+        _write(root, f"aaa/file_{index:04d}.txt", "irrelevant\n")
+    targets = ("src/models/glm/a.py", "src/models/glm/b.py")
+    for target in targets:
+        _write(root, target, "model_accuracy = 0.9\n")
+    scope = _scope(
+        root,
+        _inventory(*( (target, ChangeStatus.MODIFIED) for target in targets)),
+        title="GLM model accuracy improves by 9%",
+    )
+    assert scope.issued_changed_paths == targets
+
+
+def test_supplement_git_probes_share_the_remaining_file_attempt_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "results/metrics.json", '{"accuracy": 0.95}\n')
+    mentions = " ".join(f"source/path_{index:04}.py" for index in range(200))
+    probed: list[str] = []
+
+    def reject_supplement(_inputs, _inventory, path: str) -> bool:
+        probed.append(path)
+        return False
+
+    monkeypatch.setattr(
+        preflight_module,
+        "_git_supplement_is_exact",
+        reject_supplement,
+    )
+    scope = _scope(
+        root,
+        _inventory(("results/metrics.json", ChangeStatus.ADDED)),
+        title="Accuracy improves by 5%",
+        description=mentions,
+        limits=ReviewLimits(max_files=3),
+    )
+
+    assert scope.selected_paths == ("results/metrics.json",)
+    assert probed == ["source/path_0000.py", "source/path_0001.py"]
+
+
+def test_preflight_manifest_groups_preserve_the_four_candidate_audit_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    manifest_paths = (
+        "a/research.yaml",
+        "a/research.yml",
+        "b/research.yaml",
+        "b/research.yml",
+        "c/research.yaml",
+    )
+    artifact_paths = tuple(
+        f"{Path(path).parent.as_posix()}/results-{index}.json"
+        for index, path in enumerate(manifest_paths)
+    )
+    for path in (*manifest_paths, *artifact_paths):
+        _write(root, path, '{"accuracy": 0.95}\n')
+    inventory = _inventory(
+        *((path, ChangeStatus.ADDED) for path in (*manifest_paths, *artifact_paths))
+    )
+    observed_candidates: list[tuple[str, ...]] = []
+
+    def manifest_dependencies(
+        _inputs: object,
+        candidates: tuple[str, ...],
+        *,
+        max_bytes: int,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        assert max_bytes > 0
+        observed_candidates.append(candidates)
+        dependency_by_manifest = dict(zip(manifest_paths, artifact_paths))
+        return tuple(
+            (manifest, (dependency_by_manifest[manifest],))
+            for manifest in candidates
+        )
+
+    monkeypatch.setattr(
+        preflight_module,
+        "_exact_manifest_dependency_map",
+        manifest_dependencies,
+    )
+
+    scope = _scope(
+        root,
+        inventory,
+        title="Candidate accuracy improves by 5%",
+    )
+
+    assert observed_candidates == [manifest_paths[:4]]
+    assert scope.atomic_path_groups == tuple(
+        (manifest, artifact)
+        for manifest, artifact in zip(manifest_paths[:4], artifact_paths[:4])
+    )
+    assert manifest_paths[4] in scope.selected_paths
+    omission = next(
+        issue
+        for issue in scope.issues
+        if issue.code == "PREFLIGHT_G3_AUDIT_PLAN_OMITTED"
+    )
+    assert (omission.observed, omission.limit) == (1, 4)
+
+
+@pytest.mark.parametrize("deleted_path", ["results/deleted.json", "src/deleted.py"])
+def test_legacy_inventory_surfaces_base_only_material_deletion(
+    tmp_path: Path,
+    deleted_path: str,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(base, deleted_path, "old material\n")
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert issues == ()
+    assert inventory is not None
+    assert inventory.entries == (ChangeEntry(deleted_path, ChangeStatus.DELETED),)
+
+
+def test_legacy_case_only_rename_is_a_typed_gate1_duplicate_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import claimci.review.orchestrator as orchestrator
+
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(head, "README.md", "new\n")
+    _write(base, "readme.md", "old\n")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "OpenAIReviewerProvider",
+        lambda **_kwargs: pytest.fail("provider factory must remain untouched"),
+    )
+    review = orchestrator.run_review(
+        ReviewInputs(repository_root=head, base_root=base),
+        ReviewConfig(enabled=True),
+    )
+    result = review.preflight
+
+    assert result is not None
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert {reason.code for reason in result.gates[0].reasons} == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_DUPLICATE_PATH"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.ready_for_provider is False
+    assert result.scope is None
+    assert review.status is ReviewStatus.UNAVAILABLE
+    assert review.provider_calls == ()
+
+
+def test_legacy_invalid_generated_path_is_a_typed_gate1_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    monkeypatch.setattr(
+        preflight_module,
+        "_legacy_regular_paths",
+        lambda *_args, **_kwargs: (("../result.json",), ()),
+    )
+
+    result = preflight_review(
+        ReviewInputs(repository_root=root),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert {reason.code for reason in result.gates[0].reasons} == {
+        "PREFLIGHT_G1_CHANGE_INVENTORY_INVALID_PATH"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED
+    assert result.ready_for_provider is False
+    assert result.scope is None
+
+
+def test_legacy_deleted_material_with_modified_route_is_partial(tmp_path: Path) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(base, "results/deleted.json", '{"accuracy": 0.8}\n')
+    _write(base, "tests/test_result_check.py", "old = 1\n")
+    _write(head, "tests/test_result_check.py", "new_result = 2\n")
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Reproducibility improves with deterministic tests",
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.scope is not None
+    assert ChangeEntry(
+        "results/deleted.json", ChangeStatus.DELETED
+    ) in result.scope.inventory.entries
+    assert ScopeIssue(
+        code="PREFLIGHT_G2_DELETED_MATERIAL_UNAVAILABLE",
+        path="results/deleted.json",
+    ) in result.scope.issues
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.ready_for_provider is True
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
+
+
+@pytest.mark.parametrize(
+    ("constant", "reason"),
+    [
+        ("MAX_REPOSITORY_PATHS", "PREFLIGHT_G1_REPOSITORY_PATH_LIMIT"),
+        ("MAX_REPOSITORY_ENTRIES", "PREFLIGHT_G1_REPOSITORY_ENTRY_LIMIT"),
+    ],
+)
+def test_legacy_head_and_base_share_one_traversal_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    reason: str,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(head, "live.py", "value = 1\n")
+    _write(base, "deleted.json", "{}\n")
+    monkeypatch.setattr(preflight_module, constant, 1)
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert inventory is None
+    assert reason in {issue.code for issue in issues}
+
+
+def test_legacy_identical_paths_do_not_spuriously_exhaust_union_path_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    head.mkdir()
+    base.mkdir()
+    _write(head, "results/same.json", "{}\n")
+    _write(base, "results/same.json", "{}\n")
+    monkeypatch.setattr(preflight_module, "MAX_REPOSITORY_PATHS", 1)
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert issues == ()
+    assert inventory is not None
+    assert inventory.entries == ()
+
+
+def test_legacy_base_only_symlink_is_never_reported_as_deleted_material(
+    tmp_path: Path,
+) -> None:
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    outside = tmp_path / "outside.json"
+    head.mkdir()
+    base.mkdir()
+    outside.write_text("{}\n", encoding="utf-8")
+    link = base / "results" / "linked.json"
+    link.parent.mkdir()
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    inventory, issues = preflight_module._legacy_inventory(
+        ReviewInputs(repository_root=head, base_root=base)
+    )
+
+    assert issues == ()
+    assert inventory is not None
+    assert inventory.entries == ()
+
+
+def test_legacy_rename_like_delete_add_is_deterministic_partial(
+    tmp_path: Path,
+) -> None:
+    pairs = (
+        (tmp_path / "head-one", tmp_path / "base-one"),
+        (tmp_path / "head-two", tmp_path / "base-two"),
+    )
+    inventories = []
+    for index, (head, base) in enumerate(pairs):
+        head.mkdir()
+        base.mkdir()
+        head_paths = ("results/new.json", "tests/same.py")
+        base_paths = ("results/old.json", "tests/same.py")
+        if index:
+            head_paths = tuple(reversed(head_paths))
+            base_paths = tuple(reversed(base_paths))
+        for path in head_paths:
+            _write(head, path, "same\n" if path == "tests/same.py" else "new\n")
+        for path in base_paths:
+            _write(base, path, "same\n" if path == "tests/same.py" else "old\n")
+        inventory, issues = preflight_module._legacy_inventory(
+            ReviewInputs(repository_root=head, base_root=base)
+        )
+        assert issues == ()
+        assert inventory is not None
+        inventories.append(inventory)
+
+    expected = (
+        ChangeEntry("results/new.json", ChangeStatus.ADDED),
+        ChangeEntry("results/old.json", ChangeStatus.DELETED),
+    )
+    assert inventories[0].entries == expected
+    assert inventories[1].entries == expected
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=pairs[0][0],
+            base_root=pairs[0][1],
+            pr_title="Benchmark improves in results/new.json",
+        ),
+        ReviewConfig(enabled=True),
+    )
+    assert result.gates[1].disposition is GateDisposition.PASS_PARTIAL
+    assert result.review_status_ceiling is ReviewStatus.PARTIAL
+
+
+def test_huge_unchanged_repository_file_is_never_touched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "src/changed.py", "throughput = 2\n")
+    huge = _write(root, "cassettes/huge.yaml", b"x" * 2_187_560)
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def guarded_capture(root_path: Path, relative: str, *, max_bytes: int):
+        if relative == "cassettes/huge.yaml":
+            raise AssertionError("unchanged huge file was touched")
+        return real_capture(root_path, relative, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", guarded_capture)
+    scope = _scope(
+        root,
+        _inventory(("src/changed.py", ChangeStatus.MODIFIED)),
+        title="Throughput improves by 2x",
+    )
+    assert scope.selected_paths == ("src/changed.py",)
+    assert huge.stat().st_size == 2_187_560
+
+
+def test_openasr_submission_script_is_passive_config_and_missing_results_are_explicit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    script = "MODEL=Qwen3-ASR\npython run_eval.py --dataset librispeech\n"
+    _write(root, "transformers/submit_jobs_qwen3asr.sh", script)
+    scope = _scope(
+        root,
+        _inventory(("transformers/submit_jobs_qwen3asr.sh", ChangeStatus.ADDED)),
+        title="Evaluate Qwen3-ASR",
+        description="The model benchmark reports 8% WER and 3x RTFx.",
+    )
+    assert scope.selected_paths == ("transformers/submit_jobs_qwen3asr.sh",)
+    assert any(seed.category == "benchmark" for seed in scope.seeds)
+    assert "PREFLIGHT_G2_MATERIAL_SEED_UNROUTED" in {
+        issue.code for issue in scope.issues
+    }
+    assert all(
+        record.path != "transformers/submit_jobs_qwen3asr.sh"
+        for record in scope.sources
+    )
+    assert not scope.complete
+
+
+def test_selected_huge_file_is_recorded_and_a_safe_route_keeps_partial_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "results/required.json", b"x" * (16 * 1024 * 1024 + 1))
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("benchmarks/safe.py", ChangeStatus.MODIFIED),
+            ("results/required.json", ChangeStatus.MODIFIED),
+        ),
+        description="Benchmark accuracy is 95%; see results/required.json.",
+    )
+    assert "benchmarks/safe.py" in scope.selected_paths
+    assert "results/required.json" not in scope.selected_paths
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_TOO_LARGE"
+        and issue.path == "results/required.json"
+        for issue in scope.issues
+    )
+    assert not scope.complete
+
+
+@pytest.mark.parametrize("include_safe_result", [True, False])
+def test_oversized_comparison_blob_is_omitted_before_head_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_safe_result: bool,
+) -> None:
+    base = (tmp_path / "base").resolve()
+    head = (tmp_path / "head").resolve()
+    base.mkdir()
+    head.mkdir()
+    _write(head, "src/metric.py", "accuracy = 0.95\n")
+    entries = [("src/metric.py", ChangeStatus.MODIFIED)]
+    if include_safe_result:
+        _write(head, "results/metric.json", '{"accuracy": 0.95}\n')
+        entries.append(("results/metric.json", ChangeStatus.ADDED))
+    inventory = _inventory(*entries)
+    requested = SnapshotIdentity(SnapshotRole.REQUESTED_BASE, base, BASE)
+    comparison = SnapshotIdentity(SnapshotRole.COMPARISON_BASE, base, BASE)
+    head_identity = SnapshotIdentity(SnapshotRole.HEAD, head, HEAD)
+
+    def descriptor(identity: SnapshotIdentity, path: str):
+        if identity.role is SnapshotRole.COMPARISON_BASE and path == "src/metric.py":
+            return (preflight_module.MAX_SOURCE_FILE_BYTES + 1, "1" * 40)
+        return None
+
+    opened: list[str] = []
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def capture(root: Path, path: str, *, max_bytes: int):
+        opened.append(path)
+        return real_capture(root, path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "git_blob_descriptor", descriptor)
+    monkeypatch.setattr(preflight_module, "capture_confined_regular_file", capture)
+    scope = build_review_scope(
+        ReviewInputs(
+            repository_root=head,
+            pr_title="Candidate accuracy improves by 5%",
+            requested_base=requested,
+            comparison_base=comparison,
+            head=head_identity,
+            inventory=inventory,
+        ),
+        ReviewConfig(enabled=True),
+        inventory,
+    )
+
+    assert "src/metric.py" not in scope.selected_paths
+    assert "src/metric.py" not in opened
+    assert any(
+        issue.code == "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE"
+        and issue.path == "src/metric.py"
+        and issue.observed == preflight_module.MAX_SOURCE_FILE_BYTES + 1
+        and issue.limit == preflight_module.MAX_SOURCE_FILE_BYTES
+        for issue in scope.issues
+    )
+    gate2 = preflight_module._gate2(scope)
+    if include_safe_result:
+        assert scope.selected_paths == ("results/metric.json",)
+        assert gate2.disposition is GateDisposition.PASS_PARTIAL
+    else:
+        assert scope.selected_paths == ()
+        assert gate2.disposition is GateDisposition.FAIL
+
+
+@pytest.mark.parametrize("status", [ChangeStatus.DELETED])
+def test_deleted_only_required_route_never_produces_complete_scope(
+    tmp_path: Path,
+    status: ChangeStatus,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    scope = _scope(
+        root,
+        _inventory(("results/deleted.json", status)),
+        description="The deleted benchmark result improved accuracy by 10%.",
+    )
+    assert not scope.issued_changed_paths
+    assert not scope.complete
+    assert "PREFLIGHT_G2_ONLY_DELETED_ROUTABLE_PATH" in {
+        issue.code for issue in scope.issues
+    }
+
+
+def test_exact_deleted_route_remains_explicit_when_another_safe_route_exists(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("benchmarks/safe.py", ChangeStatus.MODIFIED),
+            ("results/deleted.json", ChangeStatus.DELETED),
+        ),
+        description=(
+            "Benchmark accuracy improved by 10%; the required result was "
+            "results/deleted.json."
+        ),
+    )
+    assert "benchmarks/safe.py" in scope.selected_paths
+    assert not scope.complete
+    assert any(
+        issue.code == "PREFLIGHT_G2_ONLY_DELETED_ROUTABLE_PATH"
+        and issue.path == "results/deleted.json"
+        for issue in scope.issues
+    )
+
+
+def test_unsafe_required_path_literal_is_reported_without_becoming_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "benchmarks/safe.py", "accuracy = 95\n")
+    scope = _scope(
+        root,
+        _inventory(("benchmarks/safe.py", ChangeStatus.MODIFIED)),
+        description="Accuracy improved by 10%; see ../../outside/results.json.",
+    )
+    assert scope.issued_paths == ("benchmarks/safe.py",)
+    assert not scope.complete
+    assert any(
+        issue.code == "PREFLIGHT_G2_OUT_OF_SCOPE_PATH" and issue.path is None
+        for issue in scope.issues
+    )
+
+
+def test_symlinked_head_root_is_rejected_before_any_material_read(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    _write(target, "benchmarks/eval.py", "score = 1\n")
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    with pytest.raises(ValueError, match="head repository root is invalid"):
+        _scope(
+            linked,
+            _inventory(("benchmarks/eval.py", ChangeStatus.MODIFIED)),
+            title="Benchmark score improves by 5%",
+        )
+
+
+def test_required_changed_document_truncation_is_an_explicit_locality_omission(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "docs/large-study.md", "Accuracy improves by 10%.\n" + "x" * 100)
+    scope = _scope(
+        root,
+        _inventory(("docs/large-study.md", ChangeStatus.MODIFIED)),
+        title="Review docs/large-study.md accuracy benchmark",
+        limits=ReviewLimits(max_file_chars=20),
+    )
+    assert not scope.complete
+    assert any(
+        issue.code == "PREFLIGHT_G2_EXCERPT_LOCALITY_UNAVAILABLE"
+        and issue.path == "docs/large-study.md"
+        and issue.observed == 126
+        and issue.limit == 20
+        for issue in scope.issues
+    )
+
+
+def test_oversized_modified_document_materializes_the_changed_region(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+    prefix = "Ordinary documentation without a material claim.\n" * 400
+    _write(base, "docs/study.md", prefix + "Accuracy was 90%.\n")
+    _write(head, "docs/study.md", prefix + "Accuracy is now 95%.\n")
+    _write(base, "results/metrics.json", '{"accuracy": 0.90}\n')
+    _write(head, "results/metrics.json", '{"accuracy": 0.95}\n')
+
+    scope = build_review_scope(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Please review docs/study.md",
+        ),
+        ReviewConfig(enabled=True, limits=ReviewLimits(max_file_chars=160)),
+        _inventory(
+            ("docs/study.md", ChangeStatus.MODIFIED),
+            ("results/metrics.json", ChangeStatus.MODIFIED),
+        ),
+    )
+
+    document = next(
+        source
+        for source in scope.sources
+        if source.kind is SourceKind.REPOSITORY_FILE
+        and source.path == "docs/study.md"
+    )
+    assert "Accuracy is now 95%." in document.text
+    assert "Accuracy was 90%." not in document.text
+    assert preflight_module._gate2(scope).disposition is GateDisposition.PASS_COMPLETE
+    assert any(
+        issue.code == "PREFLIGHT_G3_SELECTED_SOURCE_CHAR_LIMIT"
+        and issue.path == "docs/study.md"
+        for issue in scope.issues
+    )
+
+
+def test_undecodable_required_candidate_is_explicit_and_not_complete(tmp_path: Path) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "results/metrics.json", b"\xff\xfe")
+    scope = _scope(
+        root,
+        _inventory(("results/metrics.json", ChangeStatus.MODIFIED)),
+        description="Accuracy improves by 10%; see results/metrics.json.",
+    )
+    assert not scope.complete
+    assert any(
+        issue.code == "PREFLIGHT_G2_CANDIDATE_UNREADABLE"
+        for issue in scope.issues
+    )
+
+
+def test_source_bundle_adapter_uses_only_issued_and_changed_non_deleted_paths(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    _write(root, "docs/study.md", "Accuracy improves by 10%.\n")
+    _write(root, "src/model.py", "accuracy = 0.9\n")
+    scope = _scope(
+        root,
+        _inventory(
+            ("docs/study.md", ChangeStatus.MODIFIED),
+            ("old/result.json", ChangeStatus.DELETED),
+            ("src/model.py", ChangeStatus.MODIFIED),
+        ),
+    )
+    bundle = scope_source_bundle(scope)
+    assert bundle.sources == scope.sources
+    assert bundle.repository_paths == scope.issued_paths
+    assert bundle.changed_paths == scope.issued_changed_paths
+    assert bundle.total_chars == sum(len(record.text) for record in scope.sources)
+    assert all(record.kind is SourceKind.REPOSITORY_FILE for record in scope.sources)
+
+
+def test_incomplete_legacy_inventory_cannot_claim_declared_complete_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "head"
+    root.mkdir()
+    legacy = ChangeInventory(
+        schema_version=1,
+        requested_base_sha=BASE,
+        comparison_base_sha=BASE,
+        head_sha=HEAD,
+        comparison_basis=ComparisonBasis.DIRECT_BASE,
+        source=ChangeInventorySource.LEGACY_PAIRWISE,
+        declared_entry_count=0,
+        complete=False,
+        entries=(),
+    )
+    scope = _scope(root, legacy, title="Accuracy improves by 10%")
+    assert scope.mode == "legacy_pairwise_v1"
+    assert not scope.complete
+    assert "PREFLIGHT_G1_CHANGESET_INCOMPLETE" in {
+        issue.code for issue in scope.issues
+    }
+
+
+def test_legacy_gate1_failure_filters_prior_gate2_inventory_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later comparison cap cannot misfile an earlier status error in Gate 1."""
+
+    head = (tmp_path / "head").resolve()
+    base = (tmp_path / "base").resolve()
+    head.mkdir()
+    base.mkdir()
+    for name in ("a-results.json", "b-results.json"):
+        _write(head, name, "same\n")
+        _write(base, name, "same\n")
+    real_capture = preflight_module.capture_confined_regular_file
+
+    def first_status_unknown(root: Path, path: str, *, max_bytes: int):
+        if path == "a-results.json":
+            raise PassiveFileError("identity changed", code="changed")
+        return real_capture(root, path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(preflight_module, "MAX_CHANGE_COMPARISON_FILES", 1)
+    monkeypatch.setattr(
+        preflight_module, "capture_confined_regular_file", first_status_unknown
+    )
+
+    result = preflight_review(
+        ReviewInputs(
+            repository_root=head,
+            base_root=base,
+            pr_title="Benchmark accuracy improves in a-results.json",
+        ),
+        ReviewConfig(enabled=True),
+    )
+
+    assert result.gates[0].disposition is GateDisposition.FAIL
+    assert {reason.code for reason in result.gates[0].reasons} == {
+        "PREFLIGHT_G1_COMPARISON_FILE_LIMIT"
+    }
+    assert result.gates[1].disposition is GateDisposition.NOT_EVALUATED
+    assert result.gates[2].disposition is GateDisposition.NOT_EVALUATED

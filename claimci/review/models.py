@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 
 
 class ReviewError(ValueError):
@@ -48,6 +51,20 @@ class SourceKind(str, Enum):
     REPOSITORY_FILE = "repository_file"
 
 
+class ReviewMaterialKind(str, Enum):
+    """Passive material categories used only to plan evidence routes."""
+
+    DOCUMENT = "document"
+    SOURCE = "source"
+    TEST = "test"
+    CONFIG = "config"
+    RESULT = "result"
+    MANIFEST = "manifest"
+    BENCHMARK = "benchmark"
+    SUBMISSION_CONFIG = "submission_config"
+    OTHER = "other"
+
+
 class ReviewStatus(str, Enum):
     DISABLED = "DISABLED"
     COMPLETE = "COMPLETE"
@@ -55,8 +72,47 @@ class ReviewStatus(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class ProviderLifecycle(str, Enum):
+    """Provider-attempt state kept separate from completed call records."""
+
+    NOT_ATTEMPTED = "not_attempted"
+    RESPONSE_RECEIVED = "response_received"
+    FAILED_BEFORE_RESPONSE = "failed_before_response"
+
+
+class GateDisposition(str, Enum):
+    PASS_COMPLETE = "pass_complete"
+    PASS_PARTIAL = "pass_partial"
+    FAIL = "fail"
+    NOT_EVALUATED = "not_evaluated"
+
+
+class ComparisonBasis(str, Enum):
+    DIRECT_BASE = "direct_base"
+    MERGE_BASE = "merge_base"
+
+
+class ChangeStatus(str, Enum):
+    ADDED = "added"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+
+
+class ChangeInventorySource(str, Enum):
+    TRUSTED_GIT_OBJECT_GRAPH = "trusted_git_object_graph"
+    LEGACY_PAIRWISE = "legacy_pairwise"
+
+
+class SnapshotRole(str, Enum):
+    REQUESTED_BASE = "requested_base"
+    COMPARISON_BASE = "comparison_base"
+    HEAD = "head"
+
+
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 MAX_RECORDED_TOKEN_COUNT = 1_000_000_000_000
+MAX_CHANGE_INVENTORY_ENTRIES = 8_192
 
 
 def _nonempty_text(value: object, label: str, *, max_chars: int = 16_000) -> str:
@@ -84,6 +140,198 @@ def _relative_path(value: object, label: str) -> str:
     if normalized in {"", "."}:
         raise ReviewError(f"{label} must name a file")
     return normalized
+
+
+def _full_git_object_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _FULL_GIT_OBJECT_ID.fullmatch(value):
+        raise ReviewError(f"{label} must be a full lowercase Git object ID")
+    return value
+
+
+def _portable_inventory_path(value: object) -> str:
+    """Validate an already-canonical portable repository path.
+
+    Inventory metadata is an identity boundary, so aliases are rejected rather
+    than normalized into another spelling.
+    """
+
+    text = _nonempty_text(value, "change path", max_chars=4_096)
+    windows = PureWindowsPath(text)
+    components = text.split("/")
+    if (
+        "\\" in text
+        or windows.drive
+        or PurePosixPath(text).is_absolute()
+        or any(component in {"", ".", ".."} for component in components)
+        or any(unicodedata.category(character) == "Cc" for character in text)
+    ):
+        raise ReviewError("change path must be a canonical portable relative path")
+    if PurePosixPath(text).as_posix() != text:
+        raise ReviewError("change path must be a canonical portable relative path")
+    return text
+
+
+@dataclass(frozen=True)
+class SnapshotIdentity:
+    role: SnapshotRole
+    root: Path
+    sha: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, SnapshotRole):
+            raise ReviewError("snapshot role is invalid")
+        if not isinstance(self.root, Path):
+            raise ReviewError("snapshot root must be a Path")
+        try:
+            if not self.root.is_absolute() or self.root.is_symlink():
+                raise ReviewError("snapshot root must be a resolved regular directory")
+            resolved = self.root.resolve(strict=True)
+        except ReviewError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ReviewError("snapshot root must be a resolved regular directory") from exc
+        if resolved != self.root or not resolved.is_dir():
+            raise ReviewError("snapshot root must be a resolved regular directory")
+        _full_git_object_id(self.sha, "snapshot sha")
+
+
+@dataclass(frozen=True)
+class ExactMaterialOmission:
+    """Content-free exact-Git fact for material intentionally left sparse."""
+
+    role: SnapshotRole
+    source: SnapshotIdentity
+    path: str
+    object_id: str
+    observed: int
+    limit: int
+    code: str
+
+    def __post_init__(self) -> None:
+        allowed = {
+            SnapshotRole.HEAD: "PREFLIGHT_G2_CANDIDATE_TOO_LARGE",
+            SnapshotRole.COMPARISON_BASE: (
+                "PREFLIGHT_G2_COMPARISON_CANDIDATE_TOO_LARGE"
+            ),
+        }
+        if self.role not in allowed or self.code != allowed[self.role]:
+            raise ReviewError("exact material omission role and code are invalid")
+        if (
+            not isinstance(self.source, SnapshotIdentity)
+            or self.source.role is not self.role
+        ):
+            raise ReviewError("exact material omission source is invalid")
+        object.__setattr__(self, "path", _portable_inventory_path(self.path))
+        _full_git_object_id(self.object_id, "exact material omission object ID")
+        if (
+            isinstance(self.observed, bool)
+            or not isinstance(self.observed, int)
+            or isinstance(self.limit, bool)
+            or not isinstance(self.limit, int)
+            or self.limit < 0
+            or self.observed <= self.limit
+        ):
+            raise ReviewError("exact material omission size bound is invalid")
+
+
+@dataclass(frozen=True)
+class DeclaredReviewCoordinates:
+    """Raw all-or-none coordinates retained even when a root is invalid."""
+
+    requested_base_sha: str
+    comparison_base_sha: str
+    head_sha: str
+    comparison_basis: ComparisonBasis
+    invalid_root_roles: tuple[SnapshotRole, ...] = ()
+
+    def __post_init__(self) -> None:
+        for label in (
+            "requested_base_sha",
+            "comparison_base_sha",
+            "head_sha",
+        ):
+            if not isinstance(getattr(self, label), str):
+                raise ReviewError("declared review coordinates must be strings")
+        if not isinstance(self.comparison_basis, ComparisonBasis):
+            raise ReviewError("declared review comparison basis is invalid")
+        role_order = {
+            SnapshotRole.REQUESTED_BASE: 0,
+            SnapshotRole.COMPARISON_BASE: 1,
+            SnapshotRole.HEAD: 2,
+        }
+        if (
+            not isinstance(self.invalid_root_roles, tuple)
+            or any(role not in role_order for role in self.invalid_root_roles)
+            or tuple(sorted(set(self.invalid_root_roles), key=role_order.__getitem__))
+            != self.invalid_root_roles
+        ):
+            raise ReviewError("declared review invalid-root roles are invalid")
+
+
+@dataclass(frozen=True)
+class ChangeEntry:
+    path: str
+    status: ChangeStatus
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _portable_inventory_path(self.path))
+        if not isinstance(self.status, ChangeStatus):
+            raise ReviewError("change status is invalid")
+
+
+@dataclass(frozen=True)
+class ChangeInventory:
+    schema_version: int
+    requested_base_sha: str
+    comparison_base_sha: str
+    head_sha: str
+    comparison_basis: ComparisonBasis
+    source: ChangeInventorySource
+    declared_entry_count: int
+    complete: bool
+    entries: tuple[ChangeEntry, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != 1
+        ):
+            raise ReviewError("change inventory schema_version must be 1")
+        _full_git_object_id(self.requested_base_sha, "requested base sha")
+        _full_git_object_id(self.comparison_base_sha, "comparison base sha")
+        _full_git_object_id(self.head_sha, "head sha")
+        if not isinstance(self.comparison_basis, ComparisonBasis):
+            raise ReviewError("comparison basis is invalid")
+        if not isinstance(self.source, ChangeInventorySource):
+            raise ReviewError("change inventory source is invalid")
+        if (
+            isinstance(self.declared_entry_count, bool)
+            or not isinstance(self.declared_entry_count, int)
+            or not 0 <= self.declared_entry_count <= MAX_CHANGE_INVENTORY_ENTRIES
+        ):
+            raise ReviewError("declared change entry count is invalid")
+        if not isinstance(self.complete, bool):
+            raise ReviewError("change inventory completeness must be a boolean")
+        if not isinstance(self.entries, tuple) or not all(
+            isinstance(entry, ChangeEntry) for entry in self.entries
+        ):
+            raise ReviewError("change inventory entries must be ChangeEntry values")
+        if self.declared_entry_count != len(self.entries):
+            raise ReviewError("declared change entry count is inconsistent")
+        if self.source is ChangeInventorySource.TRUSTED_GIT_OBJECT_GRAPH and not self.complete:
+            raise ReviewError("trusted Git change inventory must be complete")
+        if (
+            self.comparison_basis is ComparisonBasis.DIRECT_BASE
+            and self.comparison_base_sha != self.requested_base_sha
+        ):
+            raise ReviewError("direct comparison base must equal requested base")
+        expected = tuple(sorted(self.entries, key=lambda entry: (entry.path, entry.status.value)))
+        if expected != self.entries:
+            raise ReviewError("change inventory entries must be in canonical POSIX order")
+        folded_paths = tuple(entry.path.casefold() for entry in self.entries)
+        if len(set(folded_paths)) != len(folded_paths):
+            raise ReviewError("change inventory paths must be unique")
 
 
 def _positive_int(value: object, label: str, maximum: int) -> int:
@@ -318,6 +566,324 @@ class SourceBundle:
             or self.total_chars != sum(len(source.text) for source in self.sources)
         ):
             raise ReviewError("source total_chars is inconsistent")
+
+
+@dataclass(frozen=True)
+class MaterialClaimSeed:
+    """Deterministic routing metadata, never a scientific claim or evidence."""
+
+    origin_source_id: str
+    category: str
+    route_terms: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _nonempty_text(self.origin_source_id, "material seed origin_source_id", max_chars=128)
+        category = _nonempty_text(self.category, "material seed category", max_chars=64)
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", category):
+            raise ReviewError("material seed category must be a lowercase identifier")
+        if not isinstance(self.route_terms, tuple) or not self.route_terms:
+            raise ReviewError("material seed route_terms must be a non-empty tuple")
+        if not all(
+            isinstance(term, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9_.+-]*", term)
+            and len(term) <= 128
+            for term in self.route_terms
+        ):
+            raise ReviewError("material seed route_terms are invalid")
+        if tuple(sorted(set(self.route_terms))) != self.route_terms:
+            raise ReviewError("material seed route_terms must be sorted and unique")
+
+
+@dataclass(frozen=True)
+class ScopeIssue:
+    """Stable, content-free explanation of one bounded-scope omission."""
+
+    code: str
+    path: str | None = None
+    observed: int | None = None
+    limit: int | None = None
+
+    def __post_init__(self) -> None:
+        code = _nonempty_text(self.code, "scope issue code", max_chars=128)
+        if not (
+            re.fullmatch(r"PREFLIGHT_G[123]_[A-Z0-9_]+", code)
+            or code == "PREFLIGHT_NOT_EVALUATED_UPSTREAM_FAILURE"
+        ):
+            raise ReviewError("scope issue code is invalid")
+        if self.path is not None:
+            object.__setattr__(self, "path", _portable_inventory_path(self.path))
+        for label in ("observed", "limit"):
+            value = getattr(self, label)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ReviewError(
+                    f"scope issue {label} must be a non-negative integer or null"
+                )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the stable sparse issue representation used by reports."""
+
+        value: dict[str, object] = {"code": self.code}
+        if self.path is not None:
+            value["path"] = self.path
+        if self.observed is not None:
+            value["observed"] = self.observed
+        if self.limit is not None:
+            value["limit"] = self.limit
+        return value
+
+
+@dataclass(frozen=True)
+class ReviewInventoryFailure:
+    """Content-free typed failure carried from inventory construction."""
+
+    code: str
+
+    def __post_init__(self) -> None:
+        issue = ScopeIssue(code=self.code)
+        if not issue.code.startswith("PREFLIGHT_G1_"):
+            raise ReviewError("review inventory failure must be a Gate 1 code")
+
+
+@dataclass(frozen=True)
+class ReviewScope:
+    """Complete inventory plus its bounded, deterministic materialization plan."""
+
+    mode: str
+    inventory: ChangeInventory
+    issued_paths: tuple[str, ...]
+    issued_changed_paths: tuple[str, ...]
+    selected_paths: tuple[str, ...]
+    sources: tuple[SourceRecord, ...]
+    seeds: tuple[MaterialClaimSeed, ...]
+    complete: bool
+    issues: tuple[ScopeIssue, ...]
+    materialized_chars: int = 0
+    materialized_path_chars: tuple[tuple[str, int], ...] = ()
+    atomic_path_groups: tuple[tuple[str, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"declared_changed_v1", "legacy_pairwise_v1"}:
+            raise ReviewError("review scope mode is invalid")
+        if not isinstance(self.inventory, ChangeInventory):
+            raise ReviewError("review scope inventory is invalid")
+        for label in ("issued_paths", "issued_changed_paths", "selected_paths"):
+            values = getattr(self, label)
+            if not isinstance(values, tuple):
+                raise ReviewError(f"review scope {label} must be a tuple")
+            normalized = tuple(_portable_inventory_path(path) for path in values)
+            if normalized != values or len(set(values)) != len(values):
+                raise ReviewError(
+                    f"review scope {label} must contain unique canonical paths"
+                )
+        issued = set(self.issued_paths)
+        selected = set(self.selected_paths)
+        if not set(self.issued_changed_paths).issubset(issued):
+            raise ReviewError("issued changed paths must be issued paths")
+        if not selected.issubset(issued):
+            raise ReviewError("selected paths must be issued paths")
+        inventory_head_paths = {
+            entry.path
+            for entry in self.inventory.entries
+            if entry.status is not ChangeStatus.DELETED
+        }
+        if not set(self.issued_changed_paths).issubset(inventory_head_paths):
+            raise ReviewError("issued changed paths must be non-deleted inventory paths")
+        if not isinstance(self.sources, tuple) or not all(
+            isinstance(source, SourceRecord) for source in self.sources
+        ):
+            raise ReviewError("review scope sources must be SourceRecord values")
+        if any(
+            source.path is not None and source.path not in selected
+            for source in self.sources
+        ):
+            raise ReviewError("repository sources must be selected paths")
+        if not isinstance(self.seeds, tuple) or not all(
+            isinstance(seed, MaterialClaimSeed) for seed in self.seeds
+        ):
+            raise ReviewError("review scope seeds must be MaterialClaimSeed values")
+        if not isinstance(self.complete, bool):
+            raise ReviewError("review scope completeness must be a boolean")
+        if not isinstance(self.issues, tuple) or not all(
+            isinstance(issue, ScopeIssue) for issue in self.issues
+        ):
+            raise ReviewError("review scope issues must be ScopeIssue values")
+        if (
+            isinstance(self.materialized_chars, bool)
+            or not isinstance(self.materialized_chars, int)
+            or self.materialized_chars < 0
+        ):
+            raise ReviewError("review scope materialized_chars must be non-negative")
+        if (
+            not isinstance(self.materialized_path_chars, tuple)
+            or any(
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or item[0] not in selected
+                or isinstance(item[1], bool)
+                or not isinstance(item[1], int)
+                or item[1] < 0
+                for item in self.materialized_path_chars
+            )
+            or tuple(sorted(self.materialized_path_chars))
+            != self.materialized_path_chars
+            or len({path for path, _chars in self.materialized_path_chars})
+            != len(self.materialized_path_chars)
+        ):
+            raise ReviewError("review scope materialized_path_chars is invalid")
+        if (
+            not isinstance(self.atomic_path_groups, tuple)
+            or any(
+                not isinstance(group, tuple)
+                or not group
+                or len(set(group)) != len(group)
+                or group[0] not in selected
+                or any(
+                    _portable_inventory_path(path) != path
+                    for path in group
+                )
+                for group in self.atomic_path_groups
+            )
+            or len(set(self.atomic_path_groups)) != len(self.atomic_path_groups)
+        ):
+            raise ReviewError("review scope atomic_path_groups is invalid")
+
+
+@dataclass(frozen=True)
+class PreflightGateResult:
+    gate: int
+    disposition: GateDisposition
+    reasons: tuple[ScopeIssue, ...]
+    metrics: Mapping[str, int | str | bool]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.gate, bool) or self.gate not in {1, 2, 3}:
+            raise ReviewError("preflight gate must be 1, 2, or 3")
+        if not isinstance(self.disposition, GateDisposition):
+            raise ReviewError("preflight gate disposition is invalid")
+        if not isinstance(self.reasons, tuple) or not all(
+            isinstance(reason, ScopeIssue) for reason in self.reasons
+        ):
+            raise ReviewError("preflight gate reasons must be ScopeIssue values")
+        upstream = "PREFLIGHT_NOT_EVALUATED_UPSTREAM_FAILURE"
+        if self.disposition is GateDisposition.PASS_COMPLETE and self.reasons:
+            raise ReviewError("a complete preflight gate cannot contain reasons")
+        if self.disposition in {
+            GateDisposition.PASS_PARTIAL,
+            GateDisposition.FAIL,
+        } and not self.reasons:
+            raise ReviewError("a partial or failed preflight gate requires a reason")
+        if self.disposition is GateDisposition.NOT_EVALUATED:
+            if tuple(reason.code for reason in self.reasons) != (upstream,):
+                raise ReviewError("a skipped preflight gate requires the upstream reason")
+        elif any(reason.code == upstream for reason in self.reasons):
+            raise ReviewError("the upstream reason is only valid for a skipped gate")
+        if not isinstance(self.metrics, Mapping):
+            raise ReviewError("preflight gate metrics must be a mapping")
+        normalized: dict[str, int | str | bool] = {}
+        for key, value in self.metrics.items():
+            if not isinstance(key, str) or not key:
+                raise ReviewError("preflight metric names must be non-empty strings")
+            if not isinstance(value, (int, str, bool)):
+                raise ReviewError("preflight metric values must be scalar")
+            normalized[key] = value
+        object.__setattr__(
+            self,
+            "metrics",
+            MappingProxyType(dict(sorted(normalized.items()))),
+        )
+
+
+@dataclass(frozen=True)
+class ReviewPreflight:
+    schema_version: int
+    requested_base_sha: str
+    comparison_base_sha: str
+    head_sha: str
+    gates: tuple[PreflightGateResult, ...]
+    ready_for_provider: bool
+    review_status_ceiling: ReviewStatus
+    scope: ReviewScope | None
+    comparison_basis: ComparisonBasis | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != 1
+        ):
+            raise ReviewError("review preflight schema_version must be 1")
+        _full_git_object_id(self.requested_base_sha, "preflight requested base sha")
+        _full_git_object_id(self.comparison_base_sha, "preflight comparison base sha")
+        _full_git_object_id(self.head_sha, "preflight head sha")
+        if (
+            not isinstance(self.gates, tuple)
+            or tuple(gate.gate for gate in self.gates) != (1, 2, 3)
+        ):
+            raise ReviewError("review preflight must contain gates 1, 2, and 3 in order")
+        dispositions = tuple(gate.disposition for gate in self.gates)
+        failure_indexes = tuple(
+            index
+            for index, disposition in enumerate(dispositions)
+            if disposition is GateDisposition.FAIL
+        )
+        not_evaluated_indexes = tuple(
+            index
+            for index, disposition in enumerate(dispositions)
+            if disposition is GateDisposition.NOT_EVALUATED
+        )
+        if failure_indexes:
+            first_failure = failure_indexes[0]
+            pass_dispositions = {
+                GateDisposition.PASS_COMPLETE,
+                GateDisposition.PASS_PARTIAL,
+            }
+            if (
+                failure_indexes != (first_failure,)
+                or any(
+                    disposition not in pass_dispositions
+                    for disposition in dispositions[:first_failure]
+                )
+                or dispositions[first_failure + 1 :]
+                != (GateDisposition.NOT_EVALUATED,) * (2 - first_failure)
+            ):
+                raise ReviewError("review preflight gate sequence is impossible")
+        elif not_evaluated_indexes:
+            raise ReviewError("review preflight gate sequence is impossible")
+        failed = GateDisposition.FAIL in dispositions
+        expected_ready = all(
+            disposition
+            in {GateDisposition.PASS_COMPLETE, GateDisposition.PASS_PARTIAL}
+            for disposition in dispositions
+        )
+        expected_ceiling = (
+            ReviewStatus.UNAVAILABLE
+            if failed
+            else (
+                ReviewStatus.PARTIAL
+                if GateDisposition.PASS_PARTIAL in dispositions
+                else ReviewStatus.COMPLETE
+            )
+        )
+        if not isinstance(self.ready_for_provider, bool) or (
+            self.ready_for_provider != expected_ready
+        ):
+            raise ReviewError("review preflight provider readiness is inconsistent")
+        if self.review_status_ceiling is not expected_ceiling:
+            raise ReviewError("review preflight status ceiling is inconsistent")
+        if self.scope is not None and not isinstance(self.scope, ReviewScope):
+            raise ReviewError("review preflight scope is invalid")
+        if self.comparison_basis is not None and not isinstance(
+            self.comparison_basis, ComparisonBasis
+        ):
+            raise ReviewError("review preflight comparison basis is invalid")
+        if (
+            self.scope is not None
+            and self.comparison_basis is not None
+            and self.comparison_basis is not self.scope.inventory.comparison_basis
+        ):
+            raise ReviewError("review preflight comparison basis is inconsistent")
 
 
 @dataclass(frozen=True)

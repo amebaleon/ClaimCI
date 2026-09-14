@@ -181,11 +181,18 @@ def _run(
         hints=hints,
         inspect_extraction=inspect_extraction,
     )
+    route_path = (
+        "scripts/run-eval.sh"
+        if (head / "scripts" / "run-eval.sh").is_file()
+        else SERVICE
+    )
     result = run_review(
         ReviewInputs(
             repository_root=head,
             base_root=base,
-            pr_description=CLAIM_TEXT,
+            pr_description=(
+                f"{CLAIM_TEXT}\nBenchmark evidence: 1 run in {route_path}"
+            ),
         ),
         _config(),
         provider=provider,
@@ -324,6 +331,7 @@ def test_materially_unresolved_provider_routing_is_advisory_partial(
     head = tmp_path / "head"
     base.mkdir()
     head.mkdir()
+    _write(head, "scripts/run-eval.sh", "#!/bin/sh\nexit 0\n")
     result, provider = _run(
         base,
         head,
@@ -349,6 +357,7 @@ def test_legitimate_zero_evidence_without_routing_failure_remains_complete(
     head = tmp_path / "head"
     base.mkdir()
     head.mkdir()
+    _write(head, "scripts/run-eval.sh", "#!/bin/sh\nexit 0\n")
     result, provider = _run(base, head)
 
     assert result.status is ReviewStatus.COMPLETE

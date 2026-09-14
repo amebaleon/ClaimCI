@@ -1,0 +1,14 @@
+{"schema_version":1,"candidate":"C-Weave-7801","repository":"wandb/weave","pull_request":7801,"requested_base_sha":"625a8241cd46898f86b8290a937f3f1d3ef71729","comparison_base_sha":"c31ce92835cd2415bbb3c7361e756b12ce2133f9","head_sha":"a1c2bc8e82f96980651de1c6eb8b331cb804a144","comparison_basis":"merge_base","declared_entry_count":12,"entries":[
+  {"path":"tests/trace_server/conftest.py","status":"modified"},
+  {"path":"tests/trace_server/test_async_clickhouse_trace_server.py","status":"modified"},
+  {"path":"tests/trace_server/test_clickhouse_batching.py","status":"modified"},
+  {"path":"tests/trace_server/test_clickhouse_trace_server_batched.py","status":"modified"},
+  {"path":"tests/trace_server/test_clickhouse_transport.py","status":"added"},
+  {"path":"tests/trace_server/test_clickhouse_utilities.py","status":"modified"},
+  {"path":"tests/trace_server/test_export_status.py","status":"modified"},
+  {"path":"tests/trace_server/test_llm_completion.py","status":"modified"},
+  {"path":"tests/trace_server/test_trace_server_conftest.py","status":"modified"},
+  {"path":"weave/trace_server/async_clickhouse_trace_server.py","status":"modified"},
+  {"path":"weave/trace_server/clickhouse/transport.py","status":"added"},
+  {"path":"weave/trace_server/clickhouse_trace_server_batched.py","status":"modified"}
+]}

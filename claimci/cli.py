@@ -13,8 +13,20 @@ from .models import ClaimCIError, Verdict
 from .report import render_human, render_json, render_markdown
 from .parsing import unique_json_object, validate_json_graph
 from .review.config import load_review_config
-from .review.models import ReviewError
-from .review.orchestrator import ReviewInputs, run_review
+from .review.inventory import InventoryVerificationError, build_git_change_inventory
+from .review.models import (
+    ComparisonBasis,
+    DeclaredReviewCoordinates,
+    ReviewConfig,
+    ReviewError,
+    ReviewInventoryFailure,
+    ReviewPreflight,
+    ReviewStatus,
+    SnapshotIdentity,
+    SnapshotRole,
+)
+from .review.orchestrator import ResearchReview, ReviewInputs, run_review
+from .review.preflight import preflight_review
 from .review.report import render_review_json, render_review_markdown
 
 
@@ -84,7 +96,46 @@ def build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument(
         "--base-root",
         default=None,
-        help="optional base checkout used to identify changed research documents",
+        help=(
+            "legacy optional base checkout used to identify changed research documents; "
+            "the declared coordinate path uses the six explicit coordinate options"
+        ),
+    )
+    review_parser.add_argument(
+        "--requested-base-root",
+        default=None,
+        help="trusted checkout at the exact requested pull-request base",
+    )
+    review_parser.add_argument(
+        "--comparison-base-root",
+        default=None,
+        help="trusted checkout at the explicit direct or merge comparison base",
+    )
+    review_parser.add_argument(
+        "--requested-base-sha",
+        default=None,
+        help="full lowercase Git object ID for the requested base checkout",
+    )
+    review_parser.add_argument(
+        "--comparison-base-sha",
+        default=None,
+        help="full lowercase Git object ID for the comparison base checkout",
+    )
+    review_parser.add_argument(
+        "--comparison-basis",
+        choices=tuple(basis.value for basis in ComparisonBasis),
+        default=None,
+        help="explicit comparison semantics: direct_base or merge_base",
+    )
+    review_parser.add_argument(
+        "--head-sha",
+        default=None,
+        help="full lowercase Git object ID for the passive head checkout",
+    )
+    review_parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="run only the three provider-free gates and render their advisory report",
     )
     review_parser.add_argument(
         "--config-root",
@@ -225,20 +276,148 @@ def _write_review_file(raw: str | None, content: str, label: str) -> None:
         raise ReviewError(f"could not write {label}: {type(exc).__name__}") from exc
 
 
+_COORDINATE_OPTIONS = (
+    "requested_base_root",
+    "comparison_base_root",
+    "requested_base_sha",
+    "comparison_base_sha",
+    "comparison_basis",
+    "head_sha",
+)
+
+
+def _declared_coordinate_mode(args: argparse.Namespace) -> bool:
+    present = tuple(getattr(args, name) is not None for name in _COORDINATE_OPTIONS)
+    if any(present) and not all(present):
+        raise ReviewError("all six coordinate options are required together")
+    return all(present)
+
+
+def _resolved_candidate_root(raw: str) -> Path | None:
+    try:
+        candidate = Path(raw)
+        if candidate.is_symlink():
+            return None
+        resolved = candidate.resolve(strict=True)
+        return resolved if resolved.is_dir() else None
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+def _trusted_config_root(raw: str) -> Path:
+    """Resolve one explicit trusted root without following its final symlink."""
+
+    try:
+        candidate = Path(raw)
+        if candidate.is_symlink():
+            raise ValueError
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError
+        return resolved
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        raise ReviewError("config root is invalid") from exc
+
+
+def _snapshot_or_none(
+    root: Path | None,
+    sha: str,
+    role: SnapshotRole,
+) -> SnapshotIdentity | None:
+    if root is None:
+        return None
+    try:
+        return SnapshotIdentity(role=role, root=root, sha=sha)
+    except ReviewError:
+        return None
+
+
+def _preflight_only_review(preflight: ReviewPreflight) -> ResearchReview:
+    if not isinstance(preflight, ReviewPreflight):
+        raise ReviewError("preflight result is invalid")
+    error_code = None
+    error_message = None
+    if not preflight.ready_for_provider:
+        failure = next(
+            gate
+            for gate in preflight.gates
+            if gate.disposition.value == "fail"
+        )
+        error_code = failure.reasons[0].code
+        error_message = "Research review preflight did not pass."
+    return ResearchReview(
+        status=preflight.review_status_ceiling,
+        preflight=preflight,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
+def _emit_review_result(args: argparse.Namespace, result: ResearchReview) -> int:
+    json_text = render_review_json(result)
+    markdown_text = render_review_markdown(result)
+    _write_review_file(args.json_path, json_text, "review JSON")
+    _write_review_file(args.markdown_path, markdown_text, "review Markdown")
+
+    # Explicit output paths are intended for CI artifacts; avoid duplicating a
+    # large report on stdout when both views were requested as files. A view
+    # flag always selects stdout, and with no flag Markdown is the default.
+    if args.json_output:
+        _write_console(sys.stdout, json_text)
+    elif args.markdown_output:
+        _write_console(sys.stdout, markdown_text)
+    elif args.json_path is None and args.markdown_path is None:
+        _write_console(sys.stdout, markdown_text)
+    return 0
+
+
 def _review_command(args: argparse.Namespace) -> int:
     """Run one advisory review and render one or both views."""
 
-    repository_root = _review_root(args.repository_root, "repository root")
+    declared_coordinates = _declared_coordinate_mode(args)
+    head_root = (
+        _resolved_candidate_root(args.repository_root)
+        if declared_coordinates
+        else None
+    )
+    repository_root = (
+        head_root
+        if head_root is not None
+        else (
+            Path(args.repository_root)
+            if declared_coordinates
+            else _review_root(args.repository_root, "repository root")
+        )
+    )
     base_root = None if args.base_root is None else _review_root(args.base_root, "base root")
-    config_root = (
-        repository_root
-        if args.config_root is None
-        else _review_root(args.config_root, "config root")
+    requested_root = (
+        _resolved_candidate_root(args.requested_base_root)
+        if declared_coordinates
+        else None
     )
-    config = load_review_config(
-        config_root,
-        None if args.config_path is None else Path(args.config_path),
+    comparison_root = (
+        _resolved_candidate_root(args.comparison_base_root)
+        if declared_coordinates
+        else None
     )
+    config_path = None if args.config_path is None else Path(args.config_path)
+    if args.config_root is not None:
+        config = load_review_config(
+            _trusted_config_root(args.config_root),
+            config_path,
+        )
+    elif declared_coordinates and requested_root is None:
+        # A rejected identity root cannot be followed to discover policy. An
+        # enabled in-memory policy exists only to render the inevitable Gate 1
+        # root failure; that failure makes provider work unreachable.
+        config = ReviewConfig(enabled=True)
+    else:
+        config = load_review_config(
+            requested_root if declared_coordinates else repository_root,
+            config_path,
+        )
+    if args.preflight_only and not config.enabled:
+        return _emit_review_result(args, ResearchReview(status=ReviewStatus.DISABLED))
     event_title, event_body = _event_metadata(args.event_json)
     pr_title = event_title if args.pr_title is None else args.pr_title
     pr_description = event_body
@@ -256,32 +435,87 @@ def _review_command(args: argparse.Namespace) -> int:
         config.limits.max_context_chars,
     )
 
+    requested = None
+    comparison = None
+    head = None
+    inventory: object | None = None
+    coordinates = None
+    inventory_failure = None
+    if declared_coordinates:
+        basis = ComparisonBasis(args.comparison_basis)
+        invalid_root_roles = tuple(
+            role
+            for root, role in (
+                (requested_root, SnapshotRole.REQUESTED_BASE),
+                (comparison_root, SnapshotRole.COMPARISON_BASE),
+                (head_root, SnapshotRole.HEAD),
+            )
+            if root is None
+        )
+        coordinates = DeclaredReviewCoordinates(
+            requested_base_sha=args.requested_base_sha,
+            comparison_base_sha=args.comparison_base_sha,
+            head_sha=args.head_sha,
+            comparison_basis=basis,
+            invalid_root_roles=invalid_root_roles,
+        )
+        requested = _snapshot_or_none(
+            requested_root,
+            args.requested_base_sha,
+            SnapshotRole.REQUESTED_BASE,
+        )
+        comparison = _snapshot_or_none(
+            comparison_root,
+            args.comparison_base_sha,
+            SnapshotRole.COMPARISON_BASE,
+        )
+        head = _snapshot_or_none(
+            head_root,
+            args.head_sha,
+            SnapshotRole.HEAD,
+        )
+        if invalid_root_roles:
+            inventory = None
+        elif requested is None or comparison is None or head is None:
+            inventory_failure = ReviewInventoryFailure(
+                code="PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"
+            )
+        else:
+            try:
+                inventory = build_git_change_inventory(
+                    requested,
+                    comparison,
+                    head,
+                    basis,
+                )
+            except InventoryVerificationError as exc:
+                inventory_failure = ReviewInventoryFailure(code=exc.code)
+            except ReviewError:
+                inventory_failure = ReviewInventoryFailure(
+                    code="PREFLIGHT_G1_SNAPSHOT_IDENTITY_UNVERIFIED"
+                )
+
+    inputs = ReviewInputs(
+        repository_root=repository_root,
+        base_root=base_root,
+        pr_title=pr_title,
+        pr_description=pr_description,
+        requested_base=requested,
+        comparison_base=comparison,
+        head=head,
+        inventory=inventory,
+        coordinates=coordinates,
+        inventory_failure=inventory_failure,
+    )
+
     # Keep this call singular: rendering both output formats must never rerun
     # provider calls or deterministic evidence discovery.
-    result = run_review(
-        ReviewInputs(
-            repository_root=repository_root,
-            base_root=base_root,
-            pr_title=pr_title,
-            pr_description=pr_description,
-        ),
-        config,
+    result = (
+        run_review(inputs, config, preflight_only=True)
+        if args.preflight_only
+        else run_review(inputs, config)
     )
-    json_text = render_review_json(result)
-    markdown_text = render_review_markdown(result)
-    _write_review_file(args.json_path, json_text, "review JSON")
-    _write_review_file(args.markdown_path, markdown_text, "review Markdown")
-
-    # Explicit output paths are intended for CI artifacts; avoid duplicating a
-    # large report on stdout when both views were requested as files.  A view
-    # flag always selects stdout, and with no flag Markdown is the default.
-    if args.json_output:
-        _write_console(sys.stdout, json_text)
-    elif args.markdown_output:
-        _write_console(sys.stdout, markdown_text)
-    elif args.json_path is None and args.markdown_path is None:
-        _write_console(sys.stdout, markdown_text)
-    return 0
+    return _emit_review_result(args, result)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

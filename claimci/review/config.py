@@ -98,15 +98,35 @@ def _normalize_limits(
 def load_review_config(
     repository_root: Path,
     config_path: Path | None = None,
+    *,
+    content: bytes | None = None,
 ) -> ReviewConfig:
-    """Load trusted review configuration; absence is always disabled."""
+    """Load trusted review configuration; absence is always disabled.
+
+    ``content`` lets a caller parse descriptor-captured bytes so effective values
+    and provenance can be bound to one immutable snapshot instead of rereading a
+    pathname.
+    """
 
     path = _resolve_config_path(repository_root, config_path)
-    if not path.exists():
+    if content is None and not path.exists():
         return ReviewConfig()
     try:
-        payload = load_unique_yaml(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError, yaml.YAMLError, RecursionError) as exc:
+        if content is None:
+            text = path.read_text(encoding="utf-8")
+        else:
+            if not isinstance(content, bytes):
+                raise TypeError("captured review configuration must be bytes")
+            text = content.decode("utf-8", errors="strict")
+        payload = load_unique_yaml(text)
+    except (
+        OSError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        yaml.YAMLError,
+        RecursionError,
+    ) as exc:
         raise ReviewError(f"could not load review configuration {path}: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise ReviewError("review configuration root must be a mapping")

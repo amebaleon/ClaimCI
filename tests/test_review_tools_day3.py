@@ -7,11 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from claimci.audit import audit_research
 from claimci.models import AuditResult, Finding, Impact, Severity, Verdict
 from claimci.review.tools import (
+    ManifestAuditPlan,
     discover_manifests,
+    plan_manifest_audits,
     run_manifest_audits,
     snapshot_audit_result,
 )
@@ -88,6 +91,136 @@ def test_manifest_audit_respects_global_file_and_per_file_review_budgets(
     )
 
     assert snapshots == ()
+
+
+def test_manifest_planning_records_unissued_dependencies_without_opening_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An issued manifest may name a path that remains outside the read boundary."""
+
+    manifest = tmp_path / "research.yaml"
+    artifact_paths = (
+        "private/baseline-config.yaml",
+        "private/baseline-results.json",
+        "private/baseline-train.jsonl",
+        "private/baseline-eval.jsonl",
+        "private/candidate-config.yaml",
+        "private/candidate-results.json",
+        "private/candidate-train.jsonl",
+        "private/candidate-eval.jsonl",
+    )
+    manifest.write_text(
+        """claim:
+  metric: accuracy
+  minimum_improvement: 0.05
+baseline:
+  config: private/baseline-config.yaml
+  results: private/baseline-results.json
+  train_dataset: private/baseline-train.jsonl
+  eval_dataset: private/baseline-eval.jsonl
+candidate:
+  config: private/candidate-config.yaml
+  results: private/candidate-results.json
+  train_dataset: private/candidate-train.jsonl
+  eval_dataset: private/candidate-eval.jsonl
+""",
+        encoding="utf-8",
+    )
+    for relative in artifact_paths:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("UNISSUED_DEPENDENCY_MUST_NOT_BE_READ\n", encoding="utf-8")
+
+    opened: list[str] = []
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args, **kwargs):
+        relative = path.resolve().relative_to(tmp_path.resolve()).as_posix()
+        opened.append(relative)
+        if relative != "research.yaml":
+            raise AssertionError(f"unissued dependency opened: {relative}")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    plans = plan_manifest_audits(
+        tmp_path,
+        ("research.yaml",),
+        issued_paths=("research.yaml",),
+    )
+
+    assert plans == (
+        ManifestAuditPlan(
+            manifest_path="research.yaml",
+            paths=("research.yaml", *artifact_paths),
+        ),
+    )
+    assert opened and set(opened) == {"research.yaml"}
+
+
+@pytest.mark.parametrize("use_reserved_plan", [True, False])
+def test_manifest_allowlist_rejects_drift_without_dependency_access(
+    study_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    use_reserved_plan: bool,
+) -> None:
+    """Neither exact execution nor its allowlisted public fallback may broaden."""
+
+    manifest = study_factory()
+    root = manifest.parent
+    issued_paths = (
+        "research.yaml",
+        "base/config.yaml",
+        "base/results.json",
+        "base/train.jsonl",
+        "base/eval.jsonl",
+        "candidate/config.yaml",
+        "candidate/results.json",
+        "candidate/train.jsonl",
+        "candidate/eval.jsonl",
+    )
+    plans = plan_manifest_audits(
+        root,
+        ("research.yaml",),
+        issued_paths=issued_paths,
+    )
+    assert len(plans) == 1
+
+    unissued = root / "private" / "unissued-results.json"
+    unissued.parent.mkdir()
+    unissued.write_text(
+        '{"runs":[{"seed":1,"accuracy":0.99}]}\n', encoding="utf-8"
+    )
+    payload = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    payload["candidate"]["results"] = "private/unissued-results.json"
+    manifest.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    unissued_accesses: list[str] = []
+    original_stat = Path.stat
+    original_open = Path.open
+
+    def traced_stat(path: Path, *args, **kwargs):
+        if path == unissued:
+            unissued_accesses.append("stat")
+        return original_stat(path, *args, **kwargs)
+
+    def traced_open(path: Path, *args, **kwargs):
+        if path == unissued:
+            unissued_accesses.append("open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", traced_stat)
+    monkeypatch.setattr(Path, "open", traced_open)
+
+    kwargs = {"issued_paths": issued_paths}
+    if use_reserved_plan:
+        kwargs["reserved_plans"] = plans
+    snapshots = run_manifest_audits(root, ("research.yaml",), **kwargs)
+
+    assert snapshots == ()
+    assert unissued_accesses == []
 
 
 def test_manifest_audit_rejects_internal_symlink_artifacts(study_factory) -> None:

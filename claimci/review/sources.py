@@ -20,6 +20,7 @@ from .models import (
     MagnitudeKind,
     ReviewError,
     ReviewLimits,
+    ReviewScope,
     ScientificClaim,
     SourceBundle,
     SourceKind,
@@ -324,6 +325,19 @@ def collect_review_sources(
         repository_paths=repository_paths,
         changed_paths=changed_paths,
         total_chars=sum(len(record.text) for record in records),
+    )
+
+
+def source_bundle_from_scope(scope: ReviewScope) -> SourceBundle:
+    """Adapt a bounded scope without changing legacy source collection."""
+
+    if not isinstance(scope, ReviewScope):
+        raise ReviewError("scope must be ReviewScope")
+    return SourceBundle(
+        sources=scope.sources,
+        repository_paths=scope.issued_paths,
+        changed_paths=scope.issued_changed_paths,
+        total_chars=sum(len(record.text) for record in scope.sources),
     )
 
 

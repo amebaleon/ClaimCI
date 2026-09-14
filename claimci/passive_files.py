@@ -32,6 +32,8 @@ class PassiveFileInspection:
 
     size: int
     sha256: str
+    git_blob_sha1: str
+    git_blob_sha256: str
 
 
 def _path_identity(value: os.stat_result) -> tuple[int, int, int]:
@@ -287,6 +289,8 @@ def inspect_confined_regular_file(
     opened_after: os.stat_result | None = None
     size = 0
     digest = hashlib.sha256()
+    git_sha1 = hashlib.sha1(usedforsecurity=False)
+    git_sha256 = hashlib.sha256()
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
@@ -299,12 +303,17 @@ def inspect_confined_regular_file(
                 "passive file identity changed during open",
                 code="changed",
             )
+        git_header = f"blob {opened.st_size}\0".encode("ascii")
+        git_sha1.update(git_header)
+        git_sha256.update(git_header)
         while size <= max_bytes:
             block = os.read(descriptor, min(64 * 1024, max_bytes + 1 - size))
             if not block:
                 break
             size += len(block)
             digest.update(block)
+            git_sha1.update(block)
+            git_sha256.update(block)
         if size > max_bytes:
             raise PassiveFileError(
                 "passive file changed beyond the byte bound",
@@ -361,7 +370,12 @@ def inspect_confined_regular_file(
             "passive file size changed during inspection",
             code="changed",
         )
-    return PassiveFileInspection(size=size, sha256=digest.hexdigest())
+    return PassiveFileInspection(
+        size=size,
+        sha256=digest.hexdigest(),
+        git_blob_sha1=git_sha1.hexdigest(),
+        git_blob_sha256=git_sha256.hexdigest(),
+    )
 
 
 __all__ = [
